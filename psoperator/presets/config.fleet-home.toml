@@ -1,0 +1,77 @@
+# PSOperator fleet preset: HOME
+# =============================================================================
+# Operator-provided ground truth for the home fleet. Validated fail-closed by
+# PSOperatorConfig.from_preset(): the planner base_url must be EXACTLY
+# http://10.0.1.125:8003/v1 (the governed audit proxy) — never port 8004
+# (ungoverned, unaudited), never the hostname precision-t5810 (not pinnable),
+# never 10.0.1.51 (stale). No field may reference the work fleet network
+# (203.0.113.0/24, the example WORK_NET).
+#
+# Usage:
+#   python -c "from psoperator.config import PSOperatorConfig as C; print(C.from_preset('home'))"
+# or: PSOPERATOR_* env vars still override individual fields afterwards.
+
+fleet = "home"
+
+# --- model endpoint (the ONLY allowed network call) -------------------------
+# Governed audit proxy in front of the planner on T5810. ALL planner traffic
+# goes through :8003 so every request is audited. No auth — the proxy is the
+# trust boundary, not a credential.
+model_endpoint = "http://10.0.1.125:8003/v1"
+model_name = "qwen2.5-coder-14b-pscode"
+planner_ctx_budget = 16384          # tokens; planner served with 16k ctx
+model_timeout_s = 60.0
+model_api_key = "not-needed"        # local servers ignore this
+
+# --- grounder (element grounding model) --------------------------------------
+# HOME hardware envelope: NVLink4-pooled 2x 20GB A4500 = 40GB on T5810 (pscode
+# planner lane, TP=2), a dedicated 16GB Blackwell host, and the 16GB M4 Mac
+# mini. The grounder stand-up is a three-option ladder:
+#   (a) RECOMMENDED once stood up: the dedicated 16GB Blackwell host —
+#       ui-tars-1.5-7b BF16 (~16GB) or ScaleCUA-9B / GUI-Owl-1.5-8B Q4.
+#       Zero contention: pscode occupies only the A4500 pair (TP=2), so the
+#       grounder runs concurrently with the production planner lane.
+#   (b) LOW-EFFORT DEFAULT (encoded below): Mac mini holo3.1:4b via
+#       Ollama/MLX — the host is idle and already carries 7B-class weights.
+#   (c) QUALITY CEILING, pscode-stopped windows only: the NVLink-pooled 40GB
+#       pair fits Holo3.1-35B-A3B Q4 (~21.4GB); same mutual-exclusivity
+#       pattern as the staged 32B-AWQ alternate planner.
+# NOTE: holo3.1:4b is a PLACEHOLDER — the model must still be stood up on
+# mac-mini (Ollama or MLX) before grounding calls will succeed.
+grounder_url = "http://mac-mini:11434/v1"
+grounder_model = "holo3.1:4b"
+
+# --- perception ---------------------------------------------------------------
+# Topology A default: capture on the machine being controlled (mss), dry-run
+# executor behind the gatekeeper. Switch to uvc/ch9329 for crash-cart mode.
+capture_backend = "mss"             # "mss" (Topology A) | "uvc" (Topology B)
+monitor = 1
+tile_size = 32
+diff_threshold = 0.01
+phash_threshold = 6
+
+# --- Topology B (crash-cart / out-of-band) ------------------------------------
+uvc_device_index = 0
+uvc_width = 1920
+uvc_height = 1080
+executor_backend = "dryrun"         # "dryrun" | "pynput" | "ch9329"
+ch9329_port = "/dev/ttyUSB0"
+ch9329_baudrate = 9600              # chip factory default; must match the chip
+
+# --- memory / retrieval services ----------------------------------------------
+# Embeddings (bge-base-en-v1.5) and Qdrant are LOOPBACK on T5810 — memory
+# components must co-locate on T5810.
+embeddings_url = "http://127.0.0.1:8005"    # bge-base-en-v1.5, loopback on T5810
+qdrant_url = "http://127.0.0.1:6333"        # Qdrant, loopback on T5810
+reranker_url = "http://10.0.1.115:8006"     # bge-reranker-base
+# ocr_url: no dedicated OCR service on the home fleet — in-process rapidocr
+# (pip install -e .[perception]) is the home OCR path.
+
+# --- policy / gatekeeper -------------------------------------------------------
+risk_policy_path = "policy.json"
+audit_log_path = "psoperator_audit.jsonl"
+require_approval_for_t2 = true
+require_approval_for_t3 = true
+
+# --- remote notify (optional, off by default) ---------------------------------
+# ntfy_url = "https://ntfy.sh/my-topic"

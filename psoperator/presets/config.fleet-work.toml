@@ -1,0 +1,64 @@
+# PSOperator fleet preset: WORK
+# =============================================================================
+# Operator-provided ground truth for the work fleet. POLICY: routed endpoints
+# only — every LLM call goes via the psrouter at http://203.0.113.10:8888/v1
+# (on 7960). Bare-proc and unrouted LAN endpoints are out-of-policy and
+# from_preset() rejects them fail-closed. No field may reference the home
+# fleet network (10.0.1.0/24). The documented 7960:8003 tunnel is deliberately
+# NOT encoded.
+#
+# Usage:
+#   python -c "from psoperator.config import PSOperatorConfig as C; print(C.from_preset('work'))"
+# or: PSOPERATOR_* env vars still override individual fields afterwards.
+
+fleet = "work"
+
+# --- model endpoint (the ONLY allowed network call) ---------------------------
+# Everything routed via the psrouter (OpenAI-compatible) on 7960.
+model_endpoint = "http://203.0.113.10:8888/v1"
+model_name = "Qwen3-Coder"
+planner_ctx_budget = 131072         # tokens; Qwen3-Coder long context via psrouter
+model_timeout_s = 60.0
+model_api_key = "not-needed"        # router ignores this
+
+# --- grounder -------------------------------------------------------------------
+# Grounder routed via psrouter as well. If a grounder model is not routed
+# there, run it direct ONLY with an explicit operator note — unrouted LAN
+# endpoints are out-of-policy by default.
+grounder_url = "http://203.0.113.10:8888/v1"
+# grounder_model: set to the grounder model id as exposed by psrouter when routed.
+
+# --- perception ------------------------------------------------------------------
+# Topology A default: capture on the machine being controlled (mss), dry-run
+# executor behind the gatekeeper. Switch to uvc/ch9329 for crash-cart mode.
+capture_backend = "mss"             # "mss" (Topology A) | "uvc" (Topology B)
+monitor = 1
+tile_size = 32
+diff_threshold = 0.01
+phash_threshold = 6
+
+# --- Topology B (crash-cart / out-of-band) ---------------------------------------
+uvc_device_index = 0
+uvc_width = 1920
+uvc_height = 1080
+executor_backend = "dryrun"         # "dryrun" | "pynput" | "ch9329"
+ch9329_port = "/dev/ttyUSB0"
+ch9329_baudrate = 9600              # chip factory default; must match the chip
+
+# --- memory / retrieval / OCR services --------------------------------------------
+# Embeddings: bge-m3 via Ollama LOOPBACK on 7960 — memory components must
+# co-locate on 7960.
+embeddings_url = "http://127.0.0.1:11434"   # bge-m3 (Ollama), loopback on 7960
+# qdrant_url: no Qdrant service stood up on the work fleet yet.
+# reranker_url: no dedicated reranker on the work fleet yet.
+# OCR: gpu-ocr (PaddleOCR) on 7960 — same host as psrouter (203.0.113.10).
+ocr_url = "http://203.0.113.10:8089"
+
+# --- policy / gatekeeper ------------------------------------------------------------
+risk_policy_path = "policy.json"
+audit_log_path = "psoperator_audit.jsonl"
+require_approval_for_t2 = true
+require_approval_for_t3 = true
+
+# --- remote notify (optional, off by default) ---------------------------------------
+# ntfy_url = "https://ntfy.sh/my-topic"

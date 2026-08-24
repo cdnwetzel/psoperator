@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psoperator"
+version = "0.1.0"
+description = "PSOperator: fully-local, cross-platform desktop-automation agent skeleton"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "C. D. Wetzel" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+]
+dependencies = [
+    "mss>=9.0",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "httpx>=0.26",
+    "pynput>=1.7",
+]
+
+[project.scripts]
+psoperator = "psoperator.cli:main"
+
+[project.optional-dependencies]
+# Optional accelerators; every one is guarded by a try/except import.
+perception = [
+    "imagehash>=4.3",   # perceptual-hash keyframe filter
+    "rapidocr>=2.0",    # OCR fast path (onnxruntime-based, local)
+]
+# Topology B (crash-cart / out-of-band mode) — both import-guarded.
+uvc = [
+    "opencv-python>=4.8",  # UVC capture card backend (cv2.VideoCapture)
+]
+ch9329 = [
+    "pyserial>=3.5",        # serial transport for the CH9329 HID executor
+    "pych9329-hid>=0.1.4",  # optional vendor tooling: chip config (baud/mode), REPL debugging
+]
+a11y = [
+    "pywinauto>=0.6; sys_platform == 'win32'",
+    "pyatspi>=2.46; sys_platform == 'linux'",
+]
+dev = [
+    "pytest>=8.0",
+    "imagehash>=4.3",
+    "ruff>=0.12",
+]
+
+[tool.setuptools.packages.find]
+include = ["psoperator*"]
+
+[tool.setuptools.package-data]
+psoperator = ["presets/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

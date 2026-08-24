@@ -1,0 +1,13 @@
+permission = "edit"
+scope = ["psoperator", "tests", "examples", "docs", "README.md"]
+test_command = "python -m pytest -q -p no:cacheprovider"
+memory_enabled = true
+safety_net = true
+auto_commit = false
+
+[budgets]
+max_rounds = 20
+max_tokens = 200000
+max_cost_usd = 5.0
+max_wall_seconds = 1800.0
+max_diff_lines = 500

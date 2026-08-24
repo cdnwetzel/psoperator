@@ -1,0 +1,57 @@
+# CodeRabbit (coderabbit.ai) — the PRIMARY, blocking AI review.
+# Requires the GitHub App (github.com/apps/coderabbitai) installed on this repo.
+# Greptile runs as a second, ADVISORY reviewer (see greptile.json / CONTRIBUTING.md).
+language: "en-US"
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    # One review per PR, NOT one per push. CodeRabbit's limits are per developer
+    # per hour, spent per push, and `auto_incremental_review` defaults to true —
+    # so a 3-4 push fix loop burns a whole hour's budget on one PR. We hit exactly
+    # that wall. Turning it off means the status check reflects the review of the
+    # OPENING commit, so it is ONLY safe paired with the mandatory step in
+    # CONTRIBUTING.md: comment `@coderabbitai full review` on the final state
+    # BEFORE merging (a small final push may otherwise be silently skipped as
+    # "similar to previous changes").
+    auto_incremental_review: false
+    # Backstop if incremental review is ever re-enabled: pause after 2 reviewed
+    # commits rather than the default, so a long fix loop cannot silently drain
+    # the hourly budget.
+    auto_pause_after_reviewed_commits: 2
+  path_filters:
+    - "!uv.lock"
+    - "!poc/**"
+  path_instructions:
+    - path: "psoperator/gatekeeper/**"
+      instructions: |
+        The trust boundary. Planning proposes, policy decides, only the executor
+        actuates. Anything short of explicit success must DENY: unknown, missing,
+        malformed, or stale input is a denial, never a pass. Flag any branch where
+        an error, exception, empty value, or absent config could let an action
+        through, weaken a risk tier, or actuate input. Verify a T3 hard-block and
+        kill-switch precedence cannot be bypassed.
+    - path: "psoperator/services/**"
+      instructions: |
+        Observer/planner/gatekeeper/executor as separate processes. The
+        gatekeeper-to-executor hop is HMAC-authenticated, short-lived, nonce-
+        protected; flag any change weakening replay protection or letting the
+        planner import an executor/input path. Capture/perception failure must
+        return no partial snapshot (health degrades, sequence does not advance).
+    - path: "psoperator/common/attestation.py"
+      instructions: |
+        R-202 provenance only. Constant-time comparison, canonical signing,
+        fail-closed key handling, TOCTOU-safe key files. The gatekeeper PARSES
+        the envelope but does NOT yet verify (R-203, deferred) — do not flag the
+        non-verification as a bug, but flag any claim that it IS verified.
+    - path: "psoperator/presets/**"
+      instructions: |
+        Operator fleet presets with fail-closed addressing invariants. This repo
+        is going public: flag any organisation name, internal hostname, or
+        internal private-LAN address; do not flag device-model hostnames or the
+        10.0.1.0/24 example range. Example presets use documentation-range
+        placeholders (RFC-5737, e.g. 203.0.113.0/24).
