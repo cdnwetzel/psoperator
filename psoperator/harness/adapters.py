@@ -47,12 +47,35 @@ class LanePolicy:
     models: dict[Lane, str]
     endpoint: str
     provider: str = "ollama"
+    #: Optional per-lane endpoint override. A single ``endpoint`` assumes every
+    #: lane -- and the reviewer -- lives on one server, which forces the whole
+    #: loop onto one box. That is a real constraint: the strongest local coder
+    #: may sit on different hardware from the reviewer, and separation of duties
+    #: WANTS them apart. Lanes absent here fall back to ``endpoint``, so existing
+    #: single-endpoint configs behave exactly as before.
+    endpoints: dict[Lane, str] | None = None
+    #: Optional per-lane provider override, for a lane whose endpoint speaks a
+    #: different API than the default provider (e.g. an OpenAI-compatible vLLM
+    #: server alongside Ollama).
+    providers: dict[Lane, str] | None = None
 
     def model_for(self, lane: Lane) -> str:
         try:
             return self.models[lane]
         except KeyError as exc:
             raise ValueError(f"no model mapped for lane {lane.value!r}") from exc
+
+    def endpoint_for(self, lane: Lane) -> str:
+        """Endpoint serving ``lane``; falls back to the shared ``endpoint``."""
+        if self.endpoints:
+            return self.endpoints.get(lane, self.endpoint)
+        return self.endpoint
+
+    def provider_for(self, lane: Lane) -> str:
+        """Provider for ``lane``; falls back to the shared ``provider``."""
+        if self.providers:
+            return self.providers.get(lane, self.provider)
+        return self.provider
 
 
 class PxxCoder:
@@ -89,8 +112,8 @@ class PxxCoder:
             # escape and kill an unattended SoftLoop.run.
             return CoderResult(changed=False, summary=f"no model mapped for lane: {exc}")
         env_overrides = {
-            "PXX_PROVIDER": self._policy.provider,
-            "PXX_BASE_URL": self._policy.endpoint,
+            "PXX_PROVIDER": self._policy.provider_for(task.lane),
+            "PXX_BASE_URL": self._policy.endpoint_for(task.lane),
             "PXX_MODEL": model,
             "PXX_TEST_COMMAND": task.gate_command,
             "PXX_NATIVE_TIMEOUT": str(self._native_timeout),
@@ -272,8 +295,8 @@ class PxxReviewer:
         env = os.environ.copy()
         env.update(
             {
-                "PXX_PROVIDER": self._policy.provider,
-                "PXX_BASE_URL": self._policy.endpoint,
+                "PXX_PROVIDER": self._policy.provider_for(self._lane),
+                "PXX_BASE_URL": self._policy.endpoint_for(self._lane),
                 "PXX_MODEL": self._policy.model_for(self._lane),
             }
         )
