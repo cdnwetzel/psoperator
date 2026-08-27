@@ -17,7 +17,14 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 
-from psoperator.harness.model import CoderResult, GateResult, Lane, ReviewResult, Task
+from psoperator.harness.model import (
+    CoderResult,
+    GateResult,
+    JudgeResult,
+    Lane,
+    ReviewResult,
+    Task,
+)
 
 # pxx's summary tail, e.g.:
 #   [net: pxx-pre/20260823T121231Z] [committed a4564158] (rounds=4 tokens=8056 diff_lines=2)
@@ -239,6 +246,149 @@ class CommandGate:
             timeout=self._timeout,
             check=False,
         )
+
+
+@dataclass(frozen=True)
+class VisionPolicy:
+    """Where the vision judge runs. Operator-supplied, never tracked.
+
+    Mirrors :class:`LanePolicy`: an endpoint and a model id come from env/CLI,
+    not from repository config, so a checked-in file can never point the judge
+    at an unexpected host.
+    """
+
+    model: str
+    endpoint: str
+    #: Seconds to wait for one assessment. A judge that hangs must not hang the
+    #: loop -- on timeout this seam abstains (see :class:`OllamaVisionJudge`).
+    timeout_s: float = 120.0
+    #: Display to capture. Left explicit rather than inherited from the ambient
+    #: environment so a headless service cannot silently grab the wrong screen.
+    display: str | None = None
+
+
+class OllamaVisionJudge:
+    """On-screen acceptance via a local vision model (Ollama-compatible).
+
+    Answers what a text gate cannot: is the built UI *visibly* wrong -- clipped,
+    tiny, duplicated, empty? It grabs the current screen and asks the model for a
+    verdict against the task's goal.
+
+    **This seam is ADVISORY and fails OPEN, by contract.** Per
+    :class:`~psoperator.harness.protocols.VisionJudge`, an unavailable judge
+    returns ``acceptable=True`` with no findings. That is deliberate and is the
+    *only* seam allowed to do so: a missing screenshot library, a dead endpoint,
+    or a slow model must not block a change whose executed tests already passed.
+    Every other gate in this harness fails closed.
+
+    The inverse matters too: a judge that cannot see must never *invent* a
+    finding. When capture or inference fails we abstain and say why in
+    ``findings`` only when we have a real verdict -- never a fabricated defect.
+    """
+
+    #: Asked verbatim; kept short because small VLMs drift on long instructions.
+    PROMPT = (
+        "You are checking a screenshot of a desktop application for VISIBLE defects.\n"
+        "Task the app was built for: {goal}\n\n"
+        "Answer on two lines, exactly:\n"
+        "VERDICT: OK or PROBLEM\n"
+        "FINDINGS: a comma-separated list, or the word none\n\n"
+        "Report ONLY what you can see: text clipped or cut off, widgets overlapping, "
+        "controls too small to read, duplicated elements, an empty or blank window. "
+        "Do not comment on colours, styling, or wording."
+    )
+
+    def __init__(self, policy: VisionPolicy) -> None:
+        self._policy = policy
+
+    def assess(self, task: Task) -> JudgeResult:  # pragma: no cover - I/O
+        shot = self._capture()
+        if shot is None:
+            return JudgeResult(acceptable=True)  # abstain: cannot see
+        reply = self._ask(self.PROMPT.format(goal=task.goal), shot)
+        if reply is None:
+            return JudgeResult(acceptable=True)  # abstain: no verdict
+        return self._parse(reply)
+
+    # -- seams kept separate so each can be tested without the others ----------
+
+    def _capture(self) -> str | None:
+        """Base64 PNG of the primary screen, or None if capture is impossible."""
+        try:
+            import base64
+            import io
+            import os
+
+            import mss
+            from PIL import Image
+        except ImportError:
+            return None
+        try:
+            if self._policy.display:
+                os.environ["DISPLAY"] = self._policy.display
+            with mss.mss() as sct:
+                raw = sct.grab(sct.monitors[1])
+            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            return None
+
+    def _ask(self, prompt: str, image_b64: str) -> str | None:
+        import json
+        import urllib.request
+
+        body = {
+            "model": self._policy.model,
+            "temperature": 0,
+            "max_tokens": 300,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                ],
+            }],
+        }
+        url = self._policy.endpoint.rstrip("/") + "/v1/chat/completions"
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._policy.timeout_s) as resp:
+                msg = json.loads(resp.read())["choices"][0]["message"]
+        except Exception:
+            return None
+        # Reasoning models can put the text in reasoning_content with content None.
+        return msg.get("content") or msg.get("reasoning_content") or None
+
+    @staticmethod
+    def _parse(reply: str) -> JudgeResult:
+        """VERDICT/FINDINGS lines -> JudgeResult.
+
+        Unparseable output ABSTAINS rather than guessing. A judge that cannot be
+        read is not a judge that found a problem -- conflating the two turns a
+        model quirk into a fabricated defect.
+        """
+        verdict: str | None = None
+        findings: list[str] = []
+        for line in (reply or "").splitlines():
+            s = line.strip()
+            low = s.lower()
+            if low.startswith("verdict:"):
+                verdict = s.split(":", 1)[1].strip().lower()
+            elif low.startswith("findings:"):
+                body = s.split(":", 1)[1].strip()
+                if body and body.lower() not in {"none", "n/a", "-"}:
+                    findings = [f.strip() for f in body.split(",") if f.strip()]
+        if verdict is None:
+            return JudgeResult(acceptable=True)  # abstain: no readable verdict
+        if verdict.startswith("problem") or verdict.startswith("fail"):
+            return JudgeResult(acceptable=False, findings=tuple(findings) or ("unspecified visual defect",))
+        return JudgeResult(acceptable=True, findings=tuple(findings))
 
 
 class PxxReviewer:

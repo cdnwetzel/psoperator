@@ -274,3 +274,63 @@ def test_pxx_reviewer_abstains_on_unmapped_lane():
     policy = LanePolicy(models={Lane.SMALL: "m"}, endpoint="http://x:11434")
     rev = PxxReviewer(policy, cwd=".", lane=Lane.DEEP)  # DEEP is unmapped
     assert rev.review(_task()).approved is True
+
+
+# --- OllamaVisionJudge -------------------------------------------------------
+# The vision seam is the ONLY one allowed to fail open (protocols.VisionJudge).
+# These pin both halves of that contract: it abstains when it cannot see or
+# cannot be read, and it never invents a finding.
+
+from psoperator.harness.adapters import OllamaVisionJudge, VisionPolicy  # noqa: E402
+from psoperator.harness.model import Lane, Task  # noqa: E402
+
+
+def _vtask():
+    return Task(goal="a temperature converter window", scope="app",
+                gate_command="true", lane=Lane.STANDARD)
+
+
+def test_vision_parses_clean_verdict():
+    r = OllamaVisionJudge._parse("VERDICT: OK\nFINDINGS: none")
+    assert r.acceptable is True and r.findings == ()
+
+
+def test_vision_parses_problem_with_findings():
+    r = OllamaVisionJudge._parse("VERDICT: PROBLEM\nFINDINGS: label clipped, button overlaps")
+    assert r.acceptable is False
+    assert r.findings == ("label clipped", "button overlaps")
+
+
+def test_vision_problem_without_detail_still_fails_with_a_reason():
+    # A PROBLEM verdict must never surface as an empty finding list -- the loop
+    # would then record a failure nobody can act on.
+    r = OllamaVisionJudge._parse("VERDICT: PROBLEM\nFINDINGS: none")
+    assert r.acceptable is False and r.findings == ("unspecified visual defect",)
+
+
+def test_vision_abstains_on_unreadable_output():
+    # Unparseable != defective. Guessing here would turn a model quirk into a
+    # fabricated on-screen defect.
+    r = OllamaVisionJudge._parse("i'm not sure what this is")
+    assert r.acceptable is True and r.findings == ()
+
+
+def test_vision_abstains_when_capture_unavailable(monkeypatch):
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://127.0.0.1:1"))
+    monkeypatch.setattr(j, "_capture", lambda: None)
+    assert j.assess(_vtask()).acceptable is True
+
+
+def test_vision_abstains_when_endpoint_unreachable(monkeypatch):
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://127.0.0.1:1"))
+    monkeypatch.setattr(j, "_capture", lambda: "Zm9v")
+    monkeypatch.setattr(j, "_ask", lambda *a, **k: None)
+    assert j.assess(_vtask()).acceptable is True
+
+
+def test_vision_reports_a_real_defect_end_to_end(monkeypatch):
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x"))
+    monkeypatch.setattr(j, "_capture", lambda: "Zm9v")
+    monkeypatch.setattr(j, "_ask", lambda *a, **k: "VERDICT: PROBLEM\nFINDINGS: window is blank")
+    r = j.assess(_vtask())
+    assert r.acceptable is False and r.findings == ("window is blank",)
