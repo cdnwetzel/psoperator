@@ -111,7 +111,7 @@ and mandatory review would complete the fence.
 ## Status
 
 Design + core + adapters + the local-review (tier-1) seam landed with tests.
-**Proven live end-to-end** against the tempconv-gui repo on orin1: the harness
+**Proven live end-to-end** against a small Tkinter GUI repo on a LAN Jetson node: the harness
 drove gpt-oss:20b (LAN) through the whole pipeline with no Claude in the loop —
 coding fix → gate verification → local review → committed fix — and produced
 the evidence bundle. Not yet wired: a CLI entry (`psoperator harness run`), the

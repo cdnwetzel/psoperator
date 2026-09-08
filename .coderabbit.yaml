@@ -51,7 +51,7 @@ reviews:
     - path: "psoperator/presets/**"
       instructions: |
         Operator fleet presets with fail-closed addressing invariants. This repo
-        is going public: flag any organisation name, internal hostname, or
-        internal private-LAN address; do not flag device-model hostnames or the
-        10.0.1.0/24 example range. Example presets use documentation-range
-        placeholders (RFC-5737, e.g. 203.0.113.0/24).
+        is public: flag any organisation name, internal hostname, or internal
+        private-LAN address. Both example fleets use RFC-5737 documentation
+        ranges — 192.0.2.0/24 (home) and 203.0.113.0/24 (work) — and there is no
+        approved exception for real addresses or hostnames.

@@ -37,8 +37,8 @@ class TestPresetsLoad:
         assert cfg.model_api_key == "not-needed"
         assert cfg.embeddings_url == "http://127.0.0.1:8005"
         assert cfg.qdrant_url == "http://127.0.0.1:6333"
-        assert cfg.reranker_url == "http://10.0.1.115:8006"
-        assert cfg.grounder_url == "http://mac-mini:11434/v1"
+        assert cfg.reranker_url == "http://192.0.2.115:8006"
+        assert cfg.grounder_url == "http://grounder-host:11434/v1"
 
     def test_work_preset_loads_by_name(self):
         cfg = PSOperatorConfig.from_preset("work")
@@ -79,22 +79,22 @@ class TestPresetsLoad:
 # ------------------------------------------------------------------ home invariants
 class TestHomeAddressing:
     def test_rejects_port_8004_ungoverned(self, tmp_path):
-        bad = _mutate(tmp_path, HOME, "http://10.0.1.125:8003/v1", "http://10.0.1.125:8004/v1")
+        bad = _mutate(tmp_path, HOME, "http://192.0.2.125:8003/v1", "http://192.0.2.125:8004/v1")
         with pytest.raises(ConfigError, match="governed audit proxy"):
             load_preset(bad)
 
     def test_rejects_hostname(self, tmp_path):
-        bad = _mutate(tmp_path, HOME, "http://10.0.1.125:8003/v1", "http://precision-t5810:8003/v1")
+        bad = _mutate(tmp_path, HOME, "http://192.0.2.125:8003/v1", "http://planner-host:8003/v1")
         with pytest.raises(ConfigError, match="hostname"):
             load_preset(bad)
 
     def test_rejects_stale_ip(self, tmp_path):
-        bad = _mutate(tmp_path, HOME, "http://10.0.1.125:8003/v1", "http://10.0.1.51:8003/v1")
+        bad = _mutate(tmp_path, HOME, "http://192.0.2.125:8003/v1", "http://192.0.2.51:8003/v1")
         with pytest.raises(ConfigError, match="stale"):
             load_preset(bad)
 
     def test_rejects_any_other_planner_url(self, tmp_path):
-        bad = _mutate(tmp_path, HOME, "http://10.0.1.125:8003/v1", "http://10.0.1.125:9000/v1")
+        bad = _mutate(tmp_path, HOME, "http://192.0.2.125:8003/v1", "http://192.0.2.125:9000/v1")
         with pytest.raises(ConfigError, match="must be exactly"):
             load_preset(bad)
 
@@ -102,7 +102,7 @@ class TestHomeAddressing:
         "field_line",
         [
             (
-                'reranker_url = "http://10.0.1.115:8006"',
+                'reranker_url = "http://192.0.2.115:8006"',
                 'reranker_url = "http://203.0.113.10:8006"',
             ),
             ('qdrant_url = "http://127.0.0.1:6333"', 'qdrant_url = "http://203.0.113.20:6333"'),
@@ -131,7 +131,7 @@ class TestWorkAddressing:
             tmp_path,
             WORK,
             'ocr_url = "http://203.0.113.10:8089"',
-            'ocr_url = "http://10.0.1.115:8089"',
+            'ocr_url = "http://192.0.2.115:8089"',
         )
         with pytest.raises(ConfigError, match="cross-reference"):
             load_preset(bad)

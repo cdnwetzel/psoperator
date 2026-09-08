@@ -4,7 +4,7 @@
 # only — every LLM call goes via the psrouter at http://203.0.113.10:8888/v1
 # (on 7960). Bare-proc and unrouted LAN endpoints are out-of-policy and
 # from_preset() rejects them fail-closed. No field may reference the home
-# fleet network (10.0.1.0/24). The documented 7960:8003 tunnel is deliberately
+# fleet network (192.0.2.0/24). The documented 7960:8003 tunnel is deliberately
 # NOT encoded.
 #
 # Usage:

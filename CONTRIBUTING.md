@@ -70,9 +70,11 @@ findings **do** block. Human authority owns the merge either way.
    self-approved or self-merged.
 4. **Data-egress surfaces come only from operator config/env/CLI**, never a
    checked-in file. No secrets, organisation names, internal hostnames, or
-   internal private-LAN addresses in tracked content; example presets use
-   documentation-range placeholders (RFC-5737). The `10.0.1.0/24` range and
-   device-model hostnames are the one approved exception (operator policy).
+   internal private-LAN addresses in tracked content. Example presets use
+   documentation-range placeholders (RFC-5737) throughout: `192.0.2.0/24`
+   (TEST-NET-1) for the home fleet, `203.0.113.0/24` (TEST-NET-3) for work.
+   There is no approved exception — a real deployment address in a tracked file
+   is a defect regardless of which range it comes from.
 5. **Evidence beats assertion.** "Verified"/"proven"/"attested" language must be
    backed by an artifact; claims must match what the code and tests do.
 

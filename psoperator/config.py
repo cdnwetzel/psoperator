@@ -26,17 +26,17 @@ from psoperator.common.schema import MAX_SNAPSHOT_ELEMENTS, MAX_SNAPSHOT_TTL_SEC
 # preset values as explicit constructor arguments that take precedence over env,
 # so env does NOT override a loaded preset.
 # HOME: the planner is reachable ONLY through the governed audit proxy at
-# 10.0.1.125:8003. Port 8004 bypasses the proxy (no audit), the hostname
-# "precision-t5810" is not pinnable to the governed host, and 10.0.1.51 is a
+# 192.0.2.125:8003. Port 8004 bypasses the proxy (no audit), the hostname
+# "planner-host" is not pinnable to the governed host, and 192.0.2.51 is a
 # stale, wrong address. WORK: everything is routed via the psrouter at
 # 203.0.113.10:8888/v1; unrouted LAN endpoints are out-of-policy.
-# The two fleets must never reference each other's networks (10.0.1.0/24 vs
+# The two fleets must never reference each other's networks (192.0.2.0/24 vs
 # 203.0.113.0/24).
-HOME_PLANNER_URL = "http://10.0.1.125:8003/v1"
-HOME_PLANNER_HOSTNAME = "precision-t5810"
-HOME_PLANNER_STALE_IP = "10.0.1.51"
+HOME_PLANNER_URL = "http://192.0.2.125:8003/v1"
+HOME_PLANNER_HOSTNAME = "planner-host"
+HOME_PLANNER_STALE_IP = "192.0.2.51"
 WORK_PSROUTER_URL = "http://203.0.113.10:8888/v1"
-HOME_NET = ipaddress.ip_network("10.0.1.0/24")
+HOME_NET = ipaddress.ip_network("192.0.2.0/24")
 WORK_NET = ipaddress.ip_network("203.0.113.0/24")
 
 _PRESETS_DIR = Path(__file__).resolve().parent / "presets"
@@ -295,7 +295,7 @@ def _validate_fleet_addressing(cfg: PSOperatorConfig, fleet: str, source: str) -
             if ip is not None and ip in HOME_NET:
                 raise ConfigError(
                     f"Work preset ({source}) model_endpoint {ep!r} references the "
-                    "home fleet network 10.0.1.0/24. Fleets must not cross-reference."
+                    "home fleet network 192.0.2.0/24. Fleets must not cross-reference."
                 )
             raise ConfigError(
                 f"Work preset ({source}) model_endpoint must route via the psrouter "
