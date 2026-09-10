@@ -397,6 +397,35 @@ record.
 These items require separate design decisions and must not enter through an
 implementation shortcut or undocumented configuration flag.
 
+### Deferred tracked items
+
+Committed future work, recorded here so its prerequisites are not forgotten when
+the milestone that needs it arrives.
+
+#### D-01 — Second-platform attestation port (Windows/UIA capture path)
+
+The pilot proves the governance loop on one platform (Linux/AT-SPI, per R-303
+and the R-304 reference workflow). A later breadth demo on Windows — where UIA
+exposes the richest accessibility tree — is expected in the post-pilot era. When
+it is scheduled, its capture path must re-prove the frame-hash contract *before*
+the demo, not after:
+
+- Wire the independent observer, the attestation key path, and the `doctor`
+  probe on the Windows capture pipeline (screen grab -> PNG -> RGB), so it
+  satisfies the same software<->software byte-equality path the Linux and macOS
+  capture already do.
+- Add the cross-repo frame-hash contract test (the dx.observer reader against
+  the Windows writer) alongside the existing Linux/macOS one, so a change to the
+  Windows capture pipeline fails in CI rather than at an operator's desk.
+- Only then build the UIA reference workflow.
+
+Rationale: a breadth demo whose observer is unwired would undercut the
+governance pitch at exactly the moment a skeptical audience hears it. Attestation
+leads; coverage follows — the same sequencing rule that puts the proven loop
+before any hardware purchase (infrastructure follows a proven loop, never
+precedes it). Prerequisite: a Windows host in the fleet, of which there is none
+today — every wired headless capture host is Linux or macOS.
+
 ## 11. Cross-cutting definition of done
 
 Every roadmap item that changes runtime behavior must include:
