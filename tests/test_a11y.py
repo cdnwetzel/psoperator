@@ -64,9 +64,12 @@ class FakeAcc:
 
 def _invoice_desktop():
     """A desktop whose one app holds an invoice-entry frame — the demo shape."""
-    vendor = FakeAcc("entry", "Vendor", extents=FakeExtents(10, 40, 200, 24))
-    total = FakeAcc("entry", "Invoice Total", extents=FakeExtents(10, 70, 200, 24))
-    submit = FakeAcc("push button", "Submit", extents=FakeExtents(10, 110, 80, 30))
+    # Real AT-SPI roles, validated live on the AT-SPI host (2026-09-11): a
+    # Gtk.Entry exposes role "text", a Gtk.Button exposes "button" — not
+    # "entry"/"push button" (psoperator #2). The fakes mirror the real writer.
+    vendor = FakeAcc("text", "Vendor", extents=FakeExtents(10, 40, 200, 24))
+    total = FakeAcc("text", "Invoice Total", extents=FakeExtents(10, 70, 200, 24))
+    submit = FakeAcc("button", "Submit", extents=FakeExtents(10, 110, 80, 30))
     frame = FakeAcc("frame", "Invoice Entry", children=[vendor, total, submit])
     app = FakeAcc("application", "invoice-fixture", children=[frame])
     return FakeAcc("desktop frame", "main", children=[app])
@@ -90,13 +93,23 @@ def test_roles_are_lowercased_and_names_preserved():
     frame = tree.children[0].children[0]
     assert frame.role == "frame"  # "frame" already lower; role is casefolded
     roles = {n.role for n in frame.walk()}
-    assert "push button" in roles  # AT-SPI's spaced role, lowercased, intact
+    assert {"text", "button"} <= roles  # the real GTK-fixture roles (psoperator #2)
     names = {n.name for n in frame.walk()}
     assert {"Vendor", "Invoice Total", "Submit"} <= names
 
 
+def test_a_spaced_role_is_lowercased_intact():
+    # AT-SPI has spaced role names ("page tab", "menu item", "check box");
+    # getRoleName() may return them mixed-case, and the walk must lowercase
+    # without dropping the space.
+    tab = FakeAcc("Page Tab", "Details")
+    app = FakeAcc("application", "app", children=[FakeAcc("frame", "f", children=[tab])])
+    node = _provider(FakeAcc("desktop frame", "d", children=[app])).find(name="Details")
+    assert node is not None and node.role == "page tab"
+
+
 def test_bounds_come_from_getextents_in_the_configured_coords():
-    total = _provider(_invoice_desktop()).find(role="entry", name="Invoice Total")
+    total = _provider(_invoice_desktop()).find(role="text", name="Invoice Total")
     assert total is not None
     assert total.bounds == (10, 70, 200, 24)
 
@@ -118,9 +131,9 @@ def test_bounds_are_none_when_the_element_has_no_component():
 
 def test_find_locates_a_field_through_the_real_walk():
     prov = _provider(_invoice_desktop())
-    submit = prov.find(role="push button", name="submit")  # find casefolds name
+    submit = prov.find(role="button", name="submit")  # find casefolds name
     assert submit is not None and submit.name == "Submit"
-    assert prov.find(role="push button", name="nonexistent") is None
+    assert prov.find(role="button", name="nonexistent") is None
 
 
 def test_max_nodes_budget_truncates_like_the_windows_walk():

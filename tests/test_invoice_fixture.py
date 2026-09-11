@@ -47,11 +47,13 @@ def test_construction_rejects_a_row_set_that_drifts_from_field_names(monkeypatch
 def _fixture_desktop():
     """A fake AT-SPI desktop shaped exactly like the GTK fixture: one app, one
     frame titled WINDOW_TITLE, an entry per FIELD_NAMES, and the submit button.
+    Uses the real AT-SPI roles the live stack emits: "text" for a GTK Entry,
+    "button" for a GTK Button (psoperator #2).
     Mirrors what build_window constructs, without needing a display."""
     from tests.test_a11y import FakeAcc
 
-    entries = [FakeAcc("entry", name) for name in FIELD_NAMES]
-    submit = FakeAcc("push button", SUBMIT_NAME)
+    entries = [FakeAcc("text", name) for name in FIELD_NAMES]  # GTK Entry -> AT-SPI "text"
+    submit = FakeAcc("button", SUBMIT_NAME)  # GTK Button -> AT-SPI "button"
     frame = FakeAcc("frame", WINDOW_TITLE, children=[*entries, submit])
     app = FakeAcc("application", "invoice-fixture", children=[frame])
     return FakeAcc("desktop frame", "main", children=[app])
@@ -60,7 +62,7 @@ def _fixture_desktop():
 def test_the_walk_surfaces_every_previewed_field():
     prov = AtSpiA11y(desktop=_fixture_desktop(), coord_type=None)
     for name, _ in field_rows(DEMO_INVOICE):
-        node = prov.find(role="entry", name=name)
+        node = prov.find(role="text", name=name)
         assert node is not None, f"walk did not surface field {name!r}"
         assert node.name == name
 
@@ -68,7 +70,7 @@ def test_the_walk_surfaces_every_previewed_field():
 def test_the_walk_finds_the_frame_by_window_title_and_the_submit_button():
     prov = AtSpiA11y(desktop=_fixture_desktop(), coord_type=None)
     assert prov.find(role="frame", name=WINDOW_TITLE) is not None
-    assert prov.find(role="push button", name=SUBMIT_NAME) is not None
+    assert prov.find(role="button", name=SUBMIT_NAME) is not None
 
 
 def test_check_mode_runs_without_a_display():
