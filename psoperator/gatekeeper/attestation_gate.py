@@ -19,6 +19,8 @@ never reaches the replay bookkeeping):
    refuses the rest — a later trust decision, never automatic.
 4. **not-yet-valid / expired** — now is outside ``[issued_at, expires_at]``.
 5. **replayed-nonce** — this nonce was already admitted under the pinned epoch.
+6. **stale-frame** — the snapshot frame id does not advance past the last admitted
+   (an older frame replayed after a newer one — a rollback).
 
 Epoch pinning and nonce recording happen only after *every* check passes, so a
 rejected envelope can neither pin an epoch nor consume a nonce.
@@ -84,6 +86,7 @@ class AttestationGate:
         self._record = record or (lambda receipt: None)
         self._max_nonces = max_nonces
         self._seen: OrderedDict[str, None] = OrderedDict()
+        self._last_frame_id: int | None = None
 
     @property
     def pinned_epoch(self) -> str | None:
@@ -143,14 +146,26 @@ class AttestationGate:
             raise EnvelopeRejected("expired", f"now {now} > expires_at {body.expires_at}")
         if body.nonce in self._seen:
             raise EnvelopeRejected("replayed-nonce", body.nonce)
+        # Observer frame ids strictly increase; a non-increasing one is an older
+        # frame replayed after a newer (still within its TTL, a fresh nonce, so
+        # the checks above pass). Reject the rollback at this boundary rather than
+        # leaving it to freshness downstream.
+        if self._last_frame_id is not None and body.snapshot.frame_id <= self._last_frame_id:
+            raise EnvelopeRejected(
+                "stale-frame",
+                f"frame {body.snapshot.frame_id} does not advance past last admitted "
+                f"{self._last_frame_id}",
+            )
 
         # Every check passed — only now commit state, so a rejected envelope can
-        # neither pin an epoch (trust-on-first-use) nor burn a nonce.
+        # neither pin an epoch (trust-on-first-use), burn a nonce, nor advance the
+        # frame watermark.
         if self._epoch is None:
             self._epoch = body.observer_epoch
         self._seen[body.nonce] = None
         while len(self._seen) > self._max_nonces:
             self._seen.popitem(last=False)
+        self._last_frame_id = body.snapshot.frame_id
         return AdmittedFrame(
             key_id=body.key_id,
             observer_epoch=body.observer_epoch,

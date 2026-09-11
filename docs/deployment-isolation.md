@@ -41,6 +41,13 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   the IPC secret (loopback + secret), and every observer envelope it forwards is
   independently authenticated by the R-203 gate before anything trusts it.
 
+- **Pinned observer epoch (no restart-race).** The R-203 gate can pin the expected
+  observer epoch out of band via `observer_epoch` in config. Set it in production:
+  otherwise the gate trusts the first envelope after each restart (trust-on-first-use),
+  and a compromised planner could race a restart to replay a still-valid envelope from
+  an *old* epoch, pinning it and rejecting current frames (CWE-384). Trust-on-first-use
+  is acceptable only in dev.
+
 These invariants are asserted in `tests/test_deployment_isolation.py` and the
 attestation suite.
 

@@ -103,6 +103,14 @@ class PSOperatorConfig(BaseSettings):
         description="Owner-only key file provisioned under the observer service account. "
         "Required to start the observer; never auto-created by service startup.",
     )
+    observer_epoch: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Pin the gatekeeper's expected observer epoch out of band (64 hex "
+        "chars). When set, the R-203 gate admits only this epoch, so a service restart "
+        "cannot reset trust — a compromised planner cannot race a restart to pin an old "
+        "epoch (CWE-384). Unset falls back to trust-on-first-use, acceptable only in dev.",
+    )
     observer_snapshot_ttl_s: float = Field(
         default=10.0,
         gt=0,

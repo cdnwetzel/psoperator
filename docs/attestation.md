@@ -86,12 +86,21 @@ loading fail closed until PSOperator has an ACL implementation that can prove
 the planner account lacks read access; `chmod(0600)` is not treated as an ACL
 substitute on Windows.
 
-HMAC verification requires the gatekeeper to receive a separately installed,
-owner-only copy of the same key material through an operator-controlled secret
-provisioning channel. The copy and its containing directory must be owned by the
-gatekeeper service account, and both copies must be unreadable by the planner.
-R-203 will configure the gatekeeper's explicit trusted-key paths; repository
-config must never contain the secret.
+HMAC verification requires the gatekeeper to hold the same key material the
+observer signs with, and the planner must never read it. R-205 resolved the
+account topology (`docs/deployment-isolation.md`): the observer and gatekeeper run
+as **one governance account** that owns a single owner-only key, and the untrusted
+planner is a separate account with no read access. The key loader's owner-uid +
+mode-0600 checks make cross-account reads impossible, which is *why* the two share
+an account under symmetric HMAC — so `observer_attestation_key_path` is the one
+key both read, never a repository secret.
+
+A three-account variant (observer, gatekeeper, planner all separate) is possible
+without weakening owner-only or moving to group permissions: each of the observer
+and gatekeeper accounts holds its **own** owner-only copy of the same secret,
+installed through an operator-controlled channel, and the gatekeeper is given a
+distinct trusted-key path. That is a stricter deployment; the two-account topology
+is the shipped default. Full asymmetric isolation is the deferred option C.
 
 ## Rotation and retirement
 

@@ -146,3 +146,30 @@ def test_tofu_pins_the_first_epoch_then_refuses_others():
         other = _signer(_key(), epoch=EPOCH_B).sign(_snapshot(), issued_at=101.0)
         gate.admit(other, now=105.0)
     assert exc.value.reason == "stale-epoch"
+
+
+# --- frame-rollback (monotonic frame id) ------------------------------------
+
+
+def _env_frame(frame_id: int, nonce: str):
+    snap = PerceptionSnapshot(
+        frame_id=frame_id, captured_at=100.0, frame_hash="f" * 64, screen_size=(80, 60)
+    )
+    signer = SnapshotSigner(_key(), ttl_s=10.0, observer_epoch=EPOCH_A, nonce_factory=lambda: nonce)
+    return signer.sign(snap, issued_at=101.0)
+
+
+def test_a_non_increasing_frame_is_rejected_as_a_rollback():
+    # An older frame (7), freshly re-attested with a new nonce, passes signature/
+    # epoch/lifetime/nonce — but arriving after frame 8 it is a rollback.
+    gate = _gate()
+    gate.admit(_env_frame(8, "8" * 64), now=105.0)
+    with pytest.raises(EnvelopeRejected) as exc:
+        gate.admit(_env_frame(7, "7" * 64), now=105.0)
+    assert exc.value.reason == "stale-frame"
+
+
+def test_frames_that_advance_are_admitted():
+    gate = _gate()
+    gate.admit(_env_frame(8, "8" * 64), now=105.0)
+    gate.admit(_env_frame(9, "9" * 64), now=105.0)  # advances past 8 -> admitted, no raise
