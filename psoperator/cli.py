@@ -96,7 +96,11 @@ def _run_gatekeeper(config: PSOperatorConfig) -> int:
         )
         return 1
     keyring = AttestationKeyring([load_attestation_key(key_path)])
-    gate = AttestationGate(keyring, expected_epoch=None, record=gatekeeper.record_envelope_event)
+    # Pin the epoch out of band when configured (closes the restart-race); else
+    # trust-on-first-use (dev only).
+    gate = AttestationGate(
+        keyring, expected_epoch=config.observer_epoch, record=gatekeeper.record_envelope_event
+    )
 
     print(f"gatekeeper listening on {config.gatekeeper_host}:{config.gatekeeper_port}")
     serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness, gate)
