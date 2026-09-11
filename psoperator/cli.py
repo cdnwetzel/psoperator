@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from psoperator.common.attestation import (
     AttestationKeyError,
+    AttestationKeyring,
     SnapshotSigner,
     load_attestation_key,
     provision_attestation_key,
@@ -15,6 +17,7 @@ from psoperator.common.auth import load_or_create_secret
 from psoperator.config import PSOperatorConfig, load_config
 from psoperator.gatekeeper import killswitch
 from psoperator.gatekeeper.approval import CLIApproval
+from psoperator.gatekeeper.attestation_gate import AttestationGate
 from psoperator.gatekeeper.audit import verify
 from psoperator.gatekeeper.gatekeeper import Gatekeeper
 from psoperator.gatekeeper.remote_executor import RemoteExecutor
@@ -76,8 +79,23 @@ def _run_gatekeeper(config: PSOperatorConfig) -> int:
     freshness = FreshnessTracker()
     executor = RemoteExecutor(config.executor_host, config.executor_port, secret)
     gatekeeper = Gatekeeper(config, freshness, CLIApproval(), executor)
+
+    # R-203: the service authenticates observer envelopes, so it cannot start
+    # without the observer's attestation key. Fail closed rather than serve an
+    # untrusted planner with no way to verify what it sends.
+    key_path = config.observer_attestation_key_path
+    if key_path is None:
+        print(
+            "gatekeeper service requires observer_attestation_key_path to authenticate "
+            "observer envelopes (R-203); refusing to start without it.",
+            file=sys.stderr,
+        )
+        return 1
+    keyring = AttestationKeyring([load_attestation_key(key_path)])
+    gate = AttestationGate(keyring, expected_epoch=None, record=gatekeeper.record_envelope_event)
+
     print(f"gatekeeper listening on {config.gatekeeper_host}:{config.gatekeeper_port}")
-    serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness)
+    serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness, gate)
     return 0
 
 

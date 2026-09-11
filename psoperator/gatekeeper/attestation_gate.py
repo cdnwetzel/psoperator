@@ -105,6 +105,7 @@ class AttestationGate:
                     "key_id": body.key_id,
                     "observer_epoch": body.observer_epoch,
                     "nonce": body.nonce,
+                    "frame_id": body.snapshot.frame_id,
                     "frame_hash": body.snapshot.frame_hash,
                     "at": moment,
                 }
@@ -117,6 +118,7 @@ class AttestationGate:
                 "key_id": frame.key_id,
                 "observer_epoch": frame.observer_epoch,
                 "nonce": frame.nonce,
+                "frame_id": body.snapshot.frame_id,
                 "frame_hash": frame.frame_hash,
                 "at": moment,
             }
