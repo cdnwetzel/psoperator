@@ -84,6 +84,20 @@ class Gatekeeper:
         self._audit = AuditLog(config.audit_log_path)
         self._policy = load_policy(config.risk_policy_path)
 
+    def record_envelope_event(self, receipt: dict) -> None:
+        """Append an R-203 envelope-authentication verdict (admitted or a named
+        rejection) to the same hash-chained audit the decisions use, so a refused
+        forgery leaves a durable, tamper-evident receipt — not just a response."""
+        self._audit.append(
+            frame_id=int(receipt.get("frame_id", 0)),
+            frame_hash=str(receipt.get("frame_hash", "-")),
+            action={},
+            tier=0,
+            decision=f"ENVELOPE_{str(receipt['outcome']).upper()}",
+            approver="gatekeeper",
+            reason=str(receipt.get("reason") or receipt["outcome"]),
+        )
+
     # ------------------------------------------------------------------ API
     def request_action(
         self,

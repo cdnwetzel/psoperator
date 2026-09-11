@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from PIL import Image
 
-from psoperator.common.attestation import AttestationKey, SnapshotSigner
+from psoperator.common.attestation import AttestationKey, AttestationKeyring, SnapshotSigner
 from psoperator.common.schema import PerceptionSnapshot, UIElementRef
 from psoperator.config import load_config
 from psoperator.gatekeeper import killswitch
 from psoperator.gatekeeper.approval import AutoApprove
+from psoperator.gatekeeper.attestation_gate import AttestationGate
 from psoperator.gatekeeper.gatekeeper import DecisionKind, Gatekeeper
 from psoperator.gatekeeper.risk import ActionContext
 from psoperator.perception.a11y import A11yNode
@@ -131,13 +132,22 @@ def test_separated_gatekeeper_accepts_only_attestation_envelope_shape(tmp_path):
         kill_switch_path=tmp_path / "STOP",
     )
     freshness = FreshnessTracker()
+    frame = _frame()
+    # R-203: the service authenticates the envelope, so its gate must hold the
+    # observer's key and a clock inside the envelope's validity window.
+    observer_key = AttestationKey("observer-v1", b"s" * 32)
+    gate = AttestationGate(
+        AttestationKeyring([observer_key]),
+        expected_epoch="e" * 64,
+        clock=lambda: frame.captured_at + 2,
+    )
     service = GatekeeperService(
         Gatekeeper(config, freshness, approval_backend=AutoApprove(), executor=executor),
         freshness,
+        gate,
     )
-    frame = _frame()
     envelope = SnapshotSigner(
-        AttestationKey("observer-v1", b"s" * 32),
+        observer_key,
         observer_epoch="e" * 64,
     ).sign(_snapshot(frame), issued_at=frame.captured_at + 1)
     action = Action(ActionKind.CLICK, 1, target_element_id="button-save")
