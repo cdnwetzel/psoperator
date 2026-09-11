@@ -15,6 +15,7 @@ import stat
 
 import pytest
 
+import psoperator.common.attestation as attestation
 from psoperator.common.attestation import (
     AttestationKeyError,
     load_attestation_key,
@@ -72,3 +73,18 @@ def test_the_key_directory_must_be_owner_only(tmp_path):
     permissive.chmod(0o755)
     with pytest.raises(AttestationKeyError, match="group/other"):
         provision_attestation_key(permissive / "key.json", "observer-v1")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="simulates Windows from a POSIX host")
+def test_unclaimed_platform_windows_fails_closed(tmp_path, monkeypatch):
+    # A3 / the support matrix: the isolation rests on POSIX semantics, so an
+    # unclaimed platform (Windows) must REFUSE to provision or load a key rather
+    # than trust an unverified NTFS ACL. Simulate os.name == "nt" from POSIX.
+    key = tmp_path / "observer-key.json"
+    provision_attestation_key(key, "observer-v1")  # POSIX provisioning works
+
+    monkeypatch.setattr(attestation.os, "name", "nt")
+    with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
+        provision_attestation_key(tmp_path / "other.json", "observer-v2")
+    with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
+        load_attestation_key(key)
