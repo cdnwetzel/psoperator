@@ -40,6 +40,10 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("kill", help="engage the global action kill switch")
     commands.add_parser("resume", help="explicitly disengage the kill switch")
+    commands.add_parser(
+        "kill-drill",
+        help="engage the kill switch against a canary and verify it pre-empts (audited)",
+    )
 
     audit = commands.add_parser("audit-verify", help="verify the audit hash chain")
     audit.add_argument("path", nargs="?", type=Path)
@@ -169,6 +173,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resume":
         killswitch.disengage(config.kill_switch_path)
         print(f"kill switch disengaged: {config.kill_switch_path}")
+        return 0
+    if args.command == "kill-drill":
+        from PIL import Image
+
+        from psoperator.gatekeeper.drills import DrillFailed, kill_switch_drill
+        from psoperator.gatekeeper.executor import DryRunExecutor
+        from psoperator.perception.capture import Frame
+        from psoperator.runtime.actions import Action, ActionKind
+        from psoperator.runtime.freshness import FreshnessTracker
+
+        gatekeeper = Gatekeeper(config, FreshnessTracker(), CLIApproval(), DryRunExecutor())
+        canary = Action(ActionKind.WAIT, 1, seconds=0.0)
+        frame = Frame.from_image(1, Image.new("RGB", (8, 8), "black"))
+        try:
+            result = kill_switch_drill(
+                gatekeeper, config.kill_switch_path, action=canary, frame=frame
+            )
+        except DrillFailed as exc:
+            print(f"KILL-SWITCH DRILL FAILED: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"kill-switch drill passed: canary pre-empted -> {result.decision_kind}; "
+            f"receipt appended to {config.audit_log_path}"
+        )
         return 0
     if args.command == "audit-verify":
         result = verify(args.path or config.audit_log_path)
