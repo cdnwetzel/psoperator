@@ -27,7 +27,6 @@ class DrillFailed(Exception):
 class DrillResult:
     preempted: bool
     decision_kind: str
-    audit_seq: int | None
 
 
 def kill_switch_drill(
@@ -54,4 +53,4 @@ def kill_switch_drill(
             f"kill switch did not pre-empt the canary action: got {decision.kind.value}, "
             "expected kill-switched. The stop is not enforced — stop the line."
         )
-    return DrillResult(preempted=True, decision_kind=decision.kind.value, audit_seq=None)
+    return DrillResult(preempted=True, decision_kind=decision.kind.value)

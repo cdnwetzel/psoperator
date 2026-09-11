@@ -173,3 +173,12 @@ def test_frames_that_advance_are_admitted():
     gate = _gate()
     gate.admit(_env_frame(8, "8" * 64), now=105.0)
     gate.admit(_env_frame(9, "9" * 64), now=105.0)  # advances past 8 -> admitted, no raise
+
+
+def test_max_nonces_below_one_is_refused():
+    # A cap < 1 would evict every nonce on insert, silently disabling replay
+    # rejection — the constructor refuses it (psoperator #4).
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="max_nonces"):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, max_nonces=0)

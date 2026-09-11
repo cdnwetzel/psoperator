@@ -48,8 +48,8 @@ DEFAULT_MAX_NONCES = 4096
 class EnvelopeRejected(Exception):
     """An observer envelope failed authentication. ``reason`` is a stable slug
     (unknown-key, bad-signature, stale-epoch, not-yet-valid, expired,
-    replayed-nonce) so callers and receipts can branch without string-matching a
-    message."""
+    replayed-nonce, stale-frame) so callers and receipts can branch without
+    string-matching a message."""
 
     def __init__(self, reason: str, detail: str = "") -> None:
         self.reason = reason
@@ -84,6 +84,9 @@ class AttestationGate:
         self._epoch = expected_epoch
         self._clock = clock
         self._record = record or (lambda receipt: None)
+        if max_nonces < 1:
+            raise ValueError("max_nonces must be >= 1; a smaller cap would evict every "
+                             "nonce and disable replay rejection")
         self._max_nonces = max_nonces
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._last_frame_id: int | None = None

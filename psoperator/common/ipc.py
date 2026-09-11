@@ -61,7 +61,8 @@ class IPCServer:
         self.port = port
 
     def serve_forever(self, handler: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.port))
             server.listen(16)

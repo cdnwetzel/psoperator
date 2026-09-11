@@ -117,7 +117,12 @@ def _run_observer(config: PSOperatorConfig, backend: str | None) -> int:
     except AttestationKeyError as exc:
         print(f"observer unavailable: {exc}")
         return 2
-    signer = SnapshotSigner(key, ttl_s=config.observer_snapshot_ttl_s)
+    # Sign with the configured epoch when pinned, so a gatekeeper pinned to the
+    # same observer_epoch actually matches this observer (else every envelope is
+    # rejected). Unset -> a fresh random epoch per lifetime (dev / TOFU).
+    signer = SnapshotSigner(
+        key, ttl_s=config.observer_snapshot_ttl_s, observer_epoch=config.observer_epoch
+    )
     snapshots = SnapshotBuilder(max_elements=config.observer_max_elements)
     capture = build_observer_capture(config, backend)
     selected = backend or config.capture_backend

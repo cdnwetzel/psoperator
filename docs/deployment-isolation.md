@@ -9,11 +9,15 @@ enforce it.
 
 | account | runs | holds | trust |
 | --- | --- | --- | --- |
-| **governance** (e.g. `psoperator`) | the observer **and** the gatekeeper | the attestation key (owner-only), the IPC secret, the audit log | trusted |
+| **governance** (e.g. `psoperator`) | the observer, the gatekeeper, **and** the executor | the attestation key (owner-only), the IPC secret (owner-only), the audit log | trusted |
 | **planner** (e.g. `psagent`) | the agent / model loop | nothing security-critical | **untrusted** — may be injected or compromised |
 
-The planner reaches the gatekeeper **only** over loopback IPC, authenticating
-with the shared IPC secret. It never sees the attestation key.
+The planner reaches the gatekeeper **only** over loopback IPC, and its request
+is authenticated by the R-203 envelope gate (signature + epoch + freshness +
+replay), never by a shared secret it holds — it never sees the attestation key.
+The **IPC secret** authenticates the *gatekeeper → executor* hop, so a planner
+that bypassed the gatekeeper still cannot drive input: it lacks the secret the
+executor requires.
 
 ### Why observer and gatekeeper share one account
 
@@ -37,9 +41,10 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
 - **Loopback-only IPC** (`common/ipc.py`). `IPCServer` refuses to bind anything
   but `127.0.0.1` / `::1` / `localhost`. The gatekeeper and executor services are
   never exposed on a routable interface; a remote party cannot reach them at all.
-- **Authenticated planner IPC.** The planner authenticates to the gatekeeper with
-  the IPC secret (loopback + secret), and every observer envelope it forwards is
-  independently authenticated by the R-203 gate before anything trusts it.
+- **Authenticated hops.** The planner→gatekeeper request is authenticated by the
+  R-203 envelope gate (not a secret the planner holds); the gatekeeper→executor
+  hop is signed with the owner-only IPC secret, which the planner does not have —
+  so it cannot reach the input device directly.
 
 - **Pinned observer epoch (no restart-race).** The R-203 gate can pin the expected
   observer epoch out of band via `observer_epoch` in config. Set it in production:
@@ -59,18 +64,22 @@ attestation suite.
    pre-created owner-only directory:
    ```sh
    install -d -m 700 ~/.local/state/psoperator/keys
-   psoperator provision-attestation-key   # writes an owner-only 0600 key
+   psoperator attestation-keygen --key-id observer-v1 \
+     --path ~/.local/state/psoperator/keys/observer.json   # owner-only 0600 key
+   export PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH=~/.local/state/psoperator/keys/observer.json
    ```
-   Set `observer_attestation_key_path` to that file. The gatekeeper service
-   **refuses to start without it** (fail closed).
-3. **Run the services under their accounts** — one service manager unit per
-   account (systemd on most Linux; OpenRC on the Gentoo host, where the observer
-   already runs as a supervised service). Observer and gatekeeper run as
-   `governance`; the agent loop runs as `planner`.
+   The gatekeeper service **refuses to start without this key** (fail closed).
+   To pin the epoch out of band (recommended, closes the restart-race), set
+   `PSOPERATOR_OBSERVER_EPOCH` to the same 64-hex value on **both** the observer
+   and gatekeeper.
+3. **Run the services under their accounts.** The observer, gatekeeper, and
+   executor services run as `governance` (one service-manager unit each — systemd
+   on most Linux; OpenRC on the Gentoo host, where the observer already runs
+   supervised); the agent loop runs as `planner`.
 4. **Verify the boundary:**
    ```sh
-   stat -c '%a %U' "$observer_attestation_key_path"   # expect: 600 governance
-   ss -ltnp | grep -E '127.0.0.1:(8764|8765|8766)'    # loopback only
+   stat -c '%a %U' "$PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH"  # expect: 600 governance
+   ss -ltnp | grep -E '127\.0\.0\.1:(8764|8765|8766)'         # loopback only
    ```
 
 ## Platform support matrix (R-203/R-205)
