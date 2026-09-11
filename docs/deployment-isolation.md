@@ -12,12 +12,14 @@ enforce it.
 | **governance** (e.g. `psoperator`) | the observer, the gatekeeper, **and** the executor | the attestation key (owner-only), the IPC secret (owner-only), the audit log | trusted |
 | **planner** (e.g. `psagent`) | the agent / model loop | nothing security-critical | **untrusted** — may be injected or compromised |
 
-The planner reaches the gatekeeper **only** over loopback IPC, and its request
-is authenticated by the R-203 envelope gate (signature + epoch + freshness +
-replay), never by a shared secret it holds — it never sees the attestation key.
-The **IPC secret** authenticates the *gatekeeper → executor* hop, so a planner
-that bypassed the gatekeeper still cannot drive input: it lacks the secret the
-executor requires.
+The planner reaches the gatekeeper **only** over loopback IPC. What the R-203
+gate authenticates is the **observer envelope** the request carries (signature +
+epoch + freshness + replay) — not the planner's action or context, which the
+gatekeeper still evaluates through policy and freshness. So a planner cannot
+forge *evidence* (it never sees the attestation key), but the action it proposes
+is admitted on its merits, not trusted because it arrived. The **IPC secret**
+authenticates the *gatekeeper → executor* hop, so a planner that bypassed the
+gatekeeper still cannot drive input: it lacks the secret the executor requires.
 
 ### Why observer and gatekeeper share one account
 
@@ -38,6 +40,11 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   dev/ino re-check). Anything broader — the shape a separate planner account
   would need to read it — is **refused**, so a misconfiguration cannot silently
   expose the key. The key directory must itself be pre-provisioned owner-only.
+- **Owner-only IPC secret** (`common/auth.py`). `load_or_create_secret` creates
+  the secret `0600` and, on loading a *pre-existing* one, **refuses** it fail-closed
+  unless it is owner-only (no group/other bits) and owned by the reading euid — so a
+  secret a separate planner account could read is never trusted, not merely
+  discouraged. (Windows fails closed, as the key path does.)
 - **Loopback-only IPC** (`common/ipc.py`). `IPCServer` refuses to bind anything
   but `127.0.0.1` / `::1` / `localhost`. The gatekeeper and executor services are
   never exposed on a routable interface; a remote party cannot reach them at all.
@@ -69,17 +76,32 @@ attestation suite.
    export PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH=~/.local/state/psoperator/keys/observer.json
    ```
    The gatekeeper service **refuses to start without this key** (fail closed).
-   To pin the epoch out of band (recommended, closes the restart-race), set
-   `PSOPERATOR_OBSERVER_EPOCH` to the same 64-hex value on **both** the observer
-   and gatekeeper.
-3. **Run the services under their accounts.** The observer, gatekeeper, and
+3. **Configure the service-manager environment (not just a shell).** The `export`
+   above affects only the current shell; each unit gets its own environment, so set
+   these in the observer, gatekeeper, and executor **units** (systemd `Environment=`
+   / OpenRC conf.d), not interactively:
+   - `PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH` — the key path, in the observer and
+     gatekeeper units (both refuse to start without it).
+   - `PSOPERATOR_OBSERVER_EPOCH` — the **same** 64-hex value in the observer and
+     gatekeeper units (recommended; closes the restart-race — otherwise the gate is
+     trust-on-first-use). Optional for startup.
+   - `PSOPERATOR_IPC_SECRET_PATH` — a **shared absolute path** in the gatekeeper and
+     executor units. Its default (`.psoperator/ipc.secret`) is relative to each
+     process's working directory, so separate units would each create a *different*
+     secret and every execution would be rejected. Point both at one absolute path
+     under the governance account (e.g. `~/.local/state/psoperator/ipc.secret`); the
+     loader creates it `0600` and refuses to load it if it is not owner-only.
+4. **Run the services under their accounts.** The observer, gatekeeper, and
    executor services run as `governance` (one service-manager unit each — systemd
    on most Linux; OpenRC on the Gentoo host, where the observer already runs
    supervised); the agent loop runs as `planner`.
-4. **Verify the boundary:**
+5. **Verify the boundary** (Linux; on macOS use `stat -f '%Lp %Su'` and `lsof -nP -iTCP -sTCP:LISTEN`):
    ```sh
    stat -c '%a %U' "$PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH"  # expect: 600 governance
-   ss -ltnp | grep -E '127\.0\.0\.1:(8764|8765|8766)'         # loopback only
+   stat -c '%a %U' "$PSOPERATOR_IPC_SECRET_PATH"                # expect: 600 governance
+   # Every listener on the service ports must be loopback; any other bind FAILS the check:
+   ss -ltnH 'sport = :8764 or sport = :8765 or sport = :8766' \
+     | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' && echo "EXPOSED — not loopback" || echo "loopback only"
    ```
 
 ## Platform support matrix (R-203/R-205)

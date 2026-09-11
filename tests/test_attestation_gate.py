@@ -182,3 +182,14 @@ def test_max_nonces_below_one_is_refused():
 
     with _pytest.raises(ValueError, match="max_nonces"):
         AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, max_nonces=0)
+
+
+def test_a_non_integer_nonce_cap_is_refused():
+    # A float (0.5, 1.5) or a bool (True) is a config bug: it never trips the
+    # eviction cleanly and would silently weaken replay rejection. The cap must be
+    # a real int >= 1 (CodeRabbit, psoperator #10).
+    import pytest as _pytest
+
+    for bad in (0.5, 1.5, True):
+        with _pytest.raises(ValueError, match="integer"):
+            AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, max_nonces=bad)

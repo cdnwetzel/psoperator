@@ -254,3 +254,26 @@ def test_cli_provisions_key_explicitly_and_never_overwrites(tmp_path, capsys):
 def test_observer_startup_requires_explicit_key_path_before_capture(capsys):
     assert _run_observer(load_config(observer_attestation_key_path=None), backend="mss") == 2
     assert "OBSERVER_ATTESTATION_KEY_PATH is required" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only key files")
+def test_observer_signs_with_the_configured_epoch(tmp_path, monkeypatch, capsys):
+    # F1 regression: the observer must sign with the *configured* observer_epoch,
+    # so a gatekeeper pinned to the same epoch matches it. A regression to building
+    # SnapshotSigner without observer_epoch would fail every pinned gate while the
+    # suite stayed green — so capture the signer the observer would serve with and
+    # assert its epoch (Copilot, psoperator #10).
+    key_path = tmp_path / "observer.json"
+    provision_attestation_key(key_path, "observer-v1")
+    epoch = "a" * 64
+    config = load_config(observer_attestation_key_path=key_path, observer_epoch=epoch)
+
+    captured = {}
+
+    def _capture_serve(host, port, capture, signer, snapshots):
+        captured["epoch"] = signer.observer_epoch
+
+    monkeypatch.setattr("psoperator.cli.build_observer_capture", lambda cfg, backend: object())
+    monkeypatch.setattr("psoperator.cli.serve_observer", _capture_serve)
+    assert _run_observer(config, backend="mss") == 0
+    assert captured["epoch"] == epoch
