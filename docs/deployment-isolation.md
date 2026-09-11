@@ -66,12 +66,25 @@ attestation suite.
    ss -ltnp | grep -E '127.0.0.1:(8764|8765|8766)'    # loopback only
    ```
 
-## Known limitation
+## Platform support matrix (R-203/R-205)
 
-Windows ACL parity is **not implemented**: attestation-key provisioning and
-loading refuse to run on Windows rather than trust an unverified ACL. The
-supported deployment topology is POSIX. Windows support is a separate, tracked
-item.
+The isolation guarantees rest on POSIX ownership and mode semantics. The
+supported, verified deployment platforms are POSIX; unclaimed platforms **fail
+closed** rather than run with an unverified boundary.
+
+| platform | attestation key provisioning / loading | status |
+| --- | --- | --- |
+| **Linux** | owner-only mode + owner-uid + TOCTOU-safe; verified in CI | **supported** |
+| **macOS** | same POSIX path; verified in CI | **supported** |
+| **Windows** | provisioning and loading **refuse to run** — an unverified NTFS ACL is never trusted | **fail closed; not supported** |
+
+Windows support requires implementing and verifying NTFS ACL checks equivalent to
+the POSIX owner-only guarantee. It is deliberately deferred and tracked as the
+Windows attestation/capture port (roadmap D-01): a platform with no host in the
+fleet gets no unverifiable security path — attestation leads, coverage follows.
+That Windows attestation-key provisioning and loading fail closed is itself
+asserted by a test, so the "POSIX-only" claim cannot silently rot into a
+half-implemented Windows path.
 
 ## Future — asymmetric attestation (option C, out of scope for R-205)
 
