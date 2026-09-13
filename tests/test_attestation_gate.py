@@ -173,3 +173,23 @@ def test_frames_that_advance_are_admitted():
     gate = _gate()
     gate.admit(_env_frame(8, "8" * 64), now=105.0)
     gate.admit(_env_frame(9, "9" * 64), now=105.0)  # advances past 8 -> admitted, no raise
+
+
+def test_max_nonces_below_one_is_refused():
+    # A cap < 1 would evict every nonce on insert, silently disabling replay
+    # rejection — the constructor refuses it (psoperator #4).
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="max_nonces"):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, max_nonces=0)
+
+
+def test_a_non_integer_nonce_cap_is_refused():
+    # A float (0.5, 1.5) or a bool (True) is a config bug: it never trips the
+    # eviction cleanly and would silently weaken replay rejection. The cap must be
+    # a real int >= 1 (CodeRabbit, psoperator #10).
+    import pytest as _pytest
+
+    for bad in (0.5, 1.5, True):
+        with _pytest.raises(ValueError, match="integer"):
+            AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, max_nonces=bad)

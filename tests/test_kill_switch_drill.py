@@ -48,7 +48,7 @@ def test_drill_preempts_a_benign_canary_and_leaves_a_receipt(tmp_path):
         gk, config.kill_switch_path,
         action=Action(ActionKind.WAIT, 1, seconds=0.0), frame=_frame(),
     )
-    assert result == DrillResult(preempted=True, decision_kind="kill-switched", audit_seq=None)
+    assert result == DrillResult(preempted=True, decision_kind="kill-switched")
     # the KILL_SWITCHED decision is the receipt — a durable audit row.
     kills = [r for r in _audit_rows(config.audit_log_path) if r["decision"] == "kill-switched"]
     assert len(kills) == 1
