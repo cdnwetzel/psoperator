@@ -355,6 +355,27 @@ def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path):
     assert gate.admit(envelope, now=105.0).nonce == "1" * 64
 
 
+def test_a_directory_sync_failure_is_a_persistence_failure(tmp_path, monkeypatch):
+    """`fsync(fd)` commits the file's bytes; the directory entry created by
+    `os.replace` is a separate durability question. If that sync fails the write
+    has not actually survived a crash, so it must fail the admission rather than
+    report success — otherwise a reboot can return the gate to the OLD watermark
+    and re-admit precisely the frames it just accepted."""
+    state = tmp_path / "gate_state.json"
+    gate = AttestationGate(
+        AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state
+    )
+
+    def _no_durable_dir(directory):
+        raise OSError("directory sync unavailable")
+
+    monkeypatch.setattr(AttestationGate, "_fsync_dir", staticmethod(_no_durable_dir))
+    with pytest.raises(GateStateError):
+        gate.admit(_captured_envelopes(1)[0], now=105.0)
+    assert gate._last_frame_id is None, "the watermark advanced on an undurable write"
+    assert gate._seen == {}, "a nonce was burned on an undurable write"
+
+
 def test_a_symlinked_state_file_is_refused(tmp_path):
     """`read_text` follows symlinks. A watermark another account can redirect is a
     watermark it can lower, which re-opens the window this file exists to close."""
