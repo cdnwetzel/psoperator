@@ -60,6 +60,23 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   an *old* epoch, pinning it and rejecting current frames (CWE-384). Trust-on-first-use
   is acceptable only in dev.
 
+- **Durable frame watermark (the same restart-race, one layer down).** The
+  stale-frame check refuses any envelope whose frame id does not advance past the
+  last admitted one. That watermark used to live in memory only, so a restart
+  disarmed the check entirely and *every* captured envelope still inside its TTL
+  replayed cleanly — the epoch got its restart hole closed and the watermark, the
+  same class of bug, did not. It is now persisted to `gate_state_path`
+  (`.psoperator/gate_state.json` by default, written owner-only and replaced
+  atomically) and restored on start. A state file that exists but cannot be
+  trusted makes the service **refuse to start**, and a gate that cannot write its
+  watermark **refuses to admit** — treating a corrupt file as "no state" would
+  turn it back into the silent downgrade this removes.
+
+  Worth knowing why this is the fix and nonce-set sizing was not: the nonce set
+  is a second line here, because an evicted nonce is by construction an *old*
+  frame and the watermark refuses it anyway. The window opens when the watermark
+  is absent, which is exactly and only at restart.
+
 These invariants are asserted in `tests/test_deployment_isolation.py` and the
 attestation suite.
 

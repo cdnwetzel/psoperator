@@ -28,10 +28,13 @@ rejected envelope can neither pin an epoch nor consume a nonce.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from psoperator.common.attestation import (
     AttestationKeyring,
@@ -40,9 +43,25 @@ from psoperator.common.attestation import (
 )
 from psoperator.common.schema import AttestedSnapshot
 
-#: Bound on the remembered-nonce set per pinned epoch. Nonces older than this many
-#: admissions are evicted; an envelope that old is long past its TTL anyway.
+#: Memory backstop on the remembered-nonce set, nothing more. The primary
+#: eviction rule is the TTL (see :meth:`AttestationGate._evict_nonces`).
+#:
+#: This constant used to carry the claim that "an envelope that old is long past
+#: its TTL anyway" — which is false, and falsely reassuring: admission count and
+#: elapsed time are unrelated, so a burst can evict a nonce that is still well
+#: inside its lifetime. Eviction is now driven by expiry, where it is provably
+#: free, and the count only caps memory.
 DEFAULT_MAX_NONCES = 4096
+
+
+class GateStateError(Exception):
+    """The persisted gate state could not be read or written.
+
+    Raised rather than tolerated: a gate that cannot recover or record its frame
+    watermark silently degrades to the restart behaviour this state file exists
+    to remove, and a silent degradation of a fail-closed gate is the failure mode
+    this project keeps re-learning.
+    """
 
 
 class EnvelopeRejected(Exception):
@@ -79,6 +98,7 @@ class AttestationGate:
         clock: Callable[[], float] = time.time,
         record: Callable[[dict], None] | None = None,
         max_nonces: int = DEFAULT_MAX_NONCES,
+        state_path: Path | str | None = None,
     ) -> None:
         self._keyring = keyring
         self._epoch = expected_epoch
@@ -91,8 +111,11 @@ class AttestationGate:
             raise ValueError("max_nonces must be an integer >= 1; a smaller or non-integer "
                              "cap would evict every nonce and disable replay rejection")
         self._max_nonces = max_nonces
-        self._seen: OrderedDict[str, None] = OrderedDict()
-        self._last_frame_id: int | None = None
+        # nonce -> the expires_at of the envelope that burned it, so eviction can
+        # be driven by expiry rather than by how many admissions happened since.
+        self._seen: OrderedDict[str, float] = OrderedDict()
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._last_frame_id: int | None = self._load_watermark()
 
     @property
     def pinned_epoch(self) -> str | None:
@@ -168,10 +191,9 @@ class AttestationGate:
         # frame watermark.
         if self._epoch is None:
             self._epoch = body.observer_epoch
-        self._seen[body.nonce] = None
-        while len(self._seen) > self._max_nonces:
-            self._seen.popitem(last=False)
-        self._last_frame_id = body.snapshot.frame_id
+        self._seen[body.nonce] = body.expires_at
+        self._evict_nonces(now)
+        self._advance_watermark(body.snapshot.frame_id)
         return AdmittedFrame(
             key_id=body.key_id,
             observer_epoch=body.observer_epoch,
@@ -180,3 +202,106 @@ class AttestationGate:
             issued_at=body.issued_at,
             expires_at=body.expires_at,
         )
+
+    # --- nonce eviction (D2) -------------------------------------------------
+
+    def _evict_nonces(self, now: float) -> None:
+        """Forget nonces by expiry first, by count only as a memory backstop.
+
+        Expiry-driven eviction is provably free: ``_verify`` rejects an expired
+        envelope *before* it ever consults the nonce set, so a nonce whose
+        envelope has expired can no longer be used to replay anything. Dropping
+        it costs no replay protection at all.
+
+        The count ceiling has no such guarantee. Evicting by admission count
+        assumes count tracks elapsed time, and it does not — a burst evicts
+        nonces that are still well inside their lifetime. That is why the ceiling
+        is now the backstop rather than the rule, and why reaching it while every
+        remembered nonce is still valid is *receipted* instead of done quietly:
+        the gate is then in a regime where it cannot promise replay rejection for
+        the nonce it just dropped, and an operator should be able to see that.
+        """
+        for nonce in [n for n, expires_at in self._seen.items() if expires_at <= now]:
+            del self._seen[nonce]
+        while len(self._seen) > self._max_nonces:
+            nonce, expires_at = self._seen.popitem(last=False)
+            self._record(
+                {
+                    "outcome": "nonce-evicted-unexpired",
+                    "reason": "max-nonces",
+                    "detail": (
+                        f"nonce dropped {expires_at - now:.3f}s before its envelope "
+                        f"expires; replay of that envelope is no longer refused by "
+                        f"the nonce set (the frame watermark still applies)"
+                    ),
+                    "nonce": nonce,
+                    "max_nonces": self._max_nonces,
+                    "at": now,
+                }
+            )
+
+    # --- frame watermark durability (D1) -------------------------------------
+
+    def _load_watermark(self) -> int | None:
+        """Restore the last admitted frame id across a restart.
+
+        Without this the watermark is process-local, so a restart disarms the
+        stale-frame check entirely and *every* captured envelope still inside its
+        TTL replays successfully — not merely the ones a full nonce set had
+        evicted. It is the same restart weakness ``observer_epoch`` already
+        closes for epoch pinning (CWE-384); the watermark simply never got the
+        same treatment.
+
+        A missing file is a genuine first start and yields ``None``. A file that
+        exists but cannot be trusted raises, because starting with no watermark
+        is exactly the state this is here to prevent.
+        """
+        if self._state_path is None or not self._state_path.exists():
+            return None
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise GateStateError(f"gate state at {self._state_path} is unreadable: {exc}") from exc
+        if not isinstance(state, dict):
+            raise GateStateError(f"gate state at {self._state_path} is not a JSON object")
+        watermark = state.get("last_frame_id")
+        if isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0:
+            raise GateStateError(
+                f"gate state at {self._state_path} has last_frame_id={watermark!r}; "
+                "expected a non-negative integer"
+            )
+        return watermark
+
+    def _advance_watermark(self, frame_id: int) -> None:
+        """Persist before committing in memory, so a write failure fails closed.
+
+        If the durable record cannot be updated, the envelope is not admitted: a
+        gate that keeps admitting while silently losing its watermark is back to
+        the restart behaviour above, without anything saying so.
+        """
+        if self._state_path is not None:
+            self._write_state(frame_id)
+        self._last_frame_id = frame_id
+
+    def _write_state(self, frame_id: int) -> None:
+        path = self._state_path
+        assert path is not None  # guarded by the caller
+        payload = json.dumps({"last_frame_id": frame_id}, separators=(",", ":"))
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Owner-only from creation, not chmod'd after: the window matters on a
+            # shared host, same standard the IPC secret is held to.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)  # atomic: a torn read is never observable
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
