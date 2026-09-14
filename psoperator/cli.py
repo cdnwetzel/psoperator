@@ -17,7 +17,7 @@ from psoperator.common.auth import load_or_create_secret
 from psoperator.config import PSOperatorConfig, load_config
 from psoperator.gatekeeper import killswitch
 from psoperator.gatekeeper.approval import CLIApproval
-from psoperator.gatekeeper.attestation_gate import AttestationGate
+from psoperator.gatekeeper.attestation_gate import AttestationGate, GateStateError
 from psoperator.gatekeeper.audit import verify
 from psoperator.gatekeeper.gatekeeper import Gatekeeper
 from psoperator.gatekeeper.remote_executor import RemoteExecutor
@@ -97,10 +97,18 @@ def _run_gatekeeper(config: PSOperatorConfig) -> int:
         return 1
     keyring = AttestationKeyring([load_attestation_key(key_path)])
     # Pin the epoch out of band when configured (closes the restart-race); else
-    # trust-on-first-use (dev only).
-    gate = AttestationGate(
-        keyring, expected_epoch=config.observer_epoch, record=gatekeeper.record_envelope_event
-    )
+    # trust-on-first-use (dev only). The frame watermark is persisted for the same
+    # reason: in memory only, it disarms the stale-frame check on every restart.
+    try:
+        gate = AttestationGate(
+            keyring,
+            expected_epoch=config.observer_epoch,
+            record=gatekeeper.record_envelope_event,
+            state_path=config.gate_state_path,
+        )
+    except GateStateError as exc:
+        print(f"gatekeeper service refusing to start: {exc}", file=sys.stderr)
+        return 1
 
     print(f"gatekeeper listening on {config.gatekeeper_host}:{config.gatekeeper_port}")
     serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness, gate)

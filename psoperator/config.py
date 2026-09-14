@@ -148,6 +148,12 @@ class PSOperatorConfig(BaseSettings):
     audit_log_path: Path = Field(default=Path("psoperator_audit.jsonl"))
     kill_switch_path: Path = Field(default=Path(".psoperator/STOP"))
     ipc_secret_path: Path = Field(default=Path(".psoperator/ipc.secret"))
+    gate_state_path: Path = Field(
+        default=Path(".psoperator/gate_state.json"),
+        description="Durable R-203 frame watermark. Without it the stale-frame check is "
+        "process-local, so a restart re-admits any envelope still inside its TTL — the "
+        "same restart weakness observer_epoch closes for epoch pinning (CWE-384).",
+    )
     gatekeeper_host: str = Field(default="127.0.0.1")
     gatekeeper_port: int = Field(default=8765, ge=1, le=65535)
     executor_host: str = Field(default="127.0.0.1")
