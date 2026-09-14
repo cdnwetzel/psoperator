@@ -14,6 +14,7 @@ proves the gate still admits a genuine one, so the refusals aren't vacuous.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -315,15 +316,90 @@ def test_state_is_written_owner_only(tmp_path):
 def test_a_gate_that_cannot_persist_refuses_to_admit(tmp_path):
     """If the durable record cannot be updated, admitting anyway would quietly
     restore the restart weakness with nothing reporting it."""
-    blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory", encoding="utf-8")
+    home = tmp_path / "state"
+    home.mkdir()
     gate = AttestationGate(
         AttestationKeyring([_key()]), expected_epoch=EPOCH_A,
-        state_path=blocker / "gate_state.json",
+        state_path=home / "gate_state.json",
     )
-    with pytest.raises(GateStateError):
-        gate.admit(_captured_envelopes(1)[0], now=105.0)
+    home.chmod(0o500)  # readable, not writable: the write must fail
+    try:
+        with pytest.raises(GateStateError):
+            gate.admit(_captured_envelopes(1)[0], now=105.0)
+    finally:
+        home.chmod(0o700)
     assert gate._last_frame_id is None, "the watermark advanced despite the write failing"
+
+
+def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path):
+    """The durable write runs before any volatile state changes. If it ran after,
+    a failed write would leave the nonce burned for an envelope that was never
+    admitted — and the observer could not retry, because its own nonce would come
+    back as `replayed-nonce`."""
+    home = tmp_path / "state"
+    home.mkdir()
+    gate = AttestationGate(  # trust-on-first-use, so a failed admit could pin an epoch
+        AttestationKeyring([_key()]), expected_epoch=None,
+        state_path=home / "gate_state.json",
+    )
+    envelope = _captured_envelopes(1)[0]
+    home.chmod(0o500)
+    try:
+        with pytest.raises(GateStateError):
+            gate.admit(envelope, now=105.0)
+    finally:
+        home.chmod(0o700)
+    assert gate._seen == {}, "a nonce was burned for an envelope that was not admitted"
+    assert gate.pinned_epoch is None, "trust-on-first-use pinned an epoch on a failed admit"
+    # and the retry now succeeds, which is the point
+    assert gate.admit(envelope, now=105.0).nonce == "1" * 64
+
+
+def test_a_symlinked_state_file_is_refused(tmp_path):
+    """`read_text` follows symlinks. A watermark another account can redirect is a
+    watermark it can lower, which re-opens the window this file exists to close."""
+    real = tmp_path / "elsewhere.json"
+    real.write_text('{"last_frame_id": 1}', encoding="utf-8")
+    real.chmod(0o600)
+    link = tmp_path / "gate_state.json"
+    link.symlink_to(real)
+    with pytest.raises(GateStateError):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=link)
+
+
+@pytest.mark.parametrize(
+    "mode", [0o644, 0o660, 0o666], ids=["world-read", "group-write", "world-write"]
+)
+def test_a_state_file_others_can_read_or_write_is_refused(tmp_path, mode):
+    """Same R-205 posture as the attestation key and the IPC secret."""
+    state = tmp_path / "gate_state.json"
+    state.write_text('{"last_frame_id": 1}', encoding="utf-8")
+    state.chmod(mode)
+    with pytest.raises(GateStateError):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+
+
+def test_a_non_regular_state_path_is_refused(tmp_path):
+    directory = tmp_path / "gate_state.json"
+    directory.mkdir(mode=0o700)
+    with pytest.raises(GateStateError):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=directory)
+
+
+def test_a_stale_temp_file_does_not_block_the_write(tmp_path):
+    """The temp name used to be `{name}.{pid}.tmp` — deterministic, so a file left
+    by a crashed process could be reused, and `O_TRUNC` would have kept whatever
+    mode it already had. Random name + O_EXCL means a leftover is simply ignored."""
+    state = tmp_path / "gate_state.json"
+    stale = tmp_path / f"{state.name}.{os.getpid()}.tmp"
+    stale.write_text("leftover", encoding="utf-8")
+    stale.chmod(0o666)
+    gate = AttestationGate(
+        AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state
+    )
+    gate.admit(_captured_envelopes(1)[0], now=105.0)
+    assert json.loads(state.read_text(encoding="utf-8")) == {"last_frame_id": 1}
+    assert state.stat().st_mode & 0o777 == 0o600
 
 
 # --- D2: evict nonces by expiry, not by how many admissions happened --------

@@ -66,11 +66,22 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   disarmed the check entirely and *every* captured envelope still inside its TTL
   replayed cleanly — the epoch got its restart hole closed and the watermark, the
   same class of bug, did not. It is now persisted to `gate_state_path`
-  (`.psoperator/gate_state.json` by default, written owner-only and replaced
-  atomically) and restored on start. A state file that exists but cannot be
-  trusted makes the service **refuse to start**, and a gate that cannot write its
-  watermark **refuses to admit** — treating a corrupt file as "no state" would
-  turn it back into the silent downgrade this removes.
+  (`.psoperator/gate_state.json` by default) and restored on start. A state file
+  that exists but cannot be trusted makes the service **refuse to start**, and a
+  gate that cannot write its watermark **refuses to admit** — treating a corrupt
+  file as "no state" would turn it back into the silent downgrade this removes.
+
+  The file is load-bearing for replay rejection, so it is held to the same
+  ownership standard as the attestation key and the IPC secret: owner-only
+  (`0600`), a regular file, owned by the running account, and opened without
+  following symlinks — validated by `fstat` on the descriptor actually read, not
+  by a `stat` on the path, which is a different file under a race. **A watermark
+  another account can rewrite is a watermark it can lower**, which re-admits the
+  captured frames this is meant to refuse. Writes are owner-only from creation
+  under a random `O_EXCL` temp name, replaced atomically, and the parent
+  directory is synced as well as the file — `fsync` on contents alone leaves the
+  directory entry undurable, so a crash just after admitting could return to the
+  old watermark.
 
   Worth knowing why this is the fix and nonce-set sizing was not: the nonce set
   is a second line here, because an evicted nonce is by construction an *old*

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import stat
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -189,11 +191,16 @@ class AttestationGate:
         # Every check passed — only now commit state, so a rejected envelope can
         # neither pin an epoch (trust-on-first-use), burn a nonce, nor advance the
         # frame watermark.
+        #
+        # The durable write goes FIRST, because it is the only step that can fail.
+        # If it ran last, a failed write would leave the nonce burned and the epoch
+        # pinned for an envelope that was never admitted — and the observer could
+        # not even retry it, since its own nonce would now come back as replayed.
+        self._advance_watermark(body.snapshot.frame_id)
         if self._epoch is None:
             self._epoch = body.observer_epoch
         self._seen[body.nonce] = body.expires_at
         self._evict_nonces(now)
-        self._advance_watermark(body.snapshot.frame_id)
         return AdmittedFrame(
             key_id=body.key_id,
             observer_epoch=body.observer_epoch,
@@ -252,16 +259,26 @@ class AttestationGate:
         closes for epoch pinning (CWE-384); the watermark simply never got the
         same treatment.
 
-        A missing file is a genuine first start and yields ``None``. A file that
-        exists but cannot be trusted raises, because starting with no watermark
-        is exactly the state this is here to prevent.
+        A missing file is a genuine first start and yields ``None``. Anything
+        else that cannot be trusted raises, because starting with no watermark is
+        exactly the state this is here to prevent.
+
+        The file is load-bearing for replay rejection, so it is held to the same
+        ownership standard as the attestation key and the IPC secret (R-205): a
+        state file another account can rewrite is a state file that can hand the
+        gate a *lower* watermark and re-open the very window this closes.
         """
-        if self._state_path is None or not self._state_path.exists():
+        if self._state_path is None:
+            return None
+        raw = self._read_state_bytes(self._state_path)
+        if raw is None:
             return None
         try:
-            state = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise GateStateError(f"gate state at {self._state_path} is unreadable: {exc}") from exc
+            state = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise GateStateError(
+                f"gate state at {self._state_path} is unreadable: {exc}"
+            ) from exc
         if not isinstance(state, dict):
             raise GateStateError(f"gate state at {self._state_path} is not a JSON object")
         watermark = state.get("last_frame_id")
@@ -271,6 +288,58 @@ class AttestationGate:
                 "expected a non-negative integer"
             )
         return watermark
+
+    #: A watermark file is a few dozen bytes. Anything larger is not ours.
+    _MAX_STATE_BYTES = 64 * 1024
+
+    def _read_state_bytes(self, path: Path) -> bytes | None:
+        """Read the state file, validating the *opened file* rather than the path.
+
+        Checking a path and then opening it are two different files in the
+        presence of a race or a symlink, so ownership and file type are asserted
+        with ``fstat`` on the descriptor we actually read, and the open refuses to
+        traverse a symlink at the final component.
+        """
+        if os.name == "nt":
+            raise GateStateError(
+                f"gate state ownership cannot be verified on Windows: {path}. Refusing "
+                "to trust an unverified ACL for a file that gates replay rejection."
+            )
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None  # genuine first start
+        except OSError as exc:
+            raise GateStateError(f"gate state at {path} cannot be opened: {exc}") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise GateStateError(f"gate state at {path} is not a regular file")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise GateStateError(
+                    f"gate state at {path} grants group/other permissions "
+                    f"(mode {stat.S_IMODE(info.st_mode):04o}); it must be owner-only (0600). "
+                    "A writable watermark can be lowered to re-admit captured frames."
+                )
+            if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                raise GateStateError(
+                    f"gate state at {path} is owned by uid {info.st_uid}, not this account "
+                    f"(uid {os.geteuid()}). Refusing to trust a watermark another account "
+                    "can rewrite."
+                )
+            if info.st_size > self._MAX_STATE_BYTES:
+                raise GateStateError(
+                    f"gate state at {path} is {info.st_size} bytes; not a watermark file"
+                )
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(fd, 65536)
+                if not block:
+                    break
+                chunks.append(block)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
 
     def _advance_watermark(self, frame_id: int) -> None:
         """Persist before committing in memory, so a write failure fails closed.
@@ -284,24 +353,48 @@ class AttestationGate:
         self._last_frame_id = frame_id
 
     def _write_state(self, frame_id: int) -> None:
+        """Write owner-only, replace atomically, then make the *replacement*
+        durable — not just the bytes.
+
+        ``fsync`` on the file commits its contents; it says nothing about the
+        directory entry, so a crash just after admitting could still come back to
+        the old watermark and re-open the replay window for exactly the frames
+        this admitted. The parent directory is synced too, and a failure there is
+        an error rather than a shrug: an undurable watermark is the failure mode
+        this whole file exists to remove.
+
+        The temp name is random and created with ``O_EXCL``, so a stale file left
+        by a crashed process can neither be silently reused (``O_TRUNC`` would
+        have kept its old, possibly loose, mode) nor be a symlink planted for us
+        to follow.
+        """
         path = self._state_path
         assert path is not None  # guarded by the caller
         payload = json.dumps({"last_frame_id": frame_id}, separators=(",", ":"))
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Owner-only from creation, not chmod'd after: the window matters on a
-            # shared host, same standard the IPC secret is held to.
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(tmp, flags, 0o600)
             try:
                 os.write(fd, payload.encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
             os.replace(tmp, path)  # atomic: a torn read is never observable
+            self._fsync_dir(path.parent)
         except OSError as exc:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
             raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
+
+    @staticmethod
+    def _fsync_dir(directory: Path) -> None:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
