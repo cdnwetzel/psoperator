@@ -18,12 +18,16 @@ from psoperator.config import load_config
 from psoperator.gatekeeper.approval import AutoApprove
 from psoperator.gatekeeper.executor import DryRunExecutor
 from psoperator.gatekeeper.executor_ch9329 import (
+    KNOWN_CHIPS,
     CH9329Executor,
     NullSerialTransport,
     _char_to_hid,
     _to_abs_coords,
+    detect_hid_port,
     kbd_packet,
     mouse_abs_packet,
+    resolve_baudrate,
+    resolve_connection,
 )
 from psoperator.gatekeeper.gatekeeper import DecisionKind, Gatekeeper
 from psoperator.perception.capture import Frame, ScreenCapture
@@ -292,8 +296,11 @@ class TestConfigAndAssembly:
         cfg = load_config()
         assert cfg.capture_backend == "mss"
         assert cfg.executor_backend == "dryrun"
-        assert cfg.ch9329_baudrate == 9600  # chip factory default
-        assert cfg.ch9329_port == "/dev/ttyUSB0"
+        # Port and baud are now DERIVED from the attached chip, not assumed: the
+        # old "/dev/ttyUSB0" + 9600 pair is correct only for a CH9329 and is
+        # wrong for every CH32V208 unit. Defaults must commit to neither.
+        assert cfg.ch9329_port == "auto"
+        assert cfg.ch9329_baudrate is None
         assert cfg.uvc_device_index == 0
 
     def test_topology_b_config_parses(self):
@@ -338,3 +345,118 @@ class TestConfigAndAssembly:
             run_crashcart.build_executor(load_config(executor_backend="telepathy"))
         with pytest.raises(ValueError, match="unknown capture_backend"):
             run_crashcart.build_capture(load_config(capture_backend="eyeballs"))
+
+
+# --------------------------------------------------------------------------
+# Chip / port detection — the CH9329-vs-CH32V208 revision split.
+#
+# Both revisions speak the SAME frame format (verified against the vendor host
+# app, whose chip-strategy interface declares no keyboard or mouse methods at
+# all), so the executor above is unchanged. What differs is the carrier: a
+# CH9329 sits behind a CH340 bridge on /dev/ttyUSB*, a CH32V208 is native USB
+# CDC on /dev/ttyACM* and is locked to 115200. Assuming either one is how a
+# working unit reads as dead hardware.
+# --------------------------------------------------------------------------
+CH9329_ID = (0x1A86, 0x7523)
+CH32V208_ID = (0x1A86, 0xFE0C)
+
+
+class FakePort:
+    """Shaped like pyserial's ListPortInfo in the three fields we read."""
+
+    def __init__(self, device, vid, pid):
+        self.device, self.vid, self.pid = device, vid, pid
+
+
+class TestChipDetection:
+    def test_finds_ch32v208_on_ttyacm(self):
+        found = detect_hid_port([FakePort("/dev/ttyACM0", *CH32V208_ID)])
+        assert found.device == "/dev/ttyACM0"
+        assert found.chip.name == "CH32V208"
+        assert found.chip.fixed_baudrate == 115200
+
+    def test_finds_ch9329_on_ttyusb(self):
+        found = detect_hid_port([FakePort("/dev/ttyUSB0", *CH9329_ID)])
+        assert found.device == "/dev/ttyUSB0"
+        assert found.chip.name == "CH9329"
+        assert found.chip.fixed_baudrate is None
+
+    def test_two_devices_is_refused_not_silently_first(self):
+        """The wrong-pass case that matters. This backend actuates a target
+        machine: picking the first of two attached KVMs types into whichever
+        one happened to enumerate first. Ambiguity must be an error."""
+        with pytest.raises(RuntimeError, match="more than one"):
+            detect_hid_port(
+                [
+                    FakePort("/dev/ttyACM0", *CH32V208_ID),
+                    FakePort("/dev/ttyUSB0", *CH9329_ID),
+                ]
+            )
+
+    def test_right_vendor_wrong_product_does_not_match(self):
+        """1a86 is WCH's vendor id and covers many unrelated chips. Matching on
+        vendor alone would bind to any WCH serial adapter in the machine."""
+        with pytest.raises(RuntimeError, match="no supported HID-control chip"):
+            detect_hid_port([FakePort("/dev/ttyUSB0", 0x1A86, 0x5523)])
+
+    def test_error_names_what_was_seen(self):
+        """'Not found' must distinguish wrong-cable from wrong-driver, so the
+        message carries the ids actually enumerated."""
+        with pytest.raises(RuntimeError, match="1234:5678"):
+            detect_hid_port([FakePort("/dev/ttyS0", 0x1234, 0x5678)])
+
+    def test_no_ports_at_all_is_still_a_clear_error(self):
+        with pytest.raises(RuntimeError, match="no serial ports at all"):
+            detect_hid_port([])
+
+    def test_ports_without_usb_ids_do_not_crash_the_message(self):
+        """Built-in UARTs enumerate with vid/pid None; formatting them must not
+        raise and mask the real 'not found' error."""
+        with pytest.raises(RuntimeError, match="no USB id"):
+            detect_hid_port([FakePort("/dev/ttyS0", None, None)])
+
+    def test_missing_pyserial_fails_loudly_not_as_no_device(self, monkeypatch):
+        """The silent-pass one layer down: if enumeration raises and we swallow
+        it, detection reports 'nothing attached' and sends the operator hunting
+        cables for a packaging problem."""
+        def boom():
+            raise RuntimeError("port auto-detection needs pyserial")
+
+        monkeypatch.setattr("psoperator.gatekeeper.executor_ch9329._list_ports", boom)
+        with pytest.raises(RuntimeError, match="pyserial"):
+            detect_hid_port()
+
+
+class TestBaudResolution:
+    def test_fixed_baud_chip_overrides_a_stale_config(self):
+        """The exact upgrade path: config still carries the CH9329 factory 9600
+        and the box now holds a CH32V208. Honouring 9600 opens a port that then
+        never speaks — the failure looks like dead hardware."""
+        assert resolve_baudrate(KNOWN_CHIPS[CH32V208_ID], 9600) == 115200
+
+    def test_configurable_chip_honours_an_explicit_baud(self):
+        assert resolve_baudrate(KNOWN_CHIPS[CH9329_ID], 115200) == 115200
+
+    def test_configurable_chip_falls_back_to_its_factory_default(self):
+        assert resolve_baudrate(KNOWN_CHIPS[CH9329_ID], None) == 9600
+
+    def test_explicit_port_still_works_when_detection_is_unavailable(self, monkeypatch):
+        """An explicit path must keep working on a box where enumeration fails;
+        auto-detection is a convenience, not a new hard dependency."""
+        def boom():
+            raise RuntimeError("no pyserial")
+
+        monkeypatch.setattr("psoperator.gatekeeper.executor_ch9329._list_ports", boom)
+        port, baud, chip = resolve_connection("/dev/ttyUSB7", 9600)
+        assert (port, baud, chip) == ("/dev/ttyUSB7", 9600, None)
+
+    def test_auto_resolves_both_port_and_baud_together(self, monkeypatch):
+        monkeypatch.setattr(
+            "psoperator.gatekeeper.executor_ch9329._list_ports",
+            lambda: [FakePort("/dev/ttyACM1", *CH32V208_ID)],
+        )
+        assert resolve_connection("auto", 9600) == (
+            "/dev/ttyACM1",
+            115200,
+            KNOWN_CHIPS[CH32V208_ID],
+        )

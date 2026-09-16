@@ -132,12 +132,20 @@ class PSOperatorConfig(BaseSettings):
         "Topology B). All still behind the gatekeeper.",
     )
     ch9329_port: str = Field(
-        default="/dev/ttyUSB0", description="Serial port of the CH9329 HID cable."
+        default="auto",
+        description="Serial port of the HID-control cable, or 'auto' (default) to "
+        "find it by USB identity. Auto handles both revisions: a CH9329 behind a "
+        "CH340 bridge (1a86:7523) on /dev/ttyUSB*, and a CH32V208 (1a86:fe0c), "
+        "which is native USB CDC on /dev/ttyACM*. Auto refuses to guess when two "
+        "are attached — set an explicit path to disambiguate.",
     )
-    ch9329_baudrate: int = Field(
-        default=9600,
-        description="CH9329 factory default is 9600; 115200 only works after the "
-        "chip itself has been reconfigured. Must match the chip, not the wish.",
+    ch9329_baudrate: int | None = Field(
+        default=None,
+        description="Baud override. Leave unset (default) to derive it from the "
+        "detected chip: CH9329 is 9600 from the factory and 115200 only after "
+        "being reconfigured; CH32V208 is fixed at 115200 and cannot be "
+        "reconfigured at all, so a fixed-rate chip overrides this value rather "
+        "than opening a port that never speaks.",
     )
 
     # --- policy / gatekeeper ----------------------------------------------
