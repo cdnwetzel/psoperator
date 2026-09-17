@@ -375,11 +375,23 @@ class TestChipDetection:
         assert found.chip.name == "CH32V208"
         assert found.chip.fixed_baudrate == 115200
 
-    def test_finds_ch9329_on_ttyusb(self):
-        found = detect_hid_port([FakePort("/dev/ttyUSB0", *CH9329_ID)])
-        assert found.device == "/dev/ttyUSB0"
-        assert found.chip.name == "CH9329"
-        assert found.chip.fixed_baudrate is None
+    def test_generic_ch340_bridge_is_recognised_but_never_auto_selected(self):
+        """1a86:7523 is the id of every CH340/CH341 adapter, not of the KVM. An
+        Arduino clone on the bench carries the same id, and auto-opening it
+        would write HID frames into whatever it is. The id is reported — with
+        the port, so the operator can name it — and never chosen."""
+        with pytest.raises(RuntimeError, match="explicitly") as ei:
+            detect_hid_port([FakePort("/dev/ttyUSB0", *CH9329_ID)])
+        assert "/dev/ttyUSB0" in str(ei.value)
+        assert "1a86:7523" in str(ei.value)
+
+    def test_unrelated_ch340_adapter_is_denied_even_when_alone(self):
+        """The review case: nothing else attached, one CH340 adapter that is not
+        a HID cable at all. Being the only candidate must not promote it."""
+        with pytest.raises(RuntimeError):
+            detect_hid_port([FakePort("/dev/ttyUSB3", *CH9329_ID)])
+        assert KNOWN_CHIPS[CH9329_ID].auto_selectable is False
+        assert KNOWN_CHIPS[CH32V208_ID].auto_selectable is True
 
     def test_two_devices_is_refused_not_silently_first(self):
         """The wrong-pass case that matters. This backend actuates a target
@@ -449,6 +461,22 @@ class TestBaudResolution:
         monkeypatch.setattr("psoperator.gatekeeper.executor_ch9329._list_ports", boom)
         port, baud, chip = resolve_connection("/dev/ttyUSB7", 9600)
         assert (port, baud, chip) == ("/dev/ttyUSB7", 9600, None)
+
+    def test_explicit_port_on_a_ch340_bridge_is_the_operators_assertion(self, monkeypatch):
+        """Auto will not pick 1a86:7523, but an operator who names the port has
+        asserted what is behind it, so the CH9329 profile (and its 9600 factory
+        default) still applies to that port."""
+        monkeypatch.setattr(
+            "psoperator.gatekeeper.executor_ch9329._list_ports",
+            lambda: [FakePort("/dev/ttyUSB0", *CH9329_ID)],
+        )
+        assert resolve_connection("/dev/ttyUSB0", None) == (
+            "/dev/ttyUSB0",
+            9600,
+            KNOWN_CHIPS[CH9329_ID],
+        )
+        with pytest.raises(RuntimeError, match="explicitly"):
+            resolve_connection("auto", None)
 
     def test_auto_resolves_both_port_and_baud_together(self, monkeypatch):
         monkeypatch.setattr(

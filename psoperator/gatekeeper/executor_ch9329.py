@@ -32,6 +32,9 @@ Published v1.6/v1.9 Mini-KVMs use a **CH9329** behind a CH340 USB-serial bridge
 application, whose chip-strategy interface declares no keyboard or mouse methods
 at all — so this executor drives either. What differs is the port path and the
 baud rate, which is why both are *detected from the device* rather than assumed.
+One asymmetry: ``1a86:7523`` is the id of every CH340 adapter, not of the KVM,
+so ``port='auto'`` recognises it but refuses to select it — the CH340-bridged
+unit needs an explicit port, and only the CH32V208 is found by identity.
 
 Baud note: the CH9329 ships at **9600** baud; 115200 works only after the chip
 has been reconfigured (vendor tool / SET_PARA_CFG). The CH32V208 is **fixed at
@@ -252,14 +255,27 @@ class ChipProfile:
     fixed_baudrate: int | None
     #: Baud to use when the caller expressed no preference.
     default_baudrate: int
+    #: Whether the USB identity alone is enough for ``port='auto'`` to open the
+    #: port and write actuator frames to it. ``False`` means the id is shared
+    #: with unrelated hardware, so the operator must name the port explicitly.
+    auto_selectable: bool = True
 
 
 #: USB identities we know how to drive. Both speak the same frame format; they
 #: differ only in carrier, port class and baud. Keyed (vid, pid).
 KNOWN_CHIPS: dict[tuple[int, int], ChipProfile] = {
     # CH9329 behind a CH340 USB-serial bridge — published v1.6/v1.9 hardware.
-    (0x1A86, 0x7523): ChipProfile("CH9329", fixed_baudrate=None, default_baudrate=9600),
+    # 1a86:7523 is the id of *every* CH340/CH341 serial adapter (the Linux
+    # ``ch341`` driver binds it generically), so it proves a bridge is present,
+    # not what sits behind it. Auto-selecting it could write HID frames into an
+    # Arduino clone or a debug console. Fail closed: recognise it, never choose
+    # it — the operator names the port.
+    (0x1A86, 0x7523): ChipProfile(
+        "CH9329", fixed_baudrate=None, default_baudrate=9600, auto_selectable=False
+    ),
     # CH32V208 MCU, native USB CDC — newer hardware. 115200 only, not reconfigurable.
+    # This is WCH's CDC id for the MCU, not one unique to the KVM; a protocol
+    # probe (CMD_GET_INFO) is the discriminator that would close that too.
     (0x1A86, 0xFE0C): ChipProfile("CH32V208", fixed_baudrate=115200, default_baudrate=115200),
 }
 
@@ -296,7 +312,9 @@ def detect_hid_port(candidates=None) -> DetectedPort:
     **More than one match is also an error**: this is an actuator, and silently
     picking the first of two KVMs would inject keystrokes into whichever target
     happened to enumerate first. Ambiguity is for the operator to resolve with
-    an explicit ``port=``, never for us to guess.
+    an explicit ``port=``, never for us to guess. And a match whose USB id is
+    **not unique to this hardware** (the CH340 bridge) is reported, not chosen:
+    identity alone does not prove there is a HID chip behind it.
     """
     ports = _list_ports() if candidates is None else list(candidates)
     matches = [
@@ -330,7 +348,16 @@ def detect_hid_port(candidates=None) -> DetectedPort:
             "picking the wrong one types into the wrong computer. Pass an explicit "
             "port= to say which."
         )
-    return matches[0]
+    found = matches[0]
+    if not found.chip.auto_selectable:
+        raise RuntimeError(
+            f"found a CH340 serial bridge at {found.device} (1a86:7523). That USB id "
+            "is shared by every CH340/CH341 adapter, so it may be a CH9329 HID cable "
+            "or it may be something unrelated — auto will not write actuator frames "
+            f"to it on identity alone. If it is the HID cable, pass port={found.device!r} "
+            "explicitly."
+        )
+    return found
 
 
 def resolve_baudrate(chip: ChipProfile, configured: int | None) -> int:
@@ -404,7 +431,7 @@ def _open_serial(port: str, baudrate: int) -> Transport:
             else (
                 "could not identify the chip on that port — if this is a newer "
                 "Mini-KVM the control chip is a CH32V208 on /dev/ttyACM*, not a "
-                "CH9329 on /dev/ttyUSB*. Try port='auto'. "
+                "CH9329 on /dev/ttyUSB*, and port='auto' finds it. "
             )
         )
         raise RuntimeError(

@@ -200,7 +200,7 @@ To use a crash-cart cable instead:
 
 ```bash
 python -m pip install -e '.[ch9329,uvc]'
-psoperator executor --backend ch9329        # port and baud are auto-detected
+psoperator executor --backend ch9329        # CH32V208 units: port and baud auto-detected
 ```
 
 A plain USB-A-to-USB-A cable is not a substitute for a serial-to-HID bridge.
@@ -214,17 +214,25 @@ it, and they need different plumbing:
 | --- | --- | --- |
 | capture | MS2109 | MS2109S |
 | HID control | CH9329 + CH340 bridge | CH32V208 MCU (native USB CDC) |
-| serial USB id | `1a86:7523` | `1a86:fe0c` |
+| serial USB id | `1a86:7523` (generic CH340 — see below) | `1a86:fe0c` |
 | Linux device | `/dev/ttyUSB*` | `/dev/ttyACM*` |
 | baud | 9600 factory default; 115200 after reconfiguration | **115200 fixed**, not reconfigurable |
+| `PSOPERATOR_CH9329_PORT` | **explicit path required** | `auto` works |
 
 Both accept identical frames, so one executor drives either. `PSOPERATOR_CH9329_PORT`
-defaults to `auto`, which finds the device by USB identity and derives the baud
-from the chip — deliberately, because assuming one revision's port path and baud
-makes a working unit of the other revision read as dead hardware. Auto **refuses
-to choose** when two supported devices are attached: this backend actuates a
-target machine, so picking the wrong one types into the wrong computer. Set an
-explicit `PSOPERATOR_CH9329_PORT` to disambiguate.
+defaults to `auto`, which finds a CH32V208 unit by USB identity and derives the
+baud from the chip — deliberately, because assuming one revision's port path and
+baud makes a working unit of the other revision read as dead hardware.
+
+The CH340-bridged revision is the exception, and it is a trust-boundary call:
+`1a86:7523` is the id of **every** CH340/CH341 serial adapter (the Linux `ch341`
+driver binds it generically), so seeing it proves a bridge is present, not that
+a HID chip sits behind it. `auto` recognises it and refuses to open it, naming
+the port so you can. Set `PSOPERATOR_CH9329_PORT=/dev/ttyUSB0` (or wherever it
+enumerated) for that revision; the baud is still derived from the chip once the
+port is named. Auto also **refuses to choose** when two supported devices are
+attached: this backend actuates a target machine, so picking the wrong one types
+into the wrong computer.
 
 ### Linux permissions
 
@@ -250,7 +258,7 @@ then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 | `PSOPERATOR_MODEL_ENDPOINT` | `http://localhost:8000/v1` | Local OpenAI-compatible model endpoint |
 | `PSOPERATOR_MODEL_NAME` | `ui-tars-1.5-7b` | Model identifier sent to the endpoint |
 | `PSOPERATOR_EXECUTOR_BACKEND` | `dryrun` | `dryrun`, `pynput`, or `ch9329` |
-| `PSOPERATOR_CH9329_PORT` | `auto` | HID-control serial port; `auto` finds it by USB id |
+| `PSOPERATOR_CH9329_PORT` | `auto` | HID-control serial port; `auto` finds a CH32V208 by USB id (CH340-bridged units need an explicit path) |
 | `PSOPERATOR_CH9329_BAUDRATE` | unset | Baud override; unset derives it from the detected chip |
 | `PSOPERATOR_AUDIT_LOG_PATH` | `psoperator_audit.jsonl` | Hash-chained decision log |
 | `PSOPERATOR_KILL_SWITCH_PATH` | `.psoperator/STOP` | Persistent global-stop sentinel |

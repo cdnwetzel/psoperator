@@ -134,10 +134,12 @@ class PSOperatorConfig(BaseSettings):
     ch9329_port: str = Field(
         default="auto",
         description="Serial port of the HID-control cable, or 'auto' (default) to "
-        "find it by USB identity. Auto handles both revisions: a CH9329 behind a "
-        "CH340 bridge (1a86:7523) on /dev/ttyUSB*, and a CH32V208 (1a86:fe0c), "
-        "which is native USB CDC on /dev/ttyACM*. Auto refuses to guess when two "
-        "are attached — set an explicit path to disambiguate.",
+        "find it by USB identity. Auto finds a CH32V208 unit (1a86:fe0c, native "
+        "USB CDC on /dev/ttyACM*). A CH9329 behind a CH340 bridge (1a86:7523, "
+        "/dev/ttyUSB*) is recognised but never auto-selected: that id belongs to "
+        "every CH340 adapter, so auto cannot know a HID chip is behind it — set "
+        "the path explicitly for that revision. Auto also refuses to guess when "
+        "two supported devices are attached.",
     )
     ch9329_baudrate: int | None = Field(
         default=None,
