@@ -24,15 +24,31 @@ the chip — e.g. moving it off its 9600-baud factory default — and for
 interactive REPL debugging; the executor itself speaks the documented wire
 protocol directly.)
 
-Baud note: the CH9329 ships at **9600** baud. 115200 is supported but only
-after the chip itself has been reconfigured (vendor tool / SET_PARA_CFG);
-``baudrate`` here must match the chip's current setting, not the one you
-wish it had.
+Chip revisions: the wire protocol above is shared, but the *carrier* is not.
+Published v1.6/v1.9 Mini-KVMs use a **CH9329** behind a CH340 USB-serial bridge
+(``1a86:7523``) and enumerate as ``/dev/ttyUSB*``; newer units use a
+**CH32V208** MCU (``1a86:fe0c``) which is native USB CDC and enumerates as
+``/dev/ttyACM*``. Both speak the same frames — verified against the vendor host
+application, whose chip-strategy interface declares no keyboard or mouse methods
+at all — so this executor drives either. What differs is the port path and the
+baud rate, which is why both are *detected from the device* rather than assumed.
+Neither USB id is unique to the KVM (``1a86:7523`` is every CH340 adapter;
+``1a86:fe0c`` is WCH's CDC id for the CH32V208 MCU), so ``port='auto'``
+identifies the chip and names the port but refuses to open it: an explicit
+port is the operator's assertion of what is behind that id, and the baud is
+still derived from the identified chip. A read-only protocol probe is the
+discriminator that would let ``auto`` open a port (psoperator #14).
+
+Baud note: the CH9329 ships at **9600** baud; 115200 works only after the chip
+has been reconfigured (vendor tool / SET_PARA_CFG). The CH32V208 is **fixed at
+115200** and cannot be reconfigured at all. So ``baudrate`` must match the chip
+in the box, not the one the config wishes for — hence :func:`resolve_baudrate`.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from psoperator.runtime.actions import Action, ActionKind
@@ -228,8 +244,182 @@ class Transport(Protocol):
     def close(self) -> None: ...
 
 
+# --------------------------------------------------------------------------
+# Chip / port detection (pure enough to test; no port is opened here)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChipProfile:
+    """What a supported control chip needs from us, keyed by USB identity."""
+
+    name: str
+    #: Baud the chip is locked to, or ``None`` when it is configurable.
+    fixed_baudrate: int | None
+    #: Baud to use when the caller expressed no preference.
+    default_baudrate: int
+    #: Whether the USB identity alone is enough for ``port='auto'`` to open the
+    #: port and write actuator frames to it. ``False`` means the id is shared
+    #: with unrelated hardware, so the operator must name the port explicitly.
+    auto_selectable: bool = True
+
+
+#: USB identities we know how to drive. Both speak the same frame format; they
+#: differ only in carrier, port class and baud. Keyed (vid, pid).
+KNOWN_CHIPS: dict[tuple[int, int], ChipProfile] = {
+    # CH9329 behind a CH340 USB-serial bridge — published v1.6/v1.9 hardware.
+    # 1a86:7523 is the id of *every* CH340/CH341 serial adapter (the Linux
+    # ``ch341`` driver binds it generically), so it proves a bridge is present,
+    # not what sits behind it. Auto-selecting it could write HID frames into an
+    # Arduino clone or a debug console. Fail closed: recognise it, never choose
+    # it — the operator names the port.
+    (0x1A86, 0x7523): ChipProfile(
+        "CH9329", fixed_baudrate=None, default_baudrate=9600, auto_selectable=False
+    ),
+    # CH32V208 MCU, native USB CDC — newer hardware. 115200 only, not reconfigurable.
+    # 1a86:fe0c is WCH's CDC id for the MCU, not one unique to the KVM: another
+    # CH32V208 CDC firmware on the bench carries it too. Same rule — identify,
+    # never select. A read-only CMD_GET_INFO probe is the discriminator that
+    # would let ``auto`` open a port (psoperator #14); until it exists and is
+    # verified on hardware, ``auto_selectable`` stays False for every profile.
+    (0x1A86, 0xFE0C): ChipProfile(
+        "CH32V208", fixed_baudrate=115200, default_baudrate=115200, auto_selectable=False
+    ),
+}
+
+#: Sentinel accepted by ``port=`` meaning "find it from USB identity".
+AUTO_PORT = "auto"
+
+
+@dataclass(frozen=True)
+class DetectedPort:
+    device: str
+    chip: ChipProfile
+
+
+def _list_ports():
+    """Lazily import pyserial's port enumerator. Same optional-dep contract as
+    :func:`_open_serial`: a missing install is a clear error, never a silent
+    empty list (an empty list would read as 'no device attached' and send the
+    operator hunting cables for a packaging problem)."""
+    try:
+        from serial.tools import list_ports
+    except ImportError as e:  # pragma: no cover - exercised via monkeypatch
+        raise RuntimeError(
+            "port auto-detection needs pyserial, which is not installed. "
+            "Install it with: pip install -e .[ch9329]"
+        ) from e
+    return list(list_ports.comports())
+
+
+def detect_hid_port(candidates=None) -> DetectedPort:
+    """Find the attached HID-control chip by USB identity.
+
+    Fails closed in both directions. Nothing attached is an error naming what
+    *was* seen, so the operator can tell "wrong cable" from "wrong driver".
+    **More than one match is also an error**: this is an actuator, and silently
+    picking the first of two KVMs would inject keystrokes into whichever target
+    happened to enumerate first. Ambiguity is for the operator to resolve with
+    an explicit ``port=``, never for us to guess. And a match whose USB id is
+    **not unique to this hardware** is reported, not chosen: identity alone does
+    not prove there is a HID chip behind it. Today that is every known profile,
+    so ``auto`` finds and names the port and the operator opens it explicitly.
+    """
+    ports = _list_ports() if candidates is None else list(candidates)
+    matches = [
+        DetectedPort(p.device, KNOWN_CHIPS[(p.vid, p.pid)])
+        for p in ports
+        if (p.vid, p.pid) in KNOWN_CHIPS
+    ]
+    if not matches:
+        seen = (
+            ", ".join(
+                f"{p.device} ({p.vid:04x}:{p.pid:04x})"
+                if p.vid is not None and p.pid is not None
+                else f"{p.device} (no USB id)"
+                for p in ports
+            )
+            or "no serial ports at all"
+        )
+        raise RuntimeError(
+            "no supported HID-control chip found. Looked for "
+            + ", ".join(f"{v:04x}:{p:04x} ({c.name})" for (v, p), c in KNOWN_CHIPS.items())
+            + f"; saw: {seen}. "
+            "(cable plugged into the HOST side? on Linux, is there a udev rule for it? "
+            "the CH32V208 is CDC ACM and needs a rule on the 'tty' subsystem, "
+            "not 'ttyACM' — see the README.)"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            "more than one supported HID-control chip attached: "
+            + ", ".join(f"{m.device} ({m.chip.name})" for m in matches)
+            + ". Refusing to choose — this backend actuates a target machine, so "
+            "picking the wrong one types into the wrong computer. Pass an explicit "
+            "port= to say which."
+        )
+    found = matches[0]
+    if not found.chip.auto_selectable:
+        vid, pid = next(k for k, v in KNOWN_CHIPS.items() if v is found.chip)
+        raise RuntimeError(
+            f"found a {found.chip.name} at {found.device} ({vid:04x}:{pid:04x}). That USB "
+            "id identifies the serial chip, not the HID cable — unrelated hardware "
+            "carries it too — so auto will not write actuator frames to it on "
+            f"identity alone. If it is the HID cable, pass port={found.device!r} "
+            "explicitly; the baud is still derived from the chip."
+        )
+    return found
+
+
+def resolve_baudrate(chip: ChipProfile, configured: int | None) -> int:
+    """Baud derived from the chip, not asserted by config.
+
+    A chip with a fixed rate wins over any configured value — the CH32V208 is
+    115200-only and cannot be reconfigured, so honouring a stored 9600 would
+    produce a port that opens and then never speaks. Mismatches are surfaced by
+    the caller rather than swallowed.
+    """
+    if chip.fixed_baudrate is not None:
+        return chip.fixed_baudrate
+    return chip.default_baudrate if configured is None else configured
+
+
+def _identify(port: str) -> ChipProfile | None:
+    """Best-effort chip lookup for an explicitly-given port. Returns ``None``
+    when the port is not a recognised device (or cannot be enumerated at all) —
+    an explicit port must keep working even if detection is unavailable."""
+    try:
+        for p in _list_ports():
+            if p.device == port and (p.vid, p.pid) in KNOWN_CHIPS:
+                return KNOWN_CHIPS[(p.vid, p.pid)]
+    except RuntimeError:
+        return None
+    return None
+
+
+def resolve_connection(
+    port: str, baudrate: int | None
+) -> tuple[str, int, ChipProfile | None]:
+    """Turn a requested (port, baud) into the concrete pair to open.
+
+    Kept separate from :func:`_open_serial` on purpose: resolution is decidable
+    without hardware and is the part worth testing, while opening is the part
+    that needs a real port. ``port='auto'`` detects by USB identity; an explicit
+    port is still identified best-effort so a fixed-baud chip is honoured.
+    """
+    if port == AUTO_PORT:
+        detected = detect_hid_port()
+        port, chip = detected.device, detected.chip
+    else:
+        chip = _identify(port)
+    baud = resolve_baudrate(chip, baudrate) if chip else (9600 if baudrate is None else baudrate)
+    return port, baud, chip
+
+
 def _open_serial(port: str, baudrate: int) -> Transport:
-    """Default transport: pyserial. Lazy import guard — pyserial is optional."""
+    """Default transport: pyserial. Lazy import guard — pyserial is optional.
+
+    Takes an already-resolved port and baud (see :func:`resolve_connection`).
+    """
     try:
         import serial
     except ImportError as e:
@@ -237,13 +427,29 @@ def _open_serial(port: str, baudrate: int) -> Transport:
             "CH9329Executor needs pyserial, which is not installed. "
             "Install it with: pip install -e .[ch9329]"
         ) from e
+    baud = baudrate
     try:
-        return serial.Serial(port, baudrate, timeout=0.05)
+        return serial.Serial(port, baud, timeout=0.05)
     except Exception as e:
+        # Identify only on the failure path: the happy path has already resolved
+        # the chip in resolve_connection, and re-enumerating every open to build
+        # a message nobody sees is pure cost.
+        chip = _identify(port)
+        chip_note = (
+            f"detected chip {chip.name}. "
+            if chip
+            else (
+                "could not identify the chip on that port — if this is a newer "
+                "Mini-KVM the control chip is a CH32V208 on /dev/ttyACM*, not a "
+                "CH9329 on /dev/ttyUSB*; port='auto' names the port it finds. "
+            )
+        )
         raise RuntimeError(
-            f"cannot open CH9329 serial port {port!r} at {baudrate} baud: {e} "
-            "(cable plugged in? in the 'dialout' group? chip still at its "
-            "9600-baud factory default?)"
+            f"cannot open HID serial port {port!r} at {baud} baud: {e} "
+            f"({chip_note}"
+            "cable plugged into the HOST side? permissions — 'dialout' group for "
+            "/dev/ttyUSB*, and a udev rule on the 'tty' subsystem for /dev/ttyACM*? "
+            "a CH9329 still at its 9600-baud factory default?)"
         ) from e
 
 
@@ -292,15 +498,23 @@ class CH9329Executor:
 
     def __init__(
         self,
-        port: str = "/dev/ttyUSB0",
-        baudrate: int = 9600,
+        port: str = AUTO_PORT,
+        baudrate: int | None = None,
         screen_width: int = 1920,
         screen_height: int = 1080,
         transport: Transport | None = None,
         press_delay: float = 0.02,
     ) -> None:
         self._screen = (screen_width, screen_height)
-        self._transport = transport if transport is not None else _open_serial(port, baudrate)
+        #: What was actually resolved — None when a transport was injected.
+        self.port: str | None = None
+        self.baudrate: int | None = None
+        self.chip: ChipProfile | None = None
+        if transport is not None:
+            self._transport = transport
+        else:
+            self.port, self.baudrate, self.chip = resolve_connection(port, baudrate)
+            self._transport = _open_serial(self.port, self.baudrate)
         self._press_delay = press_delay  # inter-report gap; 9600 baud is slow
 
     # ------------------------------------------------------------- helpers

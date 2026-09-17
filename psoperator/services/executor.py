@@ -12,7 +12,7 @@ from psoperator.gatekeeper.executor_ch9329 import CH9329Executor
 from psoperator.runtime.actions import parse_action
 
 
-def build_executor(backend: str, *, port: str, baudrate: int) -> Executor:
+def build_executor(backend: str, *, port: str, baudrate: int | None) -> Executor:
     if backend == "dryrun":
         return DryRunExecutor()
     if backend == "pynput":

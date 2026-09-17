@@ -196,16 +196,57 @@ To opt into an executor that can move the local mouse and keyboard:
 psoperator executor --backend pynput
 ```
 
-To use a CH9329 crash-cart cable instead:
+To use a crash-cart cable instead:
 
 ```bash
 python -m pip install -e '.[ch9329,uvc]'
-PSOPERATOR_CH9329_PORT=/dev/ttyUSB0 psoperator executor --backend ch9329
+psoperator executor --backend ch9329        # names the port it finds; set it explicitly
 ```
 
-The CH9329 factory default is typically 9600 baud. The configured baud rate
-must match the chip, and a plain USB-A-to-USB-A cable is not a substitute for a
-serial-to-HID bridge.
+A plain USB-A-to-USB-A cable is not a substitute for a serial-to-HID bridge.
+
+### Two hardware revisions, one protocol
+
+`ch9329` names the **wire protocol**, not the silicon. Two control chips speak
+it, and they need different plumbing:
+
+| | published v1.6 / v1.9 | newer units |
+| --- | --- | --- |
+| capture | MS2109 | MS2109S |
+| HID control | CH9329 + CH340 bridge | CH32V208 MCU (native USB CDC) |
+| serial USB id | `1a86:7523` (generic CH340) | `1a86:fe0c` (WCH CDC id for the MCU) |
+| Linux device | `/dev/ttyUSB*` | `/dev/ttyACM*` |
+| baud | 9600 factory default; 115200 after reconfiguration | **115200 fixed**, not reconfigurable |
+
+Both accept identical frames, so one executor drives either. `PSOPERATOR_CH9329_PORT`
+defaults to `auto`, which identifies the chip by USB id and derives the baud from
+it — deliberately, because assuming one revision's port path and baud makes a
+working unit of the other revision read as dead hardware.
+
+What `auto` will **not** do is open the port. Neither id is unique to the HID
+cable: `1a86:7523` is every CH340/CH341 serial adapter (the Linux `ch341` driver
+binds it generically), and `1a86:fe0c` is WCH's CDC id for the CH32V208 MCU, so
+seeing either proves a serial chip is present, not that a HID chip sits behind
+it. For a backend that types into a target machine that is a trust-boundary
+call: `auto` names the port and chip it found and refuses; you set
+`PSOPERATOR_CH9329_PORT` to that path, which is the operator asserting what is
+behind it. The baud is still derived from the identified chip. Auto also
+**refuses to choose** when two supported devices are attached. A read-only
+protocol probe that would let `auto` open a verified port is tracked as #14.
+
+### Linux permissions
+
+`/dev/ttyUSB*` needs the `dialout` group. `/dev/ttyACM*` needs a udev rule on
+the **`tty`** subsystem — not `ttyACM`, which is not a subsystem name — or the
+device stays root-only:
+
+```
+# /etc/udev/rules.d/51-openterface.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="fe0c", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="fe0c", TAG+="uaccess"
+```
+
+then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 
 ## Configuration
 
@@ -217,6 +258,8 @@ serial-to-HID bridge.
 | `PSOPERATOR_MODEL_ENDPOINT` | `http://localhost:8000/v1` | Local OpenAI-compatible model endpoint |
 | `PSOPERATOR_MODEL_NAME` | `ui-tars-1.5-7b` | Model identifier sent to the endpoint |
 | `PSOPERATOR_EXECUTOR_BACKEND` | `dryrun` | `dryrun`, `pynput`, or `ch9329` |
+| `PSOPERATOR_CH9329_PORT` | `auto` | HID-control serial port; `auto` identifies and names it by USB id, but an explicit path is required to open it |
+| `PSOPERATOR_CH9329_BAUDRATE` | unset | Baud override; unset derives it from the detected chip |
 | `PSOPERATOR_AUDIT_LOG_PATH` | `psoperator_audit.jsonl` | Hash-chained decision log |
 | `PSOPERATOR_KILL_SWITCH_PATH` | `.psoperator/STOP` | Persistent global-stop sentinel |
 | `PSOPERATOR_HARD_BLOCK_T3` | `true` | Prevent destructive T3 execution |
