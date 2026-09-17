@@ -32,9 +32,12 @@ Published v1.6/v1.9 Mini-KVMs use a **CH9329** behind a CH340 USB-serial bridge
 application, whose chip-strategy interface declares no keyboard or mouse methods
 at all — so this executor drives either. What differs is the port path and the
 baud rate, which is why both are *detected from the device* rather than assumed.
-One asymmetry: ``1a86:7523`` is the id of every CH340 adapter, not of the KVM,
-so ``port='auto'`` recognises it but refuses to select it — the CH340-bridged
-unit needs an explicit port, and only the CH32V208 is found by identity.
+Neither USB id is unique to the KVM (``1a86:7523`` is every CH340 adapter;
+``1a86:fe0c`` is WCH's CDC id for the CH32V208 MCU), so ``port='auto'``
+identifies the chip and names the port but refuses to open it: an explicit
+port is the operator's assertion of what is behind that id, and the baud is
+still derived from the identified chip. A read-only protocol probe is the
+discriminator that would let ``auto`` open a port (psoperator #14).
 
 Baud note: the CH9329 ships at **9600** baud; 115200 works only after the chip
 has been reconfigured (vendor tool / SET_PARA_CFG). The CH32V208 is **fixed at
@@ -274,9 +277,14 @@ KNOWN_CHIPS: dict[tuple[int, int], ChipProfile] = {
         "CH9329", fixed_baudrate=None, default_baudrate=9600, auto_selectable=False
     ),
     # CH32V208 MCU, native USB CDC — newer hardware. 115200 only, not reconfigurable.
-    # This is WCH's CDC id for the MCU, not one unique to the KVM; a protocol
-    # probe (CMD_GET_INFO) is the discriminator that would close that too.
-    (0x1A86, 0xFE0C): ChipProfile("CH32V208", fixed_baudrate=115200, default_baudrate=115200),
+    # 1a86:fe0c is WCH's CDC id for the MCU, not one unique to the KVM: another
+    # CH32V208 CDC firmware on the bench carries it too. Same rule — identify,
+    # never select. A read-only CMD_GET_INFO probe is the discriminator that
+    # would let ``auto`` open a port (psoperator #14); until it exists and is
+    # verified on hardware, ``auto_selectable`` stays False for every profile.
+    (0x1A86, 0xFE0C): ChipProfile(
+        "CH32V208", fixed_baudrate=115200, default_baudrate=115200, auto_selectable=False
+    ),
 }
 
 #: Sentinel accepted by ``port=`` meaning "find it from USB identity".
@@ -313,8 +321,9 @@ def detect_hid_port(candidates=None) -> DetectedPort:
     picking the first of two KVMs would inject keystrokes into whichever target
     happened to enumerate first. Ambiguity is for the operator to resolve with
     an explicit ``port=``, never for us to guess. And a match whose USB id is
-    **not unique to this hardware** (the CH340 bridge) is reported, not chosen:
-    identity alone does not prove there is a HID chip behind it.
+    **not unique to this hardware** is reported, not chosen: identity alone does
+    not prove there is a HID chip behind it. Today that is every known profile,
+    so ``auto`` finds and names the port and the operator opens it explicitly.
     """
     ports = _list_ports() if candidates is None else list(candidates)
     matches = [
@@ -350,12 +359,13 @@ def detect_hid_port(candidates=None) -> DetectedPort:
         )
     found = matches[0]
     if not found.chip.auto_selectable:
+        vid, pid = next(k for k, v in KNOWN_CHIPS.items() if v is found.chip)
         raise RuntimeError(
-            f"found a CH340 serial bridge at {found.device} (1a86:7523). That USB id "
-            "is shared by every CH340/CH341 adapter, so it may be a CH9329 HID cable "
-            "or it may be something unrelated — auto will not write actuator frames "
-            f"to it on identity alone. If it is the HID cable, pass port={found.device!r} "
-            "explicitly."
+            f"found a {found.chip.name} at {found.device} ({vid:04x}:{pid:04x}). That USB "
+            "id identifies the serial chip, not the HID cable — unrelated hardware "
+            "carries it too — so auto will not write actuator frames to it on "
+            f"identity alone. If it is the HID cable, pass port={found.device!r} "
+            "explicitly; the baud is still derived from the chip."
         )
     return found
 
@@ -431,7 +441,7 @@ def _open_serial(port: str, baudrate: int) -> Transport:
             else (
                 "could not identify the chip on that port — if this is a newer "
                 "Mini-KVM the control chip is a CH32V208 on /dev/ttyACM*, not a "
-                "CH9329 on /dev/ttyUSB*, and port='auto' finds it. "
+                "CH9329 on /dev/ttyUSB*; port='auto' names the port it finds. "
             )
         )
         raise RuntimeError(

@@ -369,11 +369,14 @@ class FakePort:
 
 
 class TestChipDetection:
-    def test_finds_ch32v208_on_ttyacm(self):
-        found = detect_hid_port([FakePort("/dev/ttyACM0", *CH32V208_ID)])
-        assert found.device == "/dev/ttyACM0"
-        assert found.chip.name == "CH32V208"
-        assert found.chip.fixed_baudrate == 115200
+    def test_ch32v208_is_identified_and_named_but_not_auto_selected(self):
+        """1a86:fe0c is WCH's CDC id for the MCU, not the KVM's. Same rule as
+        the CH340 bridge: name the port and the chip, never open it on identity."""
+        with pytest.raises(RuntimeError, match="explicitly") as ei:
+            detect_hid_port([FakePort("/dev/ttyACM0", *CH32V208_ID)])
+        assert "/dev/ttyACM0" in str(ei.value)
+        assert "1a86:fe0c" in str(ei.value)
+        assert "CH32V208" in str(ei.value)
 
     def test_generic_ch340_bridge_is_recognised_but_never_auto_selected(self):
         """1a86:7523 is the id of every CH340/CH341 adapter, not of the KVM. An
@@ -390,8 +393,8 @@ class TestChipDetection:
         a HID cable at all. Being the only candidate must not promote it."""
         with pytest.raises(RuntimeError):
             detect_hid_port([FakePort("/dev/ttyUSB3", *CH9329_ID)])
-        assert KNOWN_CHIPS[CH9329_ID].auto_selectable is False
-        assert KNOWN_CHIPS[CH32V208_ID].auto_selectable is True
+        # Every known profile is identify-only until a protocol probe exists (#14).
+        assert all(c.auto_selectable is False for c in KNOWN_CHIPS.values())
 
     def test_two_devices_is_refused_not_silently_first(self):
         """The wrong-pass case that matters. This backend actuates a target
@@ -478,13 +481,17 @@ class TestBaudResolution:
         with pytest.raises(RuntimeError, match="explicitly"):
             resolve_connection("auto", None)
 
-    def test_auto_resolves_both_port_and_baud_together(self, monkeypatch):
+    def test_explicit_port_on_a_ch32v208_derives_the_fixed_baud(self, monkeypatch):
+        """The upgrade path end to end: operator names the ACM port, config still
+        says 9600, the chip is identified and its fixed 115200 wins."""
         monkeypatch.setattr(
             "psoperator.gatekeeper.executor_ch9329._list_ports",
             lambda: [FakePort("/dev/ttyACM1", *CH32V208_ID)],
         )
-        assert resolve_connection("auto", 9600) == (
+        assert resolve_connection("/dev/ttyACM1", 9600) == (
             "/dev/ttyACM1",
             115200,
             KNOWN_CHIPS[CH32V208_ID],
         )
+        with pytest.raises(RuntimeError, match="explicitly"):
+            resolve_connection("auto", 9600)
