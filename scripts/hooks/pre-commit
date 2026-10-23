@@ -1,0 +1,6 @@
+#!/bin/sh
+# Privacy gate on what the commit would record (the staged blobs, not the working
+# tree). Uses the operator's private denylist when present.
+# Enable once per clone: git config core.hooksPath scripts/hooks
+exec python3 "$(git rev-parse --show-toplevel)/scripts/privacy_scan.py" staged \
+    --denylist "${PRIVACY_DENYLIST:-$HOME/.config/pxx/public-denylist}"

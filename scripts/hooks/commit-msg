@@ -1,0 +1,4 @@
+#!/bin/sh
+# Privacy gate on the commit message: a message is published as surely as a file.
+exec python3 "$(git rev-parse --show-toplevel)/scripts/privacy_scan.py" text --name commit-message \
+    --denylist "${PRIVACY_DENYLIST:-$HOME/.config/pxx/public-denylist}" < "$1"

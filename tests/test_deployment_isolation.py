@@ -26,7 +26,16 @@ from psoperator.common.ipc import IPCServer
 # --- the IPC surface is loopback-only ---------------------------------------
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "10.0.0.5", "example.com", "::", "192.168.1.10"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "10.0.0.5",  # privacy: example
+        "example.com",
+        "::",
+        "192.168.1.10",  # privacy: example
+    ],
+)
 def test_ipc_refuses_any_non_loopback_bind(host):
     # A planner reaches the gatekeeper only over loopback; the service refuses to
     # expose itself on a routable interface at all.
@@ -83,7 +92,16 @@ def test_unclaimed_platform_windows_fails_closed(tmp_path, monkeypatch):
     key = tmp_path / "observer-key.json"
     provision_attestation_key(key, "observer-v1")  # POSIX provisioning works
 
-    monkeypatch.setattr(attestation.os, "name", "nt")
+    # Fake Windows for the attestation module only. Setting the shared
+    # os.name would make pathlib build Windows paths process-wide; on
+    # Python 3.11 that crashes pytest itself (cannot instantiate WindowsPath).
+    class _WindowsOs:
+        name = "nt"
+
+        def __getattr__(self, attr):
+            return getattr(os, attr)
+
+    monkeypatch.setattr(attestation, "os", _WindowsOs())
     with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
         provision_attestation_key(tmp_path / "other.json", "observer-v2")
     with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
