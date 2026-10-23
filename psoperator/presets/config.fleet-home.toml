@@ -18,22 +18,22 @@ fleet = "home"
 # goes through :8003 so every request is audited. No auth — the proxy is the
 # trust boundary, not a credential.
 model_endpoint = "http://192.0.2.125:8003/v1"
-model_name = "qwen2.5-coder-14b-pscode"
+model_name = "qwen2.5-coder-14b-lora"
 planner_ctx_budget = 16384          # tokens; planner served with 16k ctx
 model_timeout_s = 60.0
 model_api_key = "not-needed"        # local servers ignore this
 
 # --- grounder (element grounding model) --------------------------------------
-# HOME hardware envelope: NVLink4-pooled 2x 20GB A4500 = 40GB on T5810 (pscode
+# HOME hardware envelope: NVLink4-pooled 2x 20GB A4500 = 40GB on T5810 (the coder LoRA
 # planner lane, TP=2), a dedicated 16GB Blackwell host, and the 16GB M4 Mac
 # mini. The grounder stand-up is a three-option ladder:
 #   (a) RECOMMENDED once stood up: the dedicated 16GB Blackwell host —
 #       ui-tars-1.5-7b BF16 (~16GB) or ScaleCUA-9B / GUI-Owl-1.5-8B Q4.
-#       Zero contention: pscode occupies only the A4500 pair (TP=2), so the
+#       Zero contention: the coder LoRA occupies only the A4500 pair (TP=2), so the
 #       grounder runs concurrently with the production planner lane.
 #   (b) LOW-EFFORT DEFAULT (encoded below): grounder host holo3.1:4b via
 #       Ollama/MLX — the host is idle and already carries 7B-class weights.
-#   (c) QUALITY CEILING, pscode-stopped windows only: the NVLink-pooled 40GB
+#   (c) QUALITY CEILING, LoRA-stopped windows only: the NVLink-pooled 40GB
 #       pair fits Holo3.1-35B-A3B Q4 (~21.4GB); same mutual-exclusivity
 #       pattern as the staged 32B-AWQ alternate planner.
 # NOTE: holo3.1:4b is a PLACEHOLDER — the model must still be stood up on

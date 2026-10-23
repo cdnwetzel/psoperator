@@ -33,7 +33,7 @@ class TestPresetsLoad:
     def test_home_preset_loads_by_name(self):
         cfg = PSOperatorConfig.from_preset("home")
         assert cfg.model_endpoint == HOME_PLANNER_URL
-        assert cfg.model_name == "qwen2.5-coder-14b-pscode"
+        assert cfg.model_name == "qwen2.5-coder-14b-lora"
         assert cfg.model_api_key == "not-needed"
         assert cfg.embeddings_url == "http://127.0.0.1:8005"
         assert cfg.qdrant_url == "http://127.0.0.1:6333"
