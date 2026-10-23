@@ -96,3 +96,46 @@ def test_this_repository_is_clean():
     root = _SCRIPT.parent.parent
     result = _run("files", "--root", str(root))
     assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        r"C:\Users\someone\ai",  # privacy: example
+        "c:/Users/someone/ai",  # privacy: example
+        r"D:\Documents and Settings\someone",  # privacy: example
+    ],
+)
+def test_windows_home_paths_are_caught(scan, line):
+    # strip the marker: the line must be caught on its own
+    assert scan.scan_lines("f", [line.split("  #")[0]], [])
+
+
+def test_the_example_marker_never_exempts_a_denylist_term(scan):
+    line = "host-a 10.20.30.40  # privacy: example"
+    assert scan.scan_lines("f", [line], ["host-a"]) == ["f:1: denylist term #1"]
+
+
+def test_undecodable_files_are_scanned_not_skipped(scan, tmp_path):
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    (tmp_path / "utf16.txt").write_bytes("route 10.20.30.40\n".encode("utf-16"))  # privacy: example
+    (tmp_path / "latin1.txt").write_bytes(b"\xe9 host-a\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    findings = scan.scan_files(tmp_path, ["host-a"])
+    assert any(f.startswith("utf16.txt:1: private-lan-address") for f in findings)
+    assert "latin1.txt:1: denylist term #1" in findings
+
+
+def test_staged_mode_scans_the_index_not_the_working_tree(tmp_path):
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    f = tmp_path / "notes.txt"
+    f.write_text("route 10.20.30.40\n")  # privacy: example
+    subprocess.run([*git, "add", "notes.txt"], check=True)
+    f.write_text("nothing here\n")  # edited out of the file, but still staged
+    staged = _run("staged", "--root", str(tmp_path))
+    assert staged.returncode == 1 and "notes.txt:1: private-lan-address" in staged.stdout
+    assert _run("files", "--root", str(tmp_path)).returncode == 0  # the tree alone looks clean
+    subprocess.run([*git, "add", "notes.txt"], check=True)
+    assert _run("staged", "--root", str(tmp_path)).returncode == 0
