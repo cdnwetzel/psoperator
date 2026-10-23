@@ -26,7 +26,16 @@ from psoperator.common.ipc import IPCServer
 # --- the IPC surface is loopback-only ---------------------------------------
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "10.0.0.5", "example.com", "::", "192.168.1.10"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "10.0.0.5",  # privacy: example
+        "example.com",
+        "::",
+        "192.168.1.10",  # privacy: example
+    ],
+)
 def test_ipc_refuses_any_non_loopback_bind(host):
     # A planner reaches the gatekeeper only over loopback; the service refuses to
     # expose itself on a routable interface at all.

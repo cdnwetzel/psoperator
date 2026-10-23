@@ -47,6 +47,35 @@ diff, and chasing them burns rate-limited reviews for non-defects (the exact
 Trivial nits that are genuinely worthwhile; track or drop the rest. Major/Minor
 findings **do** block. Human authority owns the merge either way.
 
+## Nothing private, anywhere
+
+This repository is public. No private-LAN address, home-directory path, or real
+hostname belongs in it. That covers files, and also commit messages, PR titles
+and PR bodies, which are published just the same. Example values use the
+RFC-5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`,
+`203.0.113.0/24`). A real deployment configures through `PSOPERATOR_*`
+environment variables or a local `.env`, never through the repository.
+
+`scripts/privacy_scan.py` enforces this.
+
+- **CI** scans every tracked file, every commit message in a PR, the PR title and
+  body, and every commit pushed to `main`.
+- **Locally**, enable the hooks once per clone, so a leak is stopped before it is
+  committed:
+
+  ```
+  git config core.hooksPath scripts/hooks
+  ```
+
+  The hooks also read a private denylist of real hostnames from
+  `~/.config/pxx/public-denylist` (or `$PRIVACY_DENYLIST`). That file must never
+  be added to any repository. Findings name the denylist entry by number, never
+  the term.
+
+A test that needs a generic private address, such as one a bind check must
+refuse, marks its line with `# privacy: example`. A real address is never
+marked.
+
 ## The bar for a change
 
 1. **Fail closed at every trust boundary.** Unknown, missing, malformed, or stale

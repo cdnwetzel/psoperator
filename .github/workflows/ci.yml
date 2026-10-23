@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing private belongs in this public repository: not in a file, and not
+  # in a commit message, PR title or PR body, which are published just the same.
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tracked files
+        run: python scripts/privacy_scan.py files
+      - name: PR title and body
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n\n%s\n' "$TITLE" "$BODY" | python scripts/privacy_scan.py text --name pr
+      - name: Commit messages in this PR
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for c in $(git rev-list "$BASE..$HEAD"); do
+            git log -1 --format=%B "$c" | python scripts/privacy_scan.py text --name "commit ${c:0:7}" || status=1
+          done
+          exit $status
+      - name: Commit messages pushed to main
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          range="$BEFORE..$AFTER"
+          git cat-file -e "$BEFORE^{commit}" 2>/dev/null || range="$AFTER"
+          status=0
+          for c in $(git rev-list "$range"); do
+            git log -1 --format=%B "$c" | python scripts/privacy_scan.py text --name "commit ${c:0:7}" || status=1
+          done
+          exit $status
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.12"
+      - run: ruff check psoperator tests scripts
+      - run: ruff format --check psoperator tests scripts
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
