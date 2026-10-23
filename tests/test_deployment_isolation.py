@@ -92,7 +92,16 @@ def test_unclaimed_platform_windows_fails_closed(tmp_path, monkeypatch):
     key = tmp_path / "observer-key.json"
     provision_attestation_key(key, "observer-v1")  # POSIX provisioning works
 
-    monkeypatch.setattr(attestation.os, "name", "nt")
+    # Fake Windows for the attestation module only. Setting the shared
+    # os.name would make pathlib build Windows paths process-wide; on
+    # Python 3.11 that crashes pytest itself (cannot instantiate WindowsPath).
+    class _WindowsOs:
+        name = "nt"
+
+        def __getattr__(self, attr):
+            return getattr(os, attr)
+
+    monkeypatch.setattr(attestation, "os", _WindowsOs())
     with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
         provision_attestation_key(tmp_path / "other.json", "observer-v2")
     with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
