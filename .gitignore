@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.coverage
+.env
+.psoperator/
+psoperator_audit.jsonl
