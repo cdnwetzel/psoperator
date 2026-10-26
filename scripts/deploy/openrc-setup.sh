@@ -137,6 +137,20 @@ say "service account $SVC_USER, executable $BIN, display $DISPLAY_"
 say "key $KEY, state $STATE, executor backend $BACKEND"
 yes_no "write the services with these settings?" || { say "nothing changed"; exit 0; }
 
+# A running service keeps its old settings until restarted, and a later restart
+# would load the new ones on its own. So when any is running, writing the new
+# settings and restarting all three are agreed together, or nothing is written.
+RUNNING=""
+for s in observer executor gatekeeper; do
+    rc-service "psoperator-$s" status >/dev/null 2>&1 && RUNNING="$RUNNING psoperator-$s"
+done
+RESTART=0
+if [ -n "$RUNNING" ]; then
+    yes_no "running now:$RUNNING. Write the new settings and restart all three together?" \
+        || { say "nothing changed"; exit 0; }
+    RESTART=1
+fi
+
 # --- state directory and IPC secret -------------------------------------------
 run install -d -m 700 -o "$SVC_USER" -g "$(id -gn "$SVC_USER" 2>/dev/null || echo "$SVC_USER")" "$STATE"
 # Created once, before either service starts, so the two never race to make it.
@@ -212,7 +226,7 @@ fi
 
 # --- enable and start ------------------------------------------------------------
 for s in observer executor gatekeeper; do run rc-update add "psoperator-$s" default; done
-if yes_no "(re)start all three services now, so each runs with these settings?"; then
+if [ "$RESTART" = 1 ] || yes_no "start all three services now?"; then
     # restart, not start: a service already running would keep its old settings.
     for s in observer executor gatekeeper; do run rc-service "psoperator-$s" restart; done
     if [ "$DRY" = 0 ]; then
