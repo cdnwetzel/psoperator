@@ -621,3 +621,26 @@ def test_a_judges_display_override_does_not_outlive_its_capture(monkeypatch):
     assert os.environ["DISPLAY"] == ":0", "the override leaked past the capture"
     assert ambient._capture() is not None
     assert seen == [":7", ":0"]
+
+
+def test_vision_reads_the_verdict_from_reasoning_content_when_content_is_not_text(monkeypatch):
+    import io
+    import urllib.request
+
+    reply = (
+        b'{"choices": [{"message": {"content": ["part"], '
+        b'"reasoning_content": "VERDICT: PROBLEM\\nFINDINGS: window is blank"}}]}'
+    )
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _Resp(reply))
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x"))
+    text = j._ask("p", "Zm9v")
+    assert text == "VERDICT: PROBLEM\nFINDINGS: window is blank"
+    assert OllamaVisionJudge._parse(text).acceptable is False

@@ -424,8 +424,11 @@ class OllamaVisionJudge:
             )
             with urllib.request.urlopen(req, timeout=self._policy.timeout_s) as resp:
                 msg = json.loads(resp.read())["choices"][0]["message"]
-            # Reasoning models can put the text in reasoning_content with content None.
-            text = msg.get("content") or msg.get("reasoning_content")
+            # Reasoning models can put the text in reasoning_content, leaving
+            # content None, empty, or not text at all.
+            text = msg.get("content")
+            if not isinstance(text, str) or not text.strip():
+                text = msg.get("reasoning_content")
         except Exception:
             return None
         return text if isinstance(text, str) and text else None
