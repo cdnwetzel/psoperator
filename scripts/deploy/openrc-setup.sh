@@ -134,6 +134,7 @@ if [ -e "$STATE" ]; then
 fi
 ask TTL "snapshot lifetime, seconds" "${d_ttl:-30}"
 check "$TTL" '^[0-9]+(\.[0-9]+)?$' "lifetime"
+awk -v t="$TTL" 'BEGIN { exit !(t > 0 && t <= 60) }' || { say "lifetime must be above 0 and at most 60 seconds: $TTL"; exit 1; }
 say "executor backends: dryrun (logs only, safe), pynput (drives the display), ch9329 (HID cable)"
 ask BACKEND "executor backend" "${d_backend:-dryrun}"
 check "$BACKEND" '^(dryrun|pynput|ch9329)$' "executor backend"
@@ -234,7 +235,13 @@ EXEC_DEP="use xvfb"
 unit psoperator-executor "psoperator executor: authenticated input ($BACKEND)" "executor --backend $BACKEND" "$EXEC_DEP"
 unit psoperator-gatekeeper "psoperator gatekeeper: verifies snapshots and gates actions" "gatekeeper" \
     "need psoperator-observer psoperator-executor"
-for s in observer executor gatekeeper; do run touch "/var/log/psoperator-$s.log"; run chown "$SVC_USER" "/var/log/psoperator-$s.log"; done
+# Owner-only: a denied action's text can reach these logs.
+for s in observer executor gatekeeper; do
+    log="/var/log/psoperator-$s.log"
+    [ -e "$log" ] || run install -m 600 -o "$SVC_USER" /dev/null "$log"
+    run chown "$SVC_USER" "$log"
+    run chmod 600 "$log"
+done
 
 # --- operator shell ---------------------------------------------------------------
 PROFILE="$SVC_HOME/.profile"
@@ -252,12 +259,23 @@ if [ "$RESTART" = 1 ] || yes_no "start all three services now?"; then
     for s in observer executor gatekeeper; do run rc-service "psoperator-$s" restart; done
     if [ "$DRY" = 0 ]; then
         # Success means each service is up AND listening, on loopback only.
+        # The listener must be the managed service itself, not some other
+        # process holding the port: its owner is the service account and its
+        # command line is "psoperator <role>".
+        owns() {  # owns PORT ROLE
+            local pid
+            for pid in $(ss -ltnpH "sport = :$1" | grep -E '(127\.0\.0\.1|\[::1\]):' | grep -oE 'pid=[0-9]+' | cut -d= -f2); do
+                [ "$(stat -c '%U' "/proc/$pid")" = "$SVC_USER" ] \
+                    && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qE "psoperator $2( |$)" && return 0
+            done
+            return 1
+        }
         ok=0
         for _ in $(seq 1 20); do
             ok=1
-            for p in 8764 8765 8766; do
-                ss -ltnH "sport = :$p" | grep -qE '(127\.0\.0\.1|\[::1\]):' || ok=0
-            done
+            owns 8764 observer || ok=0
+            owns 8765 gatekeeper || ok=0
+            owns 8766 executor || ok=0
             [ "$ok" = 1 ] && break
             sleep 0.5
         done
@@ -265,7 +283,7 @@ if [ "$RESTART" = 1 ] || yes_no "start all three services now?"; then
         for s in observer executor gatekeeper; do
             rc-service "psoperator-$s" status >/dev/null 2>&1 || { say "FAILED: psoperator-$s is not running; see /var/log/psoperator-$s.log"; exit 1; }
         done
-        [ "$ok" = 1 ] || { say "FAILED: not all of ports 8764/8765/8766 are listening; see /var/log/psoperator-*.log"; exit 1; }
+        [ "$ok" = 1 ] || { say "FAILED: ports 8764/8765/8766 are not all held by the observer/gatekeeper/executor services; see /var/log/psoperator-*.log"; exit 1; }
         if ss -ltnH 'sport = :8764 or sport = :8765 or sport = :8766' \
             | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):'; then
             say "EXPOSED: a service is listening beyond loopback"; exit 1
