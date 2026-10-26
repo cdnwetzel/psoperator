@@ -66,31 +66,56 @@ d_bin=$( { [ -r "$OBS" ] && sed -n 's/^command="\{0,1\}\([^\"]*\)"\{0,1\}$/\1/p'
 d_display=$(cur DISPLAY); d_key=$(cur PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH)
 d_ttl=$(cur PSOPERATOR_OBSERVER_SNAPSHOT_TTL_S)
 
+# Every value below is written unquoted-safe into shell files that root and the
+# services source, so each is checked against a strict pattern, never escaped.
+check() {  # check VALUE REGEX WHAT
+    [[ "$1" =~ $2 ]] || { say "invalid $3: $1"; exit 1; }
+}
+PATH_RE='^/[A-Za-z0-9._/-]+$'
+
+d_user=${d_user%%:*}  # command_user may be "account:group"
 ask SVC_USER "service account" "${d_user:-${SUDO_USER:-}}"
-[ -n "$SVC_USER" ] || { say "a service account is required"; exit 1; }
-SVC_HOME=$(getent passwd "$SVC_USER" 2>/dev/null | cut -d: -f6 || true)
-[ -n "$SVC_HOME" ] || SVC_HOME=$(eval echo "~$SVC_USER")
+check "$SVC_USER" '^[a-z_][a-z0-9_-]*$' "account name"
+SVC_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6) || true
+[ -n "$SVC_HOME" ] || { say "no such account: $SVC_USER"; exit 1; }
 ask BIN "psoperator executable" "${d_bin:-$(command -v psoperator || true)}"
+check "$BIN" "$PATH_RE" "executable path"
 [ "$DRY" = 1 ] || [ -x "$BIN" ] || { say "not executable: $BIN"; exit 1; }
 ask DISPLAY_ "X display the observer captures and the executor drives" "${d_display:-:99}"
+check "$DISPLAY_" '^:[0-9]+(\.[0-9]+)?$' "display"
 ask KEY "observer attestation key (owner-only file)" "${d_key:-$SVC_HOME/.config/psoperator/observer.key}"
-ask STATE "state directory (created owner-only)" "/var/lib/psoperator"
+check "$KEY" "$PATH_RE" "key path"
+ask STATE "state directory, dedicated to psoperator (created owner-only)" "/var/lib/psoperator"
+check "$STATE" "$PATH_RE" "state directory"
+STATE=${STATE%/}
+# Never take over an existing directory (e.g. /var/lib) that is not already ours.
+case "$STATE" in */*/*) ;; *) say "state directory must be at least two levels deep: $STATE"; exit 1 ;; esac
+if [ -e "$STATE" ]; then
+    owner=$(stat -c '%U' "$STATE" 2>/dev/null || stat -f '%Su' "$STATE")
+    if [ ! -d "$STATE" ] || [ -L "$STATE" ] || [ "$owner" != "$SVC_USER" ]; then
+        say "$STATE exists and is not a directory owned by $SVC_USER; choose a new path"; exit 1
+    fi
+fi
 ask TTL "snapshot lifetime, seconds" "${d_ttl:-30}"
+check "$TTL" '^[0-9]+(\.[0-9]+)?$' "lifetime"
 say "executor backends: dryrun (logs only, safe), pynput (drives the display), ch9329 (HID cable)"
 ask BACKEND "executor backend" "dryrun"
+check "$BACKEND" '^(dryrun|pynput|ch9329)$' "executor backend"
 CH_PORT=""
-[ "$BACKEND" = ch9329 ] && ask CH_PORT "HID cable serial port (absolute)" "/dev/ttyACM0"
-for p in "$KEY" "$STATE"; do
-    case "$p" in /*) ;; *) say "must be absolute: $p"; exit 1 ;; esac
-done
+if [ "$BACKEND" = ch9329 ]; then
+    ask CH_PORT "HID cable serial port (absolute)" "/dev/ttyACM0"
+    check "$CH_PORT" "$PATH_RE" "serial port"
+fi
 
 # One epoch shared by the observer and the gatekeeper; kept across re-runs.
 EPOCH=""
 [ -r /etc/psoperator.env ] && EPOCH=$(sed -n 's/^export PSOPERATOR_OBSERVER_EPOCH="\([0-9a-f]\{64\}\)"$/\1/p' /etc/psoperator.env)
 [ -n "$EPOCH" ] || EPOCH=$(openssl rand -hex 32)
 
-PY=$(head -1 "$BIN" 2>/dev/null | sed -n 's/^#!//p')
-[ -n "$PY" ] || PY=python3
+# The interpreter that runs psoperator, from the executable's shebang, kept as
+# separate words so "#!/usr/bin/env python3" works too.
+read -r -a PY < <(head -1 "$BIN" 2>/dev/null | sed -n 's/^#![[:space:]]*//p') || true
+[ "${#PY[@]}" -gt 0 ] || PY=(python3)
 
 say ""
 say "service account $SVC_USER, executable $BIN, display $DISPLAY_"
@@ -100,7 +125,8 @@ yes_no "write the services with these settings?" || { say "nothing changed"; exi
 # --- state directory and IPC secret -------------------------------------------
 run install -d -m 700 -o "$SVC_USER" -g "$(id -gn "$SVC_USER" 2>/dev/null || echo "$SVC_USER")" "$STATE"
 # Created once, before either service starts, so the two never race to make it.
-run su -s /bin/sh "$SVC_USER" -c "'$PY' -c 'from pathlib import Path; from psoperator.common.auth import load_or_create_secret as s; s(Path(\"$STATE/ipc.secret\"))'"
+MAKE_SECRET='import sys; from pathlib import Path; from psoperator.common.auth import load_or_create_secret as s; s(Path(sys.argv[1]))'
+run su -s /bin/sh "$SVC_USER" -c "$(printf '%q ' "${PY[@]}" -c "$MAKE_SECRET" "$STATE/ipc.secret")"
 if [ "$DRY" = 0 ]; then
     [ -r "$KEY" ] || { say "missing key $KEY: provision it with 'psoperator attestation-keygen' as $SVC_USER"; exit 1; }
 fi
@@ -170,20 +196,32 @@ fi
 
 # --- enable and start ------------------------------------------------------------
 for s in observer executor gatekeeper; do run rc-update add "psoperator-$s" default; done
-if yes_no "restart the observer and start the executor and gatekeeper now?"; then
-    run rc-service psoperator-observer restart
-    run rc-service psoperator-executor start
-    run rc-service psoperator-gatekeeper start
+if yes_no "(re)start all three services now, so each runs with these settings?"; then
+    # restart, not start: a service already running would keep its old settings.
+    for s in observer executor gatekeeper; do run rc-service "psoperator-$s" restart; done
     if [ "$DRY" = 0 ]; then
-        sleep 2
+        # Success means each service is up AND listening, on loopback only.
+        ok=0
+        for _ in $(seq 1 20); do
+            ok=1
+            for p in 8764 8765 8766; do
+                ss -ltnH "sport = :$p" | grep -qE '(127\.0\.0\.1|\[::1\]):' || ok=0
+            done
+            [ "$ok" = 1 ] && break
+            sleep 0.5
+        done
         rc-status | grep psoperator || true
+        for s in observer executor gatekeeper; do
+            rc-service "psoperator-$s" status >/dev/null 2>&1 || { say "FAILED: psoperator-$s is not running; see /var/log/psoperator-$s.log"; exit 1; }
+        done
+        [ "$ok" = 1 ] || { say "FAILED: not all of ports 8764/8765/8766 are listening; see /var/log/psoperator-*.log"; exit 1; }
         if ss -ltnH 'sport = :8764 or sport = :8765 or sport = :8766' \
             | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):'; then
             say "EXPOSED: a service is listening beyond loopback"; exit 1
         fi
-        say "listeners: loopback only"
+        say "all three services running; listeners: loopback only"
         stat -c '%a %U %n' "$KEY" "$STATE/ipc.secret"
-        su -s /bin/sh "$SVC_USER" -c ". /etc/psoperator.env; '$BIN' observer-health" || true
+        su -s /bin/sh "$SVC_USER" -c ". /etc/psoperator.env; $(printf '%q' "$BIN") observer-health" || true
         tail -n 3 /var/log/psoperator-gatekeeper.log
     fi
 else
