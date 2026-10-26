@@ -7,6 +7,7 @@ records the protocol frames it would have written.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -497,3 +498,21 @@ class TestBaudResolution:
         )
         with pytest.raises(RuntimeError, match="explicitly"):
             resolve_connection("auto", 9600)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink alias")
+    def test_a_symlinked_explicit_port_still_derives_the_fixed_baud(self, monkeypatch, tmp_path):
+        """A stable by-id alias names the same device pyserial lists canonically;
+        a raw string compare missed the chip and opened it at 9600."""
+        device = tmp_path / "ttyACM1"
+        device.touch()
+        alias = tmp_path / "usb-wch-if00"
+        alias.symlink_to(device)
+        monkeypatch.setattr(
+            "psoperator.gatekeeper.executor_ch9329._list_ports",
+            lambda: [FakePort(str(device), *CH32V208_ID)],
+        )
+        assert resolve_connection(str(alias), 9600) == (
+            str(alias),
+            115200,
+            KNOWN_CHIPS[CH32V208_ID],
+        )

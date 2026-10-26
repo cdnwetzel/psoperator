@@ -47,6 +47,7 @@ in the box, not the one the config wishes for — hence :func:`resolve_baudrate`
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -383,13 +384,22 @@ def resolve_baudrate(chip: ChipProfile, configured: int | None) -> int:
     return chip.default_baudrate if configured is None else configured
 
 
+def _same_port(a: str, b: str) -> bool:
+    """Whether two port names are one device. Operators often configure a stable
+    alias (``/dev/serial/by-id/...``, a lower-case ``com3``) where pyserial
+    reports the canonical name, and a raw string compare would miss the chip."""
+    if os.name == "nt":
+        return a.upper() == b.upper()
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def _identify(port: str) -> ChipProfile | None:
     """Best-effort chip lookup for an explicitly-given port. Returns ``None``
     when the port is not a recognised device (or cannot be enumerated at all) —
     an explicit port must keep working even if detection is unavailable."""
     try:
         for p in _list_ports():
-            if p.device == port and (p.vid, p.pid) in KNOWN_CHIPS:
+            if _same_port(p.device, port) and (p.vid, p.pid) in KNOWN_CHIPS:
                 return KNOWN_CHIPS[(p.vid, p.pid)]
     except RuntimeError:
         return None
