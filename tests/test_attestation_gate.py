@@ -511,6 +511,32 @@ def test_a_missing_state_file_in_a_shared_directory_is_not_a_first_start(tmp_pat
         )
 
 
+def test_an_existing_state_file_in_a_shared_directory_is_refused(tmp_path):
+    """The file itself is owner-only, but another account that can write its
+    directory could have swapped an older copy back in: a lower watermark."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    state = shared / "gate_state.json"
+    state.write_text('{"last_frame_id": 1, "last_issued_at": 101.0}', encoding="utf-8")
+    state.chmod(0o600)
+    shared.chmod(0o777)
+    with pytest.raises(GateStateError, match="group/other"):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+
+
+def test_a_missing_directory_under_a_shared_parent_is_not_a_first_start(tmp_path):
+    """Whoever can write the parent could have renamed the state directory away."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    with pytest.raises(GateStateError, match="moved the watermark away"):
+        AttestationGate(
+            AttestationKeyring([_key()]),
+            expected_epoch=EPOCH_A,
+            state_path=shared / "psoperator" / "gate_state.json",
+        )
+
+
 def test_the_state_directory_is_created_owner_only(tmp_path):
     """Created 0700 rather than under the process umask, which may be 002."""
     old = os.umask(0o002)

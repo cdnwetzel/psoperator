@@ -349,12 +349,13 @@ class AttestationGate:
                 f"gate state ownership cannot be verified on Windows: {path}. Refusing "
                 "to trust an unverified ACL for a file that gates replay rejection."
             )
+        # Checked whether or not the file exists. Another account that can write
+        # the directory can delete the file (a missing file reads as a first
+        # start) or swap an older copy of it back in (a lower watermark).
+        self._check_state_dir(path.parent)
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
-            # Absence is only a first start if no other account could have
-            # deleted the file: deleting it would otherwise reset the watermark.
-            self._check_state_dir(path.parent)
             return None  # genuine first start
         except OSError as exc:
             raise GateStateError(f"gate state at {path} cannot be opened: {exc}") from exc
@@ -394,12 +395,20 @@ class AttestationGate:
 
         Whoever can write the directory can unlink the state file, and a missing
         file reads as a first start with no watermark — the replay window this
-        file exists to close. A directory that does not exist yet is fine: the
-        writer creates it owner-only.
+        file exists to close. They could equally put back an older copy, whose
+        lower watermark re-admits captured frames.
+
+        A directory that does not exist yet is a first start only if no other
+        account could have renamed it away, so its nearest existing ancestor is
+        held to the same standard (owned by this account or root). The writer
+        then creates the directory owner-only. Like the key and IPC-secret
+        loaders, this checks paths rather than anchoring every later open to a
+        verified directory descriptor.
         """
         try:
             info = os.lstat(directory)
         except FileNotFoundError:
+            AttestationGate._check_state_ancestor(directory)
             return
         except OSError as exc:
             raise GateStateError(
@@ -417,6 +426,30 @@ class AttestationGate:
             raise GateStateError(
                 f"gate state directory {directory} is owned by uid {info.st_uid}, not this "
                 f"account (uid {os.geteuid()})."
+            )
+
+    @staticmethod
+    def _check_state_ancestor(directory: Path) -> None:
+        """The nearest existing ancestor of a missing state directory must be one
+        no other account can write, or the directory may have been moved away."""
+        ancestor = Path(os.path.abspath(directory)).parent
+        while True:
+            try:
+                info = os.stat(ancestor)
+                break
+            except FileNotFoundError:
+                if ancestor.parent == ancestor:
+                    raise GateStateError(f"no existing ancestor of {directory}") from None
+                ancestor = ancestor.parent
+            except OSError as exc:
+                raise GateStateError(f"cannot check {ancestor} for {directory}: {exc}") from exc
+        owners = {0, os.geteuid()} if hasattr(os, "geteuid") else {info.st_uid}
+        if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in owners:
+            raise GateStateError(
+                f"gate state directory {directory} is missing and its parent {ancestor} "
+                f"(mode {stat.S_IMODE(info.st_mode):04o}, uid {info.st_uid}) is writable by "
+                "another account, which could have moved the watermark away. Refusing to "
+                "take this for a first start."
             )
 
     def _advance_watermark(self, frame_id: int, issued_at: float) -> None:
