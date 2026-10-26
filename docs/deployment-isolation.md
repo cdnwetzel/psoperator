@@ -149,7 +149,10 @@ attestation suite.
 4. **Run the services under their accounts.** The observer, gatekeeper, and
    executor services run as `governance` (one service-manager unit each — systemd
    on most Linux; OpenRC on the Gentoo host, where the observer already runs
-   supervised); the agent loop runs as `planner`.
+   supervised); the agent loop runs as `planner`. On OpenRC,
+   `scripts/deploy/openrc-setup.sh` writes the three units and one shared
+   settings file with absolute paths (run it with `--dry-run` first). It sets up
+   a single service account, so the planner split above stays a separate step.
 5. **Verify the boundary** (Linux; on macOS use `stat -f '%Lp %Su'` and `lsof -nP -iTCP -sTCP:LISTEN`):
    ```sh
    stat -c '%a %U' "$PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH"  # expect: 600 governance
