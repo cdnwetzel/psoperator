@@ -538,17 +538,20 @@ def test_a_missing_directory_under_a_shared_parent_is_not_a_first_start(tmp_path
 
 
 def test_the_state_directory_is_created_owner_only(tmp_path):
-    """Created 0700 rather than under the process umask, which may be 002."""
+    """Every missing component is created 0700 rather than under the process
+    umask, which may be 002: a group-writable intermediate directory would let
+    another account move the state directory below it away and back."""
     old = os.umask(0o002)
     try:
-        state = tmp_path / "fresh" / "gate_state.json"
+        state = tmp_path / "a" / "b" / "gate_state.json"
         gate = AttestationGate(
             AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state
         )
         gate.admit(_captured_envelopes(1)[0], now=105.0)
     finally:
         os.umask(old)
-    assert state.parent.stat().st_mode & 0o777 == 0o700
+    for created in (tmp_path / "a", tmp_path / "a" / "b"):
+        assert created.stat().st_mode & 0o777 == 0o700, created
 
 
 # --- D2: evict nonces by expiry, not by how many admissions happened --------

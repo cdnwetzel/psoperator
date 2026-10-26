@@ -487,7 +487,7 @@ class AttestationGate:
         )
         tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
         try:
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._mkdir_owner_only(path.parent)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(tmp, flags, 0o600)
@@ -504,6 +504,22 @@ class AttestationGate:
             except OSError:
                 pass
             raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
+
+    @staticmethod
+    def _mkdir_owner_only(directory: Path) -> None:
+        """Create every missing component ``0700``. ``mkdir(parents=True)``
+        applies the mode to the leaf only, leaving intermediate directories to
+        the umask, and a group-writable one lets another account move the state
+        directory below it away and back."""
+        missing: list[Path] = []
+        current = directory
+        while not current.exists():
+            missing.append(current)
+            if current.parent == current:
+                break
+            current = current.parent
+        for part in reversed(missing):
+            part.mkdir(mode=0o700, exist_ok=True)
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:

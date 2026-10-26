@@ -78,8 +78,10 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   envelope issued earlier stays a rollback whatever its frame id. If the
   observer's clock steps backwards, admission pauses until the clock passes the
   last admitted issue time again. A missing state file counts as a first start
-  only when its directory is owned by the gate's account and not writable by
-  group or other; the gate creates that directory `0700`.
+  only when its directory exists, is owned by the gate's account, and is not
+  writable by group or other. If the directory is missing, the nearest existing
+  ancestor must be owned by the gate's account or by root and not writable by
+  group or other. The gate creates each missing directory with mode `0700`.
 
   The file is load-bearing for replay rejection, so it is held to the same
   ownership standard as the attestation key and the IPC secret: owner-only

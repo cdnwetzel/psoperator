@@ -186,6 +186,22 @@ def test_a_stop_rewritten_mid_claim_stays_engaged_even_if_restoring_fails(tmp_pa
     assert killswitch.is_engaged(stop)
 
 
+def test_a_stop_rewritten_mid_claim_is_restored_intact(tmp_path, monkeypatch):
+    stop = tmp_path / "STOP"
+    marker = "PSOperator kill-switch drill mine.\n"
+    assert killswitch.engage_exclusive(stop, marker)
+    real_rename = os.rename
+
+    def _operator_rewrites_first(src, dst):
+        killswitch.engage(stop)
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", _operator_rewrites_first)
+    killswitch.disengage_if_owned(stop, marker)
+    assert stop.read_text(encoding="utf-8") == "PSOperator stopped by operator.\n"
+    assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
+
+
 def test_a_failed_marker_write_leaves_no_orphan_stop(tmp_path, monkeypatch):
     stop = tmp_path / "STOP"
 
