@@ -202,6 +202,62 @@ def test_a_stop_rewritten_mid_claim_is_restored_intact(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
 
 
+def test_the_switch_stays_engaged_while_a_stop_is_claimed(tmp_path, monkeypatch):
+    # An operator rewrite landing between the ownership read and the claim means
+    # the claimed file is the operator's stop. Until it is put back the switch
+    # must still read as engaged, or a request in that interval passes.
+    stop = tmp_path / "STOP"
+    marker = "PSOperator kill-switch drill mine.\n"
+    assert killswitch.engage_exclusive(stop, marker)
+    real_rename = os.rename
+    engaged_after_claim = []
+
+    def _operator_rewrites_first(src, dst):
+        killswitch.engage(stop)
+        real_rename(src, dst)
+        engaged_after_claim.append(killswitch.is_engaged(stop))
+
+    monkeypatch.setattr(os, "rename", _operator_rewrites_first)
+    killswitch.disengage_if_owned(stop, marker)
+    assert engaged_after_claim == [True]
+    assert killswitch.is_engaged(stop)
+
+
+def test_an_undecodable_stop_rewritten_mid_claim_is_put_back(tmp_path, monkeypatch):
+    # An operator may write anything; bytes that are not UTF-8 are not provably
+    # the drill's, so the stop goes back rather than the decode error escaping.
+    stop = tmp_path / "STOP"
+    marker = "PSOperator kill-switch drill mine.\n"
+    assert killswitch.engage_exclusive(stop, marker)
+    real_rename = os.rename
+
+    def _operator_writes_bytes_first(src, dst):
+        stop.write_bytes(b"\xff\xfe")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", _operator_writes_bytes_first)
+    killswitch.disengage_if_owned(stop, marker)
+    assert killswitch.is_engaged(stop)
+    assert stop.read_bytes() == b"\xff\xfe"
+    assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
+
+
+def test_an_undecodable_stop_is_not_ours_to_lift(tmp_path):
+    stop = tmp_path / "STOP"
+    stop.write_bytes(b"\xff\xfe")
+    killswitch.disengage_if_owned(stop, "marker\n")
+    assert killswitch.is_engaged(stop)
+
+
+def test_an_interrupted_claim_keeps_the_switch_engaged_until_the_operator_clears_it(tmp_path):
+    # A process that dies mid-claim leaves only the claim file: still a stop.
+    stop = tmp_path / "STOP"
+    (tmp_path / "STOP.0123456789abcdef.claim").write_text("anything\n", encoding="utf-8")
+    assert killswitch.is_engaged(stop)
+    killswitch.disengage(stop)
+    assert not killswitch.is_engaged(stop)
+
+
 def test_a_failed_marker_write_leaves_no_orphan_stop(tmp_path, monkeypatch):
     stop = tmp_path / "STOP"
 

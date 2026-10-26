@@ -2,17 +2,28 @@
 
 The sentinel is checked by the gatekeeper before every action. It never
 auto-clears; resuming execution requires an explicit operator action.
+
+A stop that is being lifted conditionally (see :func:`disengage_if_owned`) is
+first renamed to a ``<name>.<random>.claim`` sibling. A claim still counts as an
+engaged stop, so the switch never reads as off while ownership is re-checked,
+and a process that dies mid-claim leaves the switch engaged, not lifted.
 """
 
 from __future__ import annotations
 
+import glob
 import os
 import secrets
 from pathlib import Path
 
 
+def _claims(target: Path) -> list[Path]:
+    return [Path(p) for p in glob.glob(f"{glob.escape(str(target))}.*.claim")]
+
+
 def is_engaged(path: Path) -> bool:
-    return Path(path).is_file()
+    target = Path(path)
+    return target.is_file() or any(claim.is_file() for claim in _claims(target))
 
 
 def engage(path: Path) -> None:
@@ -22,7 +33,12 @@ def engage(path: Path) -> None:
 
 
 def disengage(path: Path) -> None:
-    Path(path).unlink(missing_ok=True)
+    """The operator's explicit release: lifts the stop and any claim left by an
+    interrupted conditional release."""
+    target = Path(path)
+    target.unlink(missing_ok=True)
+    for claim in _claims(target):
+        claim.unlink(missing_ok=True)
 
 
 def engage_exclusive(path: Path, marker: str) -> bool:
@@ -46,40 +62,37 @@ def engage_exclusive(path: Path, marker: str) -> bool:
     return True
 
 
+def _holds(path: Path, marker: str) -> bool:
+    """Whether ``path`` provably holds ``marker``. Unreadable or undecodable
+    content (an operator may write anything) is not provably ours."""
+    try:
+        return path.read_text(encoding="utf-8") == marker
+    except (OSError, ValueError):
+        return False
+
+
 def disengage_if_owned(path: Path, marker: str) -> None:
     """Lift a stop only if it is still the one ``engage_exclusive`` created with
     ``marker``.
 
     An operator who engages while the owner holds the stop rewrites the sentinel,
     so its content no longer matches and it stays. Ownership is read in place
-    first: a stop that is not ours is never moved, so the switch never reads as
-    disengaged on its account. Only an apparently owned stop is claimed by an
-    atomic rename and re-read, which catches an operator rewrite landing between
-    the first read and the rename. Such a stop is put back; if that fails, a
-    fresh stop is engaged before the error propagates, so the switch fails closed.
+    first: a stop that is not ours is never moved. Only an apparently owned stop
+    is claimed by an atomic rename and re-read, which catches an operator rewrite
+    landing between the first read and the rename. The claim itself counts as
+    engaged (see :func:`is_engaged`), so the switch stays on throughout, and a
+    rewritten stop is put back. If putting it back fails, the claim is left in
+    place, still engaged, and the error propagates.
     """
     target = Path(path)
-    try:
-        if target.read_text(encoding="utf-8") != marker:
-            return
-    except FileNotFoundError:
+    if not _holds(target, marker):
         return
-    except OSError:
-        return  # unreadable: not provably ours, so it stays
     claim = target.with_name(f"{target.name}.{secrets.token_hex(8)}.claim")
     try:
         os.rename(target, claim)
     except FileNotFoundError:
         return
-    try:
-        ours = claim.read_text(encoding="utf-8") == marker
-    except OSError:
-        ours = False
-    if ours:
+    if _holds(claim, marker):
         claim.unlink()
         return
-    try:
-        os.replace(claim, target)
-    except OSError:
-        engage(target)
-        raise
+    os.replace(claim, target)
