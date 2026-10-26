@@ -35,8 +35,14 @@ def engage_exclusive(path: Path, marker: str) -> bool:
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(marker)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(marker)
+    except BaseException:
+        # An empty sentinel nobody owns would outlive the caller, which never
+        # learned it engaged anything. Remove it and report the failure.
+        target.unlink(missing_ok=True)
+        raise
     return True
 
 
@@ -45,12 +51,21 @@ def disengage_if_owned(path: Path, marker: str) -> None:
     ``marker``.
 
     An operator who engages while the owner holds the stop rewrites the sentinel,
-    so its content no longer matches and it stays. The sentinel is claimed by an
-    atomic rename before it is read, so an engagement that lands between the read
-    and the delete cannot be the file deleted: it either rewrote the claimed file
-    (no longer ours, so it is put back) or created a new sentinel (never touched).
+    so its content no longer matches and it stays. Ownership is read in place
+    first: a stop that is not ours is never moved, so the switch never reads as
+    disengaged on its account. Only an apparently owned stop is claimed by an
+    atomic rename and re-read, which catches an operator rewrite landing between
+    the first read and the rename. Such a stop is put back; if that fails, a
+    fresh stop is engaged before the error propagates, so the switch fails closed.
     """
     target = Path(path)
+    try:
+        if target.read_text(encoding="utf-8") != marker:
+            return
+    except FileNotFoundError:
+        return
+    except OSError:
+        return  # unreadable: not provably ours, so it stays
     claim = target.with_name(f"{target.name}.{secrets.token_hex(8)}.claim")
     try:
         os.rename(target, claim)
@@ -63,6 +78,8 @@ def disengage_if_owned(path: Path, marker: str) -> None:
     if ours:
         claim.unlink()
         return
-    # Not ours: put the stop back. Replacing a newer sentinel with this one keeps
-    # the switch engaged either way.
-    os.replace(claim, target)
+    try:
+        os.replace(claim, target)
+    except OSError:
+        engage(target)
+        raise

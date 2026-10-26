@@ -9,8 +9,11 @@ proves the drill fails loud if the stop ever stopped enforcing.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 from psoperator.config import load_config
@@ -141,12 +144,58 @@ def test_drill_keeps_a_stop_an_operator_engages_while_the_canary_runs(tmp_path):
     assert killswitch.is_engaged(config.kill_switch_path), "the drill lifted an operator's stop"
 
 
-def test_lifting_an_unowned_stop_puts_it_back(tmp_path):
+def test_an_unowned_stop_is_never_lifted_even_briefly(tmp_path, monkeypatch):
+    # The gatekeeper checks the switch on every request, so a stop that is
+    # moved aside while its owner is checked is a stop that is off for a moment.
     stop = tmp_path / "STOP"
     killswitch.engage(stop)
+    engaged_at_reads = []
+    real_read = Path.read_text
+
+    def _recording_read(self, *a, **k):
+        engaged_at_reads.append(killswitch.is_engaged(stop))
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", _recording_read)
     killswitch.disengage_if_owned(stop, "PSOperator kill-switch drill someone-else.\n")
+    assert engaged_at_reads and all(engaged_at_reads)
     assert killswitch.is_engaged(stop)
     assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
+
+
+def test_a_stop_rewritten_mid_claim_stays_engaged_even_if_restoring_fails(tmp_path, monkeypatch):
+    # The operator rewrites the drill's stop between the ownership read and the
+    # claim. The claim then holds the operator's stop; if putting it back fails,
+    # the switch must still end up engaged and the error must surface.
+    stop = tmp_path / "STOP"
+    marker = "PSOperator kill-switch drill mine.\n"
+    assert killswitch.engage_exclusive(stop, marker)
+    real_rename = os.rename
+
+    def _operator_rewrites_first(src, dst):
+        killswitch.engage(stop)
+        real_rename(src, dst)
+
+    def _restore_fails(src, dst):
+        raise OSError("restore failed")
+
+    monkeypatch.setattr(os, "rename", _operator_rewrites_first)
+    monkeypatch.setattr(os, "replace", _restore_fails)
+    with pytest.raises(OSError, match="restore failed"):
+        killswitch.disengage_if_owned(stop, marker)
+    assert killswitch.is_engaged(stop)
+
+
+def test_a_failed_marker_write_leaves_no_orphan_stop(tmp_path, monkeypatch):
+    stop = tmp_path / "STOP"
+
+    def _disk_full(*a, **k):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(os, "fdopen", _disk_full)
+    with pytest.raises(OSError):
+        killswitch.engage_exclusive(stop, "marker\n")
+    assert not killswitch.is_engaged(stop), "an empty stop nobody owns was left behind"
 
 
 def test_engage_exclusive_does_not_take_over_an_existing_stop(tmp_path):
