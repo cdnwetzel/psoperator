@@ -90,6 +90,8 @@ Risk policy defaults are deliberately conservative:
 
 The global kill switch is checked before freshness, policy, or execution. Run
 `psoperator kill` to engage it and `psoperator resume` to clear it explicitly.
+Both require `PSOPERATOR_KILL_SWITCH_PATH` set to the absolute path the
+gatekeeper service watches, and print that path.
 
 ### Two deployment modes
 
@@ -261,7 +263,7 @@ then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 | `PSOPERATOR_CH9329_PORT` | `auto` | HID-control serial port; `auto` identifies and names it by USB id, but an explicit path is required to open it |
 | `PSOPERATOR_CH9329_BAUDRATE` | unset | Baud override; unset derives it from the detected chip |
 | `PSOPERATOR_AUDIT_LOG_PATH` | `psoperator_audit.jsonl` | Hash-chained decision log |
-| `PSOPERATOR_KILL_SWITCH_PATH` | `.psoperator/STOP` | Persistent global-stop sentinel |
+| `PSOPERATOR_KILL_SWITCH_PATH` | `.psoperator/STOP` | Persistent global-stop sentinel; must be set to one absolute path for the gatekeeper service and `kill`/`resume`/`kill-drill`, which refuse a relative one |
 | `PSOPERATOR_HARD_BLOCK_T3` | `true` | Prevent destructive T3 execution |
 | `PSOPERATOR_OBSERVER_PORT` | `8764` | Planner-facing observer service |
 | `PSOPERATOR_OBSERVER_TIMEOUT_S` | `5.0` | Observer request timeout |

@@ -65,6 +65,28 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _kill_switch_path(config: PSOperatorConfig) -> Path | None:
+    """The configured stop path, only if it is absolute.
+
+    The gatekeeper service and an operator's shell run in different working
+    directories, so a relative path names a different file in each: ``kill``
+    would engage a stop the service never reads, and ``kill-drill`` would pass
+    against that same wrong file. ``~`` is not expanded either, because the
+    service and the operator usually run as different accounts.
+    """
+    path = config.kill_switch_path
+    if path.is_absolute():
+        return path
+    print(
+        f"kill switch path {str(path)!r} is relative, so this process and the "
+        "gatekeeper service may read different files. Set PSOPERATOR_KILL_SWITCH_PATH "
+        "to one absolute path, the same in the gatekeeper unit and the operator's "
+        "environment.",
+        file=sys.stderr,
+    )
+    return None
+
+
 def _run_executor(config: PSOperatorConfig, backend: str | None) -> int:
     secret = load_or_create_secret(config.ipc_secret_path)
     selected = backend or config.executor_backend
@@ -79,6 +101,9 @@ def _run_executor(config: PSOperatorConfig, backend: str | None) -> int:
 
 
 def _run_gatekeeper(config: PSOperatorConfig) -> int:
+    kill_switch_path = _kill_switch_path(config)
+    if kill_switch_path is None:
+        return 1
     secret = load_or_create_secret(config.ipc_secret_path)
     freshness = FreshnessTracker()
     executor = RemoteExecutor(config.executor_host, config.executor_port, secret)
@@ -111,6 +136,7 @@ def _run_gatekeeper(config: PSOperatorConfig) -> int:
         return 1
 
     print(f"gatekeeper listening on {config.gatekeeper_host}:{config.gatekeeper_port}")
+    print(f"gatekeeper watching kill switch at {kill_switch_path}")
     serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness, gate)
     return 0
 
@@ -183,13 +209,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_config()
 
+    if args.command in ("kill", "resume", "kill-drill"):
+        kill_switch_path = _kill_switch_path(config)
+        if kill_switch_path is None:
+            return 2
     if args.command == "kill":
-        killswitch.engage(config.kill_switch_path)
-        print(f"kill switch engaged: {config.kill_switch_path}")
+        killswitch.engage(kill_switch_path)
+        print(f"kill switch engaged: {kill_switch_path}")
         return 0
     if args.command == "resume":
-        killswitch.disengage(config.kill_switch_path)
-        print(f"kill switch disengaged: {config.kill_switch_path}")
+        killswitch.disengage(kill_switch_path)
+        print(f"kill switch disengaged: {kill_switch_path}")
         return 0
     if args.command == "kill-drill":
         from PIL import Image
@@ -204,15 +234,13 @@ def main(argv: list[str] | None = None) -> int:
         canary = Action(ActionKind.WAIT, 1, seconds=0.0)
         frame = Frame.from_image(1, Image.new("RGB", (8, 8), "black"))
         try:
-            result = kill_switch_drill(
-                gatekeeper, config.kill_switch_path, action=canary, frame=frame
-            )
+            result = kill_switch_drill(gatekeeper, kill_switch_path, action=canary, frame=frame)
         except DrillFailed as exc:
             print(f"KILL-SWITCH DRILL FAILED: {exc}", file=sys.stderr)
             return 1
         print(
-            f"kill-switch drill passed: canary pre-empted -> {result.decision_kind}; "
-            f"receipt appended to {config.audit_log_path}"
+            f"kill-switch drill passed: canary pre-empted -> {result.decision_kind} "
+            f"at {kill_switch_path}; receipt appended to {config.audit_log_path}"
         )
         return 0
     if args.command == "audit-verify":
