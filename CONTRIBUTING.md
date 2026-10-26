@@ -2,15 +2,14 @@
 
 PSOperator is a security-oriented, fully-local desktop-automation agent. Its core
 invariant is simple and load-bearing: **planning proposes, policy decides, only
-the executor actuates.** Changes are held to that boundary, and to a two-tier AI
-review model backed by human merge authority.
+the executor actuates.** Changes are held to that boundary, and to an AI review
+backed by human merge authority.
 
 ## Review model
 
-Two independent AI reviewers, one blocking and one advisory, plus the human who
-merges. Their value is *disagreement* — a finding one raises and the other misses
-is worth more than either's aggregate score. Verify every finding from either
-reviewer against the code before acting; both can be wrong.
+One AI reviewer (CodeRabbit, blocking) plus the human who merges. No second AI
+reviewer is configured, so do not read a green PR as two independent reviews.
+Verify every finding against the code before acting; the reviewer can be wrong.
 
 ### CodeRabbit — primary, blocking
 
@@ -38,7 +37,7 @@ increment (this repo has seen exactly that).
 
 ### The merge bar
 
-A PR is mergeable when **no Major or Minor findings remain** from either reviewer
+A PR is mergeable when **no Major or Minor findings remain** from CodeRabbit
 (and internal review + tests are clean). Do **not** block a merge chasing an
 assertive reviewer to literally zero comments — on a substantial module it will
 almost always surface a couple of Trivial style/coverage/refactor nits on any

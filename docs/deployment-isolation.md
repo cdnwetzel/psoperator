@@ -71,6 +71,16 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   gate that cannot write its watermark **refuses to admit** — treating a corrupt
   file as "no state" would turn it back into the silent downgrade this removes.
 
+  The watermark orders envelopes by `(issued_at, frame_id)`. Frame ids restart at
+  1 with every observer lifetime, so ordering on the frame id alone locked a
+  restarted observer out until it had re-counted past its previous lifetime. The
+  observer's clock does not restart, so a new lifetime advances at once, while an
+  envelope issued earlier stays a rollback whatever its frame id. If the
+  observer's clock steps backwards, admission pauses until the clock passes the
+  last admitted issue time again. A missing state file counts as a first start
+  only when its directory is owned by the gate's account and not writable by
+  group or other; the gate creates that directory `0700`.
+
   The file is load-bearing for replay rejection, so it is held to the same
   ownership standard as the attestation key and the IPC secret: owner-only
   (`0600`), a regular file, owned by the running account, and opened without
@@ -119,6 +129,12 @@ attestation suite.
      secret and every execution would be rejected. Point both at one absolute path
      under the governance account (e.g. `~/.local/state/psoperator/ipc.secret`); the
      loader creates it `0600` and refuses to load it if it is not owner-only.
+   - `PSOPERATOR_GATE_STATE_PATH` — an **absolute** path in the gatekeeper unit,
+     under an owner-only governance directory (e.g.
+     `~/.local/state/psoperator/gate_state.json`). The default
+     (`.psoperator/gate_state.json`) is relative to the working directory, so a
+     unit started from a different directory finds no file, takes it for a first
+     start, and silently resets the frame watermark.
 4. **Run the services under their accounts.** The observer, gatekeeper, and
    executor services run as `governance` (one service-manager unit each — systemd
    on most Linux; OpenRC on the Gentoo host, where the observer already runs
