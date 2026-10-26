@@ -60,7 +60,20 @@ fi
 
 # --- defaults from an existing observer unit, if any -------------------------
 OBS=/etc/init.d/psoperator-observer
-cur() { [ -r "$OBS" ] && sed -n "s/^export $1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$OBS" | head -1; }
+ENV=/etc/psoperator.env
+# A re-run reads the shared settings file this script wrote; a first run reads
+# the exports in a hand-written observer unit.
+cur() {
+    local f
+    for f in "$ENV" "$OBS"; do
+        [ -r "$f" ] && sed -n "s/^export $1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$f" | head -1 | grep . && return
+    done
+    return 0
+}
+d_ipc=$(cur PSOPERATOR_IPC_SECRET_PATH)
+d_state=${d_ipc%/ipc.secret}
+[ "$d_state" != "$d_ipc" ] || d_state=""
+d_backend=$(cur PSOPERATOR_EXECUTOR_BACKEND); d_ch=$(cur PSOPERATOR_CH9329_PORT)
 d_user=$( { [ -r "$OBS" ] && sed -n 's/^command_user="\{0,1\}\([^\"]*\)"\{0,1\}$/\1/p' "$OBS"; } | head -1)
 d_bin=$( { [ -r "$OBS" ] && sed -n 's/^command="\{0,1\}\([^\"]*\)"\{0,1\}$/\1/p' "$OBS"; } | head -1)
 d_display=$(cur DISPLAY); d_key=$(cur PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH)
@@ -85,9 +98,17 @@ ask DISPLAY_ "X display the observer captures and the executor drives" "${d_disp
 check "$DISPLAY_" '^:[0-9]+(\.[0-9]+)?$' "display"
 ask KEY "observer attestation key (owner-only file)" "${d_key:-$SVC_HOME/.config/psoperator/observer.key}"
 check "$KEY" "$PATH_RE" "key path"
-ask STATE "state directory, dedicated to psoperator (created owner-only)" "/var/lib/psoperator"
+ask STATE "state directory, dedicated to psoperator (created owner-only)" "${d_state:-/var/lib/psoperator}"
 check "$STATE" "$PATH_RE" "state directory"
 STATE=${STATE%/}
+# The state directory holds the gate's frame watermark and the operator's STOP;
+# pointing the services at a new one would silently drop both.
+if [ -n "$d_state" ] && [ "$STATE" != "$d_state" ]; then
+    say "the services already use $d_state, which holds the gate watermark and any STOP."
+    say "Moving it is not done here: stop the services, move gate_state.json and STOP"
+    say "yourself, then edit $ENV. Re-run with $d_state to keep it."
+    exit 1
+fi
 # Never take over an existing directory (e.g. /var/lib) that is not already ours.
 case "$STATE" in */*/*) ;; *) say "state directory must be at least two levels deep: $STATE"; exit 1 ;; esac
 # Every parent must already exist, be a real directory, be owned by root and
@@ -114,11 +135,11 @@ fi
 ask TTL "snapshot lifetime, seconds" "${d_ttl:-30}"
 check "$TTL" '^[0-9]+(\.[0-9]+)?$' "lifetime"
 say "executor backends: dryrun (logs only, safe), pynput (drives the display), ch9329 (HID cable)"
-ask BACKEND "executor backend" "dryrun"
+ask BACKEND "executor backend" "${d_backend:-dryrun}"
 check "$BACKEND" '^(dryrun|pynput|ch9329)$' "executor backend"
 CH_PORT=""
 if [ "$BACKEND" = ch9329 ]; then
-    ask CH_PORT "HID cable serial port (absolute)" "/dev/ttyACM0"
+    ask CH_PORT "HID cable serial port (absolute)" "${d_ch:-/dev/ttyACM0}"
     check "$CH_PORT" "$PATH_RE" "serial port"
 fi
 
