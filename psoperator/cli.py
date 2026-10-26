@@ -136,7 +136,9 @@ def _run_gatekeeper(config: PSOperatorConfig) -> int:
         return 1
 
     print(f"gatekeeper listening on {config.gatekeeper_host}:{config.gatekeeper_port}")
-    print(f"gatekeeper watching kill switch at {kill_switch_path}")
+    # Flushed: under a service manager stdout is a pipe, and the server below
+    # never returns, so a buffered line might never reach the operator.
+    print(f"gatekeeper watching kill switch at {kill_switch_path}", flush=True)
     serve_gatekeeper(config.gatekeeper_host, config.gatekeeper_port, gatekeeper, freshness, gate)
     return 0
 
