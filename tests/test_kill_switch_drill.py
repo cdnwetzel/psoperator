@@ -260,16 +260,124 @@ def test_an_interrupted_claim_keeps_the_switch_engaged_until_the_operator_clears
     assert not killswitch.is_engaged(stop)
 
 
+def test_an_operator_stop_landing_right_after_the_drills_create_is_not_taken_over(
+    tmp_path, monkeypatch
+):
+    # The operator engages in the instant after the drill's file appears. The
+    # drill must not end up "owning" that stop, or its cleanup would lift it.
+    stop = tmp_path / "STOP"
+    marker = "PSOperator kill-switch drill mine.\n"
+    real_open = os.open
+    fired = []
+
+    def _operator_engages_after_create(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if not fired and flags & os.O_CREAT:
+            fired.append(path)
+            killswitch.engage(stop)
+        return fd
+
+    monkeypatch.setattr(os, "open", _operator_engages_after_create)
+    owned = killswitch.engage_exclusive(stop, marker)
+    monkeypatch.setattr(os, "open", real_open)
+    if owned:
+        killswitch.disengage_if_owned(stop, marker)
+    assert fired, "the injected operator engagement never ran"
+    assert killswitch.is_engaged(stop), "the drill lifted a stop the operator engaged"
+    assert stop.read_text(encoding="utf-8") == "PSOperator stopped by operator.\n"
+
+
+def test_a_failed_exclusive_engage_never_removes_an_operator_stop(tmp_path, monkeypatch):
+    # The operator engages right after the drill's create, then the drill's own
+    # write fails. Its cleanup may remove only what it created, never the stop.
+    stop = tmp_path / "STOP"
+    real_open = os.open
+    fired = []
+
+    def _operator_engages_after_create(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if not fired and flags & os.O_CREAT:
+            fired.append(path)
+            killswitch.engage(stop)
+        return fd
+
+    def _write_fails(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(os, "open", _operator_engages_after_create)
+    monkeypatch.setattr(os, "fdopen", _write_fails)
+    monkeypatch.setattr(os, "write", _write_fails)
+    with pytest.raises(OSError):
+        killswitch.engage_exclusive(stop, "marker\n")
+    monkeypatch.undo()
+    assert fired, "the injected operator engagement never ran"
+    assert stop.read_text(encoding="utf-8") == "PSOperator stopped by operator.\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["STOP"], "a temp file leaked"
+
+
+@pytest.mark.parametrize("direction", ["claim-to-stop", "stop-to-claim"])
+def test_one_rename_anywhere_inside_is_engaged_never_reads_as_disengaged(
+    tmp_path, monkeypatch, direction
+):
+    """is_engaged reads the filesystem in several steps. A drill moves the stop
+    between its path and a claim by one atomic rename; whichever step that rename
+    lands before, the switch must still read as engaged."""
+    import glob
+
+    stop = tmp_path / "STOP"
+    claim = tmp_path / "STOP.0123456789abcdef.claim"
+    real_is_file = Path.is_file
+    real_glob = glob.glob
+
+    def run_with_rename_before_step(step: int) -> tuple[bool, int]:
+        for leftover in (stop, claim):
+            leftover.unlink(missing_ok=True)
+        src, dst = (claim, stop) if direction == "claim-to-stop" else (stop, claim)
+        src.write_text("PSOperator stopped by operator.\n", encoding="utf-8")
+        calls = [0]
+
+        def _maybe_rename():
+            if calls[0] == step:
+                os.rename(src, dst)
+            calls[0] += 1
+
+        def _is_file(self):
+            _maybe_rename()
+            return real_is_file(self)
+
+        def _glob(pattern, *a, **k):
+            _maybe_rename()
+            return real_glob(pattern, *a, **k)
+
+        monkeypatch.setattr(Path, "is_file", _is_file)
+        monkeypatch.setattr(glob, "glob", _glob)
+        try:
+            engaged = killswitch.is_engaged(stop)
+        finally:
+            monkeypatch.setattr(Path, "is_file", real_is_file)
+            monkeypatch.setattr(glob, "glob", real_glob)
+        return engaged, calls[0]
+
+    step = 0
+    while True:
+        engaged, steps_taken = run_with_rename_before_step(step)
+        assert engaged, f"read as disengaged with the rename before step {step}"
+        if step >= steps_taken:
+            break  # the rename landed after the last step: every position covered
+        step += 1
+
+
 def test_a_failed_marker_write_leaves_no_orphan_stop(tmp_path, monkeypatch):
     stop = tmp_path / "STOP"
 
     def _disk_full(*a, **k):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(os, "fdopen", _disk_full)
+    monkeypatch.setattr(os, "write", _disk_full)
     with pytest.raises(OSError):
         killswitch.engage_exclusive(stop, "marker\n")
     assert not killswitch.is_engaged(stop), "an empty stop nobody owns was left behind"
+    assert not list(tmp_path.iterdir()), "the temp file leaked"
 
 
 def test_engage_exclusive_does_not_take_over_an_existing_stop(tmp_path):
