@@ -321,12 +321,16 @@ class AttestationGate:
         if "last_issued_at" not in state:
             return watermark, None  # written before issued_at was recorded
         issued_at = state["last_issued_at"]
-        if (
-            isinstance(issued_at, bool)
-            or not isinstance(issued_at, (int, float))
-            or not math.isfinite(issued_at)
-            or issued_at < 0
-        ):
+        try:
+            valid = (
+                not isinstance(issued_at, bool)
+                and isinstance(issued_at, (int, float))
+                and math.isfinite(issued_at)
+                and issued_at >= 0
+            )
+        except OverflowError:  # an int too large for a float, e.g. 10**400
+            valid = False
+        if not valid:
             raise GateStateError(
                 f"gate state at {self._state_path} has last_issued_at={issued_at!r}; "
                 "expected a non-negative finite number"

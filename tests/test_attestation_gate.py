@@ -345,12 +345,12 @@ def test_a_gate_that_cannot_persist_refuses_to_admit(tmp_path):
     assert gate._last_frame_id is None, "the watermark advanced despite the write failing"
 
 
-@_needs_non_root
-def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path):
+def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path, monkeypatch):
     """The durable write runs before any volatile state changes. If it ran after,
     a failed write would leave the nonce burned for an envelope that was never
     admitted — and the observer could not retry, because its own nonce would come
-    back as `replayed-nonce`."""
+    back as `replayed-nonce`. The failure is injected rather than made with
+    directory permissions, so this also runs as root."""
     home = tmp_path / "state"
     home.mkdir()
     gate = AttestationGate(  # trust-on-first-use, so a failed admit could pin an epoch
@@ -359,12 +359,14 @@ def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path):
         state_path=home / "gate_state.json",
     )
     envelope = _captured_envelopes(1)[0]
-    home.chmod(0o500)
-    try:
+    with monkeypatch.context() as patch:
+
+        def _replace_fails(src, dst):
+            raise OSError("injected write failure")
+
+        patch.setattr(os, "replace", _replace_fails)
         with pytest.raises(GateStateError):
             gate.admit(envelope, now=105.0)
-    finally:
-        home.chmod(0o700)
     assert gate._seen == {}, "a nonce was burned for an envelope that was not admitted"
     assert gate.pinned_epoch is None, "trust-on-first-use pinned an epoch on a failed admit"
     # and the retry now succeeds, which is the point
@@ -486,7 +488,9 @@ def test_a_legacy_state_file_still_orders_by_frame_id(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "issued_at", ["-1", "true", '"7"', "NaN", "Infinity"], ids=["neg", "bool", "str", "nan", "inf"]
+    "issued_at",
+    ["-1", "true", '"7"', "NaN", "Infinity", "1" + "0" * 400],
+    ids=["neg", "bool", "str", "nan", "inf", "too-big-for-a-float"],
 )
 def test_an_untrusted_issue_time_refuses_to_start(tmp_path, issued_at):
     state = tmp_path / "gate_state.json"
