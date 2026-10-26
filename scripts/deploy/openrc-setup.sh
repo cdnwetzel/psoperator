@@ -173,14 +173,19 @@ if [ -n "$RUNNING" ]; then
     RESTART=1
 fi
 
+# The key must load as the service account, with psoperator's own checks
+# (owner-only, regular file), before anything is created or written.
+LOAD_KEY='import sys; from pathlib import Path; from psoperator.common.attestation import load_attestation_key as k; k(Path(sys.argv[1]))'
+if [ "$DRY" = 0 ]; then
+    su -s /bin/sh "$SVC_USER" -c "$(printf '%q ' "${PY[@]}" -c "$LOAD_KEY" "$KEY")" \
+        || { say "key $KEY does not load as $SVC_USER: provision it with 'psoperator attestation-keygen' as that account"; exit 1; }
+fi
+
 # --- state directory and IPC secret -------------------------------------------
 run install -d -m 700 -o "$SVC_USER" -g "$(id -gn "$SVC_USER" 2>/dev/null || echo "$SVC_USER")" "$STATE"
 # Created once, before either service starts, so the two never race to make it.
 MAKE_SECRET='import sys; from pathlib import Path; from psoperator.common.auth import load_or_create_secret as s; s(Path(sys.argv[1]))'
 run su -s /bin/sh "$SVC_USER" -c "$(printf '%q ' "${PY[@]}" -c "$MAKE_SECRET" "$STATE/ipc.secret")"
-if [ "$DRY" = 0 ]; then
-    [ -r "$KEY" ] || { say "missing key $KEY: provision it with 'psoperator attestation-keygen' as $SVC_USER"; exit 1; }
-fi
 
 # --- shared settings ------------------------------------------------------------
 CH_LINE=""
@@ -261,12 +266,12 @@ if [ "$RESTART" = 1 ] || yes_no "start all three services now?"; then
         # Success means each service is up AND listening, on loopback only.
         # The listener must be the managed service itself, not some other
         # process holding the port: its owner is the service account and its
-        # command line is "psoperator <role>".
+        # command line runs the configured executable with that role.
         owns() {  # owns PORT ROLE
             local pid
             for pid in $(ss -ltnpH "sport = :$1" | grep -E '(127\.0\.0\.1|\[::1\]):' | grep -oE 'pid=[0-9]+' | cut -d= -f2); do
                 [ "$(stat -c '%U' "/proc/$pid")" = "$SVC_USER" ] \
-                    && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qE "psoperator $2( |$)" && return 0
+                    && [[ " $(tr '\0' ' ' < "/proc/$pid/cmdline") " == *" $BIN $2 "* ]] && return 0
             done
             return 1
         }
