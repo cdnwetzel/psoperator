@@ -1,0 +1,193 @@
+#!/bin/bash
+# Set up the observer, executor and gatekeeper as OpenRC services on one host.
+#
+# All three run as one service account on one host: IPCServer binds loopback
+# only, so they cannot be split across machines. Every box-specific value is
+# prompted for (defaults are read from an existing observer unit when there is
+# one), so nothing host-specific lives in this file.
+#
+# Update the psoperator checkout or install first: the units run whatever
+# version the executable resolves to.
+#
+# Run as root:  sudo bash scripts/deploy/openrc-setup.sh [--dry-run]
+#   --dry-run   print every file and command instead of writing or running it
+#
+# Writes:
+#   /etc/psoperator.env                  shared settings, sourced by each unit
+#   /etc/init.d/psoperator-observer      rewritten to source it (old copy backed up)
+#   /etc/init.d/psoperator-executor      new
+#   /etc/init.d/psoperator-gatekeeper    new
+#   <state dir>                          owner-only: IPC secret, gate state, STOP, audit log
+#
+# Not done here: the planner account split (docs/deployment-isolation.md),
+# approvals (the gatekeeper's CLI approval has no console under a service
+# manager, so T2/T3 actions fail closed), and the dx fleet binding.
+set -eu
+
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+say() { printf '%s\n' "$*"; }
+ask() {  # ask VAR "question" "default"
+    local reply
+    read -rp "$2 [$3]: " reply
+    printf -v "$1" '%s' "${reply:-$3}"
+}
+yes_no() {  # yes_no "question" -> 0 on y
+    local reply
+    read -rp "$1 [y/N]: " reply
+    [ "$reply" = y ] || [ "$reply" = Y ]
+}
+run() {
+    if [ "$DRY" = 1 ]; then say "DRY: $*"; else "$@"; fi
+}
+put() {  # put PATH MODE < content
+    local content
+    content=$(cat)
+    if [ "$DRY" = 1 ]; then
+        say "DRY: write $1 (mode $2):"
+        printf '%s\n' "$content" | sed 's/^/    | /'
+    else
+        printf '%s\n' "$content" > "$1"
+        chmod "$2" "$1"
+    fi
+}
+
+if [ "$DRY" = 0 ] && [ "$(id -u)" != 0 ]; then
+    say "run as root (sudo), or pass --dry-run"; exit 1
+fi
+
+# --- defaults from an existing observer unit, if any -------------------------
+OBS=/etc/init.d/psoperator-observer
+cur() { [ -r "$OBS" ] && sed -n "s/^export $1=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$OBS" | head -1; }
+d_user=$( { [ -r "$OBS" ] && sed -n 's/^command_user="\{0,1\}\([^\"]*\)"\{0,1\}$/\1/p' "$OBS"; } | head -1)
+d_bin=$( { [ -r "$OBS" ] && sed -n 's/^command="\{0,1\}\([^\"]*\)"\{0,1\}$/\1/p' "$OBS"; } | head -1)
+d_display=$(cur DISPLAY); d_key=$(cur PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH)
+d_ttl=$(cur PSOPERATOR_OBSERVER_SNAPSHOT_TTL_S)
+
+ask SVC_USER "service account" "${d_user:-${SUDO_USER:-}}"
+[ -n "$SVC_USER" ] || { say "a service account is required"; exit 1; }
+SVC_HOME=$(getent passwd "$SVC_USER" 2>/dev/null | cut -d: -f6 || true)
+[ -n "$SVC_HOME" ] || SVC_HOME=$(eval echo "~$SVC_USER")
+ask BIN "psoperator executable" "${d_bin:-$(command -v psoperator || true)}"
+[ "$DRY" = 1 ] || [ -x "$BIN" ] || { say "not executable: $BIN"; exit 1; }
+ask DISPLAY_ "X display the observer captures and the executor drives" "${d_display:-:99}"
+ask KEY "observer attestation key (owner-only file)" "${d_key:-$SVC_HOME/.config/psoperator/observer.key}"
+ask STATE "state directory (created owner-only)" "/var/lib/psoperator"
+ask TTL "snapshot lifetime, seconds" "${d_ttl:-30}"
+say "executor backends: dryrun (logs only, safe), pynput (drives the display), ch9329 (HID cable)"
+ask BACKEND "executor backend" "dryrun"
+CH_PORT=""
+[ "$BACKEND" = ch9329 ] && ask CH_PORT "HID cable serial port (absolute)" "/dev/ttyACM0"
+for p in "$KEY" "$STATE"; do
+    case "$p" in /*) ;; *) say "must be absolute: $p"; exit 1 ;; esac
+done
+
+# One epoch shared by the observer and the gatekeeper; kept across re-runs.
+EPOCH=""
+[ -r /etc/psoperator.env ] && EPOCH=$(sed -n 's/^export PSOPERATOR_OBSERVER_EPOCH="\([0-9a-f]\{64\}\)"$/\1/p' /etc/psoperator.env)
+[ -n "$EPOCH" ] || EPOCH=$(openssl rand -hex 32)
+
+PY=$(head -1 "$BIN" 2>/dev/null | sed -n 's/^#!//p')
+[ -n "$PY" ] || PY=python3
+
+say ""
+say "service account $SVC_USER, executable $BIN, display $DISPLAY_"
+say "key $KEY, state $STATE, executor backend $BACKEND"
+yes_no "write the services with these settings?" || { say "nothing changed"; exit 0; }
+
+# --- state directory and IPC secret -------------------------------------------
+run install -d -m 700 -o "$SVC_USER" -g "$(id -gn "$SVC_USER" 2>/dev/null || echo "$SVC_USER")" "$STATE"
+# Created once, before either service starts, so the two never race to make it.
+run su -s /bin/sh "$SVC_USER" -c "'$PY' -c 'from pathlib import Path; from psoperator.common.auth import load_or_create_secret as s; s(Path(\"$STATE/ipc.secret\"))'"
+if [ "$DRY" = 0 ]; then
+    [ -r "$KEY" ] || { say "missing key $KEY: provision it with 'psoperator attestation-keygen' as $SVC_USER"; exit 1; }
+fi
+
+# --- shared settings ------------------------------------------------------------
+CH_LINE=""
+[ -n "$CH_PORT" ] && CH_LINE="export PSOPERATOR_CH9329_PORT=\"$CH_PORT\""
+[ -e /etc/psoperator.env ] && run cp -p /etc/psoperator.env "/etc/psoperator.env.bak-$STAMP"
+put /etc/psoperator.env 644 <<EOF
+# psoperator services: shared settings (written by scripts/deploy/openrc-setup.sh).
+# The operator's shell needs PSOPERATOR_KILL_SWITCH_PATH too, for kill/resume.
+export DISPLAY="$DISPLAY_"
+export PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH="$KEY"
+export PSOPERATOR_OBSERVER_EPOCH="$EPOCH"
+export PSOPERATOR_OBSERVER_SNAPSHOT_TTL_S="$TTL"
+export PSOPERATOR_OBSERVER_HOST="127.0.0.1"
+export PSOPERATOR_OBSERVER_PORT="8764"
+export PSOPERATOR_GATEKEEPER_HOST="127.0.0.1"
+export PSOPERATOR_GATEKEEPER_PORT="8765"
+export PSOPERATOR_EXECUTOR_HOST="127.0.0.1"
+export PSOPERATOR_EXECUTOR_PORT="8766"
+export PSOPERATOR_EXECUTOR_BACKEND="$BACKEND"
+export PSOPERATOR_IPC_SECRET_PATH="$STATE/ipc.secret"
+export PSOPERATOR_GATE_STATE_PATH="$STATE/gate_state.json"
+export PSOPERATOR_KILL_SWITCH_PATH="$STATE/STOP"
+export PSOPERATOR_AUDIT_LOG_PATH="$STATE/audit.jsonl"
+export PSOPERATOR_RISK_POLICY_PATH="$STATE/policy.json"
+$CH_LINE
+EOF
+
+unit() {  # unit NAME DESCRIPTION ARGS DEPEND
+    put "/etc/init.d/$1" 755 <<EOF
+#!/sbin/openrc-run
+# Written by psoperator scripts/deploy/openrc-setup.sh; settings in /etc/psoperator.env.
+description="$2"
+supervisor=supervise-daemon
+command="$BIN"
+command_args="$3"
+command_user="$SVC_USER"
+directory="$STATE"
+output_log="/var/log/$1.log"
+error_log="/var/log/$1.log"
+. /etc/psoperator.env
+
+depend() { $4; }
+EOF
+}
+
+[ -e "$OBS" ] && run cp -p "$OBS" "$OBS.bak-$STAMP"
+X_DEP="need xvfb"
+[ -e /etc/init.d/xvfb ] || X_DEP="use xvfb"
+unit psoperator-observer "psoperator observer: signed screen snapshots" "observer --backend mss" "$X_DEP"
+EXEC_DEP="use xvfb"
+[ "$BACKEND" = pynput ] && EXEC_DEP="$X_DEP"
+unit psoperator-executor "psoperator executor: authenticated input ($BACKEND)" "executor --backend $BACKEND" "$EXEC_DEP"
+unit psoperator-gatekeeper "psoperator gatekeeper: verifies snapshots and gates actions" "gatekeeper" \
+    "need psoperator-observer psoperator-executor"
+for s in observer executor gatekeeper; do run touch "/var/log/psoperator-$s.log"; run chown "$SVC_USER" "/var/log/psoperator-$s.log"; done
+
+# --- operator shell ---------------------------------------------------------------
+PROFILE="$SVC_HOME/.profile"
+LINE="export PSOPERATOR_KILL_SWITCH_PATH=\"$STATE/STOP\""
+if ! grep -qsF "$LINE" "$PROFILE" && yes_no "add the stop path to $PROFILE so 'psoperator kill' works from any folder?"; then
+    if [ "$DRY" = 1 ]; then say "DRY: append to $PROFILE: $LINE"
+    else printf '%s\n' "$LINE" >> "$PROFILE"; chown "$SVC_USER" "$PROFILE"; fi
+fi
+
+# --- enable and start ------------------------------------------------------------
+for s in observer executor gatekeeper; do run rc-update add "psoperator-$s" default; done
+if yes_no "restart the observer and start the executor and gatekeeper now?"; then
+    run rc-service psoperator-observer restart
+    run rc-service psoperator-executor start
+    run rc-service psoperator-gatekeeper start
+    if [ "$DRY" = 0 ]; then
+        sleep 2
+        rc-status | grep psoperator || true
+        if ss -ltnH 'sport = :8764 or sport = :8765 or sport = :8766' \
+            | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):'; then
+            say "EXPOSED: a service is listening beyond loopback"; exit 1
+        fi
+        say "listeners: loopback only"
+        stat -c '%a %U %n' "$KEY" "$STATE/ipc.secret"
+        su -s /bin/sh "$SVC_USER" -c ". /etc/psoperator.env; '$BIN' observer-health" || true
+        tail -n 3 /var/log/psoperator-gatekeeper.log
+    fi
+else
+    say "services enabled but not started; start with: rc-service psoperator-gatekeeper start"
+fi
+say "done. Undo: rc-update del each service, remove /etc/init.d/psoperator-{executor,gatekeeper},"
+say "and restore $OBS from $OBS.bak-$STAMP."
