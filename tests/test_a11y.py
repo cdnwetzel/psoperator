@@ -181,8 +181,27 @@ def test_a_name_access_that_raises_yields_empty_string():
     assert node is not None and node.name == ""
 
 
-def test_default_a11y_falls_back_to_the_stub_off_linux():
+def test_default_a11y_falls_back_to_the_stub_on_an_unsupported_platform(monkeypatch):
     # Off a live desktop, the factory must degrade to the honest empty stub
-    # rather than raise (a missing provider is not a crash).
+    # rather than raise (a missing provider is not a crash). The platform is
+    # forced: on a Linux host with pyatspi the factory rightly returns the live
+    # provider, whose tree() is never None.
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "freebsd")
     prov = default_a11y()
-    assert prov.tree() is None or isinstance(prov, StubA11yProvider)
+    assert isinstance(prov, StubA11yProvider)
+    assert prov.tree() is None
+
+
+def test_default_a11y_falls_back_when_the_platform_provider_is_unavailable(monkeypatch):
+    import sys
+
+    from psoperator.perception import a11y
+
+    def _unavailable():
+        raise RuntimeError("pyatspi is not installed")
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(a11y, "AtSpiA11y", _unavailable)
+    assert isinstance(default_a11y(), StubA11yProvider)

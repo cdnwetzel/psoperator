@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from psoperator.harness.model import (
@@ -37,6 +38,8 @@ _NOT_RESTORED = re.compile(r"\[net (?:not|partly) restored:")
 _DIFF_LINES = re.compile(r"diff_lines=(\d+)")
 # pxx's usage-error exit: `pxx review` with no diff to review exits 64.
 _PXX_EXIT_USAGE = 64
+# Serialises vision captures, which briefly override the process-wide DISPLAY.
+_DISPLAY_LOCK = threading.Lock()
 
 
 def _verdict(stdout: str) -> str | None:
@@ -367,10 +370,21 @@ class OllamaVisionJudge:
         except ImportError:
             return None
         try:
-            if self._policy.display:
-                os.environ["DISPLAY"] = self._policy.display
-            with mss.mss() as sct:
-                raw = sct.grab(sct.monitors[1])
+            # DISPLAY is process-wide. Override it only for this capture, and hold
+            # the lock so a concurrent judge cannot capture under our display (or
+            # we under its) and send that screen to its own endpoint.
+            with _DISPLAY_LOCK:
+                prior = os.environ.get("DISPLAY")
+                try:
+                    if self._policy.display:
+                        os.environ["DISPLAY"] = self._policy.display
+                    with mss.mss() as sct:
+                        raw = sct.grab(sct.monitors[1])
+                finally:
+                    if prior is None:
+                        os.environ.pop("DISPLAY", None)
+                    else:
+                        os.environ["DISPLAY"] = prior
             img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
@@ -400,18 +414,21 @@ class OllamaVisionJudge:
             ],
         }
         url = self._policy.endpoint.rstrip("/") + "/v1/chat/completions"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
+        # Building the request (an empty or malformed endpoint) and reading the
+        # reply (a null or non-object message) fail like a dead endpoint: abstain.
         try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+            )
             with urllib.request.urlopen(req, timeout=self._policy.timeout_s) as resp:
                 msg = json.loads(resp.read())["choices"][0]["message"]
+            # Reasoning models can put the text in reasoning_content with content None.
+            text = msg.get("content") or msg.get("reasoning_content")
         except Exception:
             return None
-        # Reasoning models can put the text in reasoning_content with content None.
-        return msg.get("content") or msg.get("reasoning_content") or None
+        return text if isinstance(text, str) and text else None
 
     @staticmethod
     def _parse(reply: str) -> JudgeResult:
