@@ -553,3 +553,94 @@ def test_vision_reports_a_real_defect_end_to_end(monkeypatch):
     monkeypatch.setattr(j, "_ask", lambda *a, **k: "VERDICT: PROBLEM\nFINDINGS: window is blank")
     r = j.assess(_vtask())
     assert r.acceptable is False and r.findings == ("window is blank",)
+
+
+def test_vision_abstains_when_the_endpoint_is_empty():
+    # An empty endpoint makes the request itself unbuildable; that is a dead
+    # endpoint, not a crash of the whole assessment.
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint=""))
+    assert j._ask("p", "Zm9v") is None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        b'{"choices": [{"message": null}]}',
+        b'{"choices": [{"message": {"content": ["not", "text"]}}]}',
+    ],
+    ids=["null-message", "non-text-content"],
+)
+def test_vision_abstains_when_the_reply_has_no_usable_message(monkeypatch, reply):
+    import io
+    import urllib.request
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _Resp(reply))
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x"))
+    assert j._ask("p", "Zm9v") is None
+
+
+def test_a_judges_display_override_does_not_outlive_its_capture(monkeypatch):
+    """DISPLAY is process-wide. A judge that pins a display must not leave it
+    set, or the next judge (display=None) captures that screen and sends it to
+    its own endpoint."""
+    import os
+    import sys
+    import types
+
+    seen = []
+
+    class _Shot:
+        size = (1, 1)
+        bgra = b"\x00\x00\x00\x00"
+
+    class _Sct:
+        monitors = [None, {}]
+
+        def __enter__(self):
+            seen.append(os.environ.get("DISPLAY"))
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def grab(self, monitor):
+            return _Shot()
+
+    monkeypatch.setitem(sys.modules, "mss", types.SimpleNamespace(mss=_Sct))
+    monkeypatch.setenv("DISPLAY", ":0")
+    pinned = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x", display=":7"))
+    ambient = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x"))
+    assert pinned._capture() is not None
+    assert os.environ["DISPLAY"] == ":0", "the override leaked past the capture"
+    assert ambient._capture() is not None
+    assert seen == [":7", ":0"]
+
+
+def test_vision_reads_the_verdict_from_reasoning_content_when_content_is_not_text(monkeypatch):
+    import io
+    import urllib.request
+
+    reply = (
+        b'{"choices": [{"message": {"content": ["part"], '
+        b'"reasoning_content": "VERDICT: PROBLEM\\nFINDINGS: window is blank"}}]}'
+    )
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _Resp(reply))
+    j = OllamaVisionJudge(VisionPolicy(model="m", endpoint="http://x"))
+    text = j._ask("p", "Zm9v")
+    assert text == "VERDICT: PROBLEM\nFINDINGS: window is blank"
+    assert OllamaVisionJudge._parse(text).acceptable is False

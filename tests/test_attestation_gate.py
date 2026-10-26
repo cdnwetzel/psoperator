@@ -31,6 +31,12 @@ EPOCH_A = "a" * 64
 EPOCH_B = "b" * 64
 NONCE_1 = "1" * 64
 
+# Root ignores directory permission bits, so a write the test denies succeeds.
+_needs_non_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory permission bits",
+)
+
 
 def _key(secret: bytes = b"s" * 32, key_id: str = KEY_ID) -> AttestationKey:
     return AttestationKey(key_id, secret, created_at=90.0)
@@ -311,16 +317,20 @@ def test_state_is_written_owner_only(tmp_path):
     state = tmp_path / "nested" / "gate_state.json"
     gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
     gate.admit(_captured_envelopes(1)[0], now=105.0)
-    assert json.loads(state.read_text(encoding="utf-8")) == {"last_frame_id": 1}
+    assert json.loads(state.read_text(encoding="utf-8")) == {
+        "last_frame_id": 1,
+        "last_issued_at": 101.0,
+    }
     assert state.stat().st_mode & 0o777 == 0o600
     assert not list(state.parent.glob("*.tmp")), "the atomic-replace temp file leaked"
 
 
+@_needs_non_root
 def test_a_gate_that_cannot_persist_refuses_to_admit(tmp_path):
     """If the durable record cannot be updated, admitting anyway would quietly
     restore the restart weakness with nothing reporting it."""
     home = tmp_path / "state"
-    home.mkdir()
+    home.mkdir(mode=0o700)  # the gate refuses a group-writable state dir
     gate = AttestationGate(
         AttestationKeyring([_key()]),
         expected_epoch=EPOCH_A,
@@ -335,25 +345,28 @@ def test_a_gate_that_cannot_persist_refuses_to_admit(tmp_path):
     assert gate._last_frame_id is None, "the watermark advanced despite the write failing"
 
 
-def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path):
+def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path, monkeypatch):
     """The durable write runs before any volatile state changes. If it ran after,
     a failed write would leave the nonce burned for an envelope that was never
     admitted — and the observer could not retry, because its own nonce would come
-    back as `replayed-nonce`."""
+    back as `replayed-nonce`. The failure is injected rather than made with
+    directory permissions, so this also runs as root."""
     home = tmp_path / "state"
-    home.mkdir()
+    home.mkdir(mode=0o700)
     gate = AttestationGate(  # trust-on-first-use, so a failed admit could pin an epoch
         AttestationKeyring([_key()]),
         expected_epoch=None,
         state_path=home / "gate_state.json",
     )
     envelope = _captured_envelopes(1)[0]
-    home.chmod(0o500)
-    try:
+    with monkeypatch.context() as patch:
+
+        def _replace_fails(src, dst):
+            raise OSError("injected write failure")
+
+        patch.setattr(os, "replace", _replace_fails)
         with pytest.raises(GateStateError):
             gate.admit(envelope, now=105.0)
-    finally:
-        home.chmod(0o700)
     assert gate._seen == {}, "a nonce was burned for an envelope that was not admitted"
     assert gate.pinned_epoch is None, "trust-on-first-use pinned an epoch on a failed admit"
     # and the retry now succeeds, which is the point
@@ -420,8 +433,129 @@ def test_a_stale_temp_file_does_not_block_the_write(tmp_path):
     stale.chmod(0o666)
     gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
     gate.admit(_captured_envelopes(1)[0], now=105.0)
-    assert json.loads(state.read_text(encoding="utf-8")) == {"last_frame_id": 1}
+    assert json.loads(state.read_text(encoding="utf-8")) == {
+        "last_frame_id": 1,
+        "last_issued_at": 101.0,
+    }
     assert state.stat().st_mode & 0o777 == 0o600
+
+
+def _lifetime_env(frame_id: int, nonce: str, issued_at: float):
+    """An envelope from an observer lifetime whose clock reads ``issued_at``."""
+    return _signer(_key(), ttl=50.0, nonce=nonce).sign(
+        _snapshot(frame_id=frame_id), issued_at=issued_at
+    )
+
+
+def test_a_restarted_observer_is_not_locked_out_by_the_watermark(tmp_path):
+    """Frame ids restart at 1 with each observer lifetime, under the same pinned
+    epoch. Ordering on the frame id alone refused every new frame until the new
+    lifetime had counted past the old one's last frame."""
+    state = tmp_path / "gate_state.json"
+    gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+    for i in range(1, 5):
+        gate.admit(_lifetime_env(i, str(i) * 64, 101.0), now=105.0)
+
+    restarted = AttestationGate(
+        AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state
+    )
+    fresh = restarted.admit(_lifetime_env(1, "9" * 64, 120.0), now=125.0)
+    assert fresh.nonce == "9" * 64
+
+
+def test_an_older_lifetime_is_a_rollback_whatever_its_frame_id():
+    """The negative control for the fix above: a higher frame id from an earlier
+    issue time is an old lifetime's envelope replayed, not progress."""
+    gate = _gate()
+    gate.admit(_lifetime_env(1, "1" * 64, 120.0), now=125.0)
+    with pytest.raises(EnvelopeRejected) as rejection:
+        gate.admit(_lifetime_env(9, "9" * 64, 101.0), now=125.0)
+    assert rejection.value.reason == "stale-frame"
+
+
+def test_a_legacy_state_file_still_orders_by_frame_id(tmp_path):
+    """A state file written before issued_at was recorded keeps its watermark;
+    it is never read as 'no state'."""
+    state = tmp_path / "gate_state.json"
+    state.write_text('{"last_frame_id": 4}', encoding="utf-8")
+    state.chmod(0o600)
+    gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+    with pytest.raises(EnvelopeRejected) as rejection:
+        gate.admit(_lifetime_env(4, "4" * 64, 120.0), now=125.0)
+    assert rejection.value.reason == "stale-frame"
+    gate.admit(_lifetime_env(5, "5" * 64, 120.0), now=125.0)
+    assert json.loads(state.read_text(encoding="utf-8"))["last_issued_at"] == 120.0
+
+
+@pytest.mark.parametrize(
+    "issued_at",
+    ["-1", "true", '"7"', "NaN", "Infinity", "1" + "0" * 400],
+    ids=["neg", "bool", "str", "nan", "inf", "too-big-for-a-float"],
+)
+def test_an_untrusted_issue_time_refuses_to_start(tmp_path, issued_at):
+    state = tmp_path / "gate_state.json"
+    state.write_text(f'{{"last_frame_id": 4, "last_issued_at": {issued_at}}}', encoding="utf-8")
+    state.chmod(0o600)
+    with pytest.raises(GateStateError):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o777, 0o1777], ids=["group", "world", "sticky-world"])
+def test_a_missing_state_file_in_a_shared_directory_is_not_a_first_start(tmp_path, mode):
+    """Whoever can write the directory can delete the file, and a missing file
+    would otherwise read as a first start with no watermark."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(mode)
+    with pytest.raises(GateStateError, match="group/other"):
+        AttestationGate(
+            AttestationKeyring([_key()]),
+            expected_epoch=EPOCH_A,
+            state_path=shared / "gate_state.json",
+        )
+
+
+def test_an_existing_state_file_in_a_shared_directory_is_refused(tmp_path):
+    """The file itself is owner-only, but another account that can write its
+    directory could have swapped an older copy back in: a lower watermark."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    state = shared / "gate_state.json"
+    state.write_text('{"last_frame_id": 1, "last_issued_at": 101.0}', encoding="utf-8")
+    state.chmod(0o600)
+    shared.chmod(0o777)
+    with pytest.raises(GateStateError, match="group/other"):
+        AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+
+
+def test_a_missing_directory_under_a_shared_parent_is_not_a_first_start(tmp_path):
+    """Whoever can write the parent could have renamed the state directory away."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    with pytest.raises(GateStateError, match="moved the watermark away"):
+        AttestationGate(
+            AttestationKeyring([_key()]),
+            expected_epoch=EPOCH_A,
+            state_path=shared / "psoperator" / "gate_state.json",
+        )
+
+
+def test_the_state_directory_is_created_owner_only(tmp_path):
+    """Every missing component is created 0700 rather than under the process
+    umask, which may be 002: a group-writable intermediate directory would let
+    another account move the state directory below it away and back."""
+    old = os.umask(0o002)
+    try:
+        state = tmp_path / "a" / "b" / "gate_state.json"
+        gate = AttestationGate(
+            AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state
+        )
+        gate.admit(_captured_envelopes(1)[0], now=105.0)
+    finally:
+        os.umask(old)
+    for created in (tmp_path / "a", tmp_path / "a" / "b"):
+        assert created.stat().st_mode & 0o777 == 0o700, created
 
 
 # --- D2: evict nonces by expiry, not by how many admissions happened --------
