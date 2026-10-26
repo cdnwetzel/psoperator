@@ -137,6 +137,15 @@ attestation suite.
      (`.psoperator/gate_state.json`) is relative to the working directory, so a
      unit started from a different directory finds no file, takes it for a first
      start, and silently resets the frame watermark.
+   - `PSOPERATOR_KILL_SWITCH_PATH` — one **shared absolute path** in the gatekeeper
+     unit and in the environment you run `psoperator kill`, `resume`, and
+     `kill-drill` from (as the governance account), e.g.
+     `/var/lib/psoperator/STOP` in a directory the governance account owns. Its
+     default (`.psoperator/STOP`) is relative to each process's working directory, so
+     `kill` from another directory would engage a stop the service never reads.
+     The gatekeeper service and those three commands refuse a relative path, and
+     `~` is not expanded. The service prints the path it watches at startup;
+     check that it matches what `kill` prints.
 4. **Run the services under their accounts.** The observer, gatekeeper, and
    executor services run as `governance` (one service-manager unit each — systemd
    on most Linux; OpenRC on the Gentoo host, where the observer already runs
