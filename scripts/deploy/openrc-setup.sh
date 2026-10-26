@@ -93,7 +93,11 @@ SVC_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6) || true
 [ -n "$SVC_HOME" ] || { say "no such account: $SVC_USER"; exit 1; }
 ask BIN "psoperator executable" "${d_bin:-$(command -v psoperator || true)}"
 check "$BIN" "$PATH_RE" "executable path"
-[ "$DRY" = 1 ] || [ -x "$BIN" ] || { say "not executable: $BIN"; exit 1; }
+# Checked as the service account, which is who OpenRC launches it as.
+if [ "$DRY" = 0 ]; then
+    su -s /bin/sh "$SVC_USER" -c "test -x $(printf '%q' "$BIN")" \
+        || { say "$SVC_USER cannot execute $BIN"; exit 1; }
+fi
 ask DISPLAY_ "X display the observer captures and the executor drives" "${d_display:-:99}"
 check "$DISPLAY_" '^:[0-9]+(\.[0-9]+)?$' "display"
 ask KEY "observer attestation key (owner-only file)" "${d_key:-$SVC_HOME/.config/psoperator/observer.key}"
