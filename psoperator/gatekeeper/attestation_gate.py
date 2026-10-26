@@ -19,8 +19,12 @@ never reaches the replay bookkeeping):
    refuses the rest — a later trust decision, never automatic.
 4. **not-yet-valid / expired** — now is outside ``[issued_at, expires_at]``.
 5. **replayed-nonce** — this nonce was already admitted under the pinned epoch.
-6. **stale-frame** — the snapshot frame id does not advance past the last admitted
-   (an older frame replayed after a newer one — a rollback).
+6. **stale-frame** — the envelope does not advance past the last admitted one,
+   ordered by ``(issued_at, frame_id)`` (an older frame replayed after a newer
+   one — a rollback). ``issued_at`` leads because frame ids restart at 1 with
+   each observer lifetime while the observer's clock does not; ordering on the
+   frame id alone locked a restarted observer out until it had re-counted past
+   the previous lifetime's last frame.
 
 Epoch pinning and nonce recording happen only after *every* check passes, so a
 rejected envelope can neither pin an epoch nor consume a nonce.
@@ -29,6 +33,7 @@ rejected envelope can neither pin an epoch nor consume a nonce.
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import stat
@@ -119,7 +124,13 @@ class AttestationGate:
         # be driven by expiry rather than by how many admissions happened since.
         self._seen: OrderedDict[str, float] = OrderedDict()
         self._state_path = Path(state_path) if state_path is not None else None
-        self._last_frame_id: int | None = self._load_watermark()
+        self._last_frame_id: int | None = None
+        # None only for a legacy state file written before issued_at was
+        # recorded; the gate then orders by frame id alone until its next admit.
+        self._last_issued_at: float | None = None
+        watermark = self._load_watermark()
+        if watermark is not None:
+            self._last_frame_id, self._last_issued_at = watermark
 
     @property
     def pinned_epoch(self) -> str | None:
@@ -179,15 +190,17 @@ class AttestationGate:
             raise EnvelopeRejected("expired", f"now {now} > expires_at {body.expires_at}")
         if body.nonce in self._seen:
             raise EnvelopeRejected("replayed-nonce", body.nonce)
-        # Observer frame ids strictly increase; a non-increasing one is an older
-        # frame replayed after a newer (still within its TTL, a fresh nonce, so
-        # the checks above pass). Reject the rollback at this boundary rather than
-        # leaving it to freshness downstream.
-        if self._last_frame_id is not None and body.snapshot.frame_id <= self._last_frame_id:
+        # Within one observer lifetime frame ids strictly increase; across
+        # lifetimes they restart at 1 while issued_at keeps moving forward. A
+        # non-advancing envelope is an older frame replayed after a newer (still
+        # within its TTL, a fresh nonce, so the checks above pass). Reject the
+        # rollback at this boundary rather than leaving it to freshness downstream.
+        if not self._advances(body.issued_at, body.snapshot.frame_id):
             raise EnvelopeRejected(
                 "stale-frame",
-                f"frame {body.snapshot.frame_id} does not advance past last admitted "
-                f"{self._last_frame_id}",
+                f"frame {body.snapshot.frame_id} issued at {body.issued_at} does not "
+                f"advance past last admitted frame {self._last_frame_id} issued at "
+                f"{self._last_issued_at}",
             )
 
         # Every check passed — only now commit state, so a rejected envelope can
@@ -198,7 +211,7 @@ class AttestationGate:
         # If it ran last, a failed write would leave the nonce burned and the epoch
         # pinned for an envelope that was never admitted — and the observer could
         # not even retry it, since its own nonce would now come back as replayed.
-        self._advance_watermark(body.snapshot.frame_id)
+        self._advance_watermark(body.snapshot.frame_id, body.issued_at)
         if self._epoch is None:
             self._epoch = body.observer_epoch
         self._seen[body.nonce] = body.expires_at
@@ -211,6 +224,24 @@ class AttestationGate:
             issued_at=body.issued_at,
             expires_at=body.expires_at,
         )
+
+    def _advances(self, issued_at: float, frame_id: int) -> bool:
+        """Whether an envelope moves strictly past the watermark.
+
+        Ordered by ``(issued_at, frame_id)``: a later issue time advances even
+        with a lower frame id (a restarted observer), an earlier one never does
+        (a rollback, whatever its frame id), and a tie on issue time falls back
+        to the frame id. An observer clock stepped backwards therefore stalls
+        admission until it passes the old issue time again, a wait bounded by
+        the size of the step rather than by a count of frames.
+        """
+        if self._last_frame_id is None:
+            return True
+        if self._last_issued_at is None:  # legacy state: frame id only
+            return frame_id > self._last_frame_id
+        if issued_at != self._last_issued_at:
+            return issued_at > self._last_issued_at
+        return frame_id > self._last_frame_id
 
     # --- nonce eviction (D2) -------------------------------------------------
 
@@ -251,8 +282,8 @@ class AttestationGate:
 
     # --- frame watermark durability (D1) -------------------------------------
 
-    def _load_watermark(self) -> int | None:
-        """Restore the last admitted frame id across a restart.
+    def _load_watermark(self) -> tuple[int, float | None] | None:
+        """Restore the last admitted ``(frame_id, issued_at)`` across a restart.
 
         Without this the watermark is process-local, so a restart disarms the
         stale-frame check entirely and *every* captured envelope still inside its
@@ -287,7 +318,20 @@ class AttestationGate:
                 f"gate state at {self._state_path} has last_frame_id={watermark!r}; "
                 "expected a non-negative integer"
             )
-        return watermark
+        if "last_issued_at" not in state:
+            return watermark, None  # written before issued_at was recorded
+        issued_at = state["last_issued_at"]
+        if (
+            isinstance(issued_at, bool)
+            or not isinstance(issued_at, (int, float))
+            or not math.isfinite(issued_at)
+            or issued_at < 0
+        ):
+            raise GateStateError(
+                f"gate state at {self._state_path} has last_issued_at={issued_at!r}; "
+                "expected a non-negative finite number"
+            )
+        return watermark, float(issued_at)
 
     #: A watermark file is a few dozen bytes. Anything larger is not ours.
     _MAX_STATE_BYTES = 64 * 1024
@@ -308,6 +352,9 @@ class AttestationGate:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
+            # Absence is only a first start if no other account could have
+            # deleted the file: deleting it would otherwise reset the watermark.
+            self._check_state_dir(path.parent)
             return None  # genuine first start
         except OSError as exc:
             raise GateStateError(f"gate state at {path} cannot be opened: {exc}") from exc
@@ -341,7 +388,38 @@ class AttestationGate:
         finally:
             os.close(fd)
 
-    def _advance_watermark(self, frame_id: int) -> None:
+    @staticmethod
+    def _check_state_dir(directory: Path) -> None:
+        """Refuse a state directory another account can write to.
+
+        Whoever can write the directory can unlink the state file, and a missing
+        file reads as a first start with no watermark — the replay window this
+        file exists to close. A directory that does not exist yet is fine: the
+        writer creates it owner-only.
+        """
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise GateStateError(
+                f"gate state directory {directory} cannot be checked: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise GateStateError(f"gate state directory {directory} is not a real directory")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise GateStateError(
+                f"gate state directory {directory} is writable by group/other "
+                f"(mode {stat.S_IMODE(info.st_mode):04o}); another account could delete "
+                "the watermark and have the gate take it for a first start."
+            )
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise GateStateError(
+                f"gate state directory {directory} is owned by uid {info.st_uid}, not this "
+                f"account (uid {os.geteuid()})."
+            )
+
+    def _advance_watermark(self, frame_id: int, issued_at: float) -> None:
         """Persist before committing in memory, so a write failure fails closed.
 
         If the durable record cannot be updated, the envelope is not admitted: a
@@ -349,10 +427,11 @@ class AttestationGate:
         the restart behaviour above, without anything saying so.
         """
         if self._state_path is not None:
-            self._write_state(frame_id)
+            self._write_state(frame_id, issued_at)
         self._last_frame_id = frame_id
+        self._last_issued_at = issued_at
 
-    def _write_state(self, frame_id: int) -> None:
+    def _write_state(self, frame_id: int, issued_at: float) -> None:
         """Write owner-only, replace atomically, then make the *replacement*
         durable — not just the bytes.
 
@@ -370,10 +449,12 @@ class AttestationGate:
         """
         path = self._state_path
         assert path is not None  # guarded by the caller
-        payload = json.dumps({"last_frame_id": frame_id}, separators=(",", ":"))
+        payload = json.dumps(
+            {"last_frame_id": frame_id, "last_issued_at": issued_at}, separators=(",", ":")
+        )
         tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(tmp, flags, 0o600)

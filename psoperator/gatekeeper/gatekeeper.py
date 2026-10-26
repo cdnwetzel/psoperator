@@ -87,12 +87,20 @@ class Gatekeeper:
     def record_envelope_event(self, receipt: dict) -> None:
         """Append an R-203 envelope-authentication verdict (admitted or a named
         rejection) to the same hash-chained audit the decisions use, so a refused
-        forgery leaves a durable, tamper-evident receipt — not just a response."""
+        forgery leaves a durable, tamper-evident receipt — not just a response.
+        The envelope's identity (key, epoch, nonce) is kept, so a receipt can say
+        which key or nonce a rejection was about."""
         self._audit.append(
             frame_id=int(receipt.get("frame_id", 0)),
             frame_hash=str(receipt.get("frame_hash", "-")),
-            action={},
-            tier=0,
+            action={
+                "envelope": {
+                    k: receipt[k]
+                    for k in ("key_id", "observer_epoch", "nonce", "detail", "max_nonces", "at")
+                    if k in receipt
+                }
+            },
+            tier=-1,  # no risk assessment, the same sentinel as _record
             decision=f"ENVELOPE_{str(receipt['outcome']).upper()}",
             approver="gatekeeper",
             reason=str(receipt.get("reason") or receipt["outcome"]),

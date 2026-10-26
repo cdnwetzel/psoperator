@@ -217,3 +217,32 @@ class TestAuditChain:
         gate.request_action(Action(ActionKind.CLICK, 1, x=2, y=2), f)  # fresh: 1 == latest
         r = verify(cfg.audit_log_path)
         assert r.ok and r.lines_checked == 2
+
+    def test_an_envelope_receipt_keeps_which_key_and_nonce_it_was_about(self, env):
+        """A refused forgery's receipt must say which key and nonce were involved,
+        and must not carry a real risk tier (0) when no assessment was made."""
+        cfg, _, gate = env
+        gate.record_envelope_event(
+            {
+                "outcome": "rejected",
+                "reason": "replayed-nonce",
+                "detail": "n" * 64,
+                "key_id": "observer-v1",
+                "observer_epoch": "a" * 64,
+                "nonce": "n" * 64,
+                "frame_id": 7,
+                "frame_hash": "f" * 64,
+                "at": 101.0,
+            }
+        )
+        row = json.loads(cfg.audit_log_path.read_text(encoding="utf-8").splitlines()[-1])
+        assert row["decision"] == "ENVELOPE_REJECTED"
+        assert row["tier"] == -1
+        assert row["action"]["envelope"] == {
+            "key_id": "observer-v1",
+            "observer_epoch": "a" * 64,
+            "nonce": "n" * 64,
+            "detail": "n" * 64,
+            "at": 101.0,
+        }
+        assert verify(cfg.audit_log_path).ok
