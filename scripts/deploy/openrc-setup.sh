@@ -90,6 +90,21 @@ check "$STATE" "$PATH_RE" "state directory"
 STATE=${STATE%/}
 # Never take over an existing directory (e.g. /var/lib) that is not already ours.
 case "$STATE" in */*/*) ;; *) say "state directory must be at least two levels deep: $STATE"; exit 1 ;; esac
+# Every parent must already exist, be a real directory, be owned by root and
+# be writable by root only. Then no other account can swap a component for a
+# symlink between this check and the privileged install below.
+parent=""
+IFS=/ read -r -a parts <<< "${STATE#/}"
+for part in "${parts[@]:0:${#parts[@]}-1}"; do
+    parent="$parent/$part"
+    if [ -L "$parent" ] || [ ! -d "$parent" ]; then
+        say "parent $parent of the state directory must be an existing real directory"; exit 1
+    fi
+    meta=$(stat -c '%u %a' "$parent" 2>/dev/null || stat -f '%u %Lp' "$parent")
+    if [ "${meta%% *}" != 0 ] || [ $(( 8#${meta##* } & 8#022 )) != 0 ]; then
+        say "parent $parent of the state directory must be owned by root and writable only by root"; exit 1
+    fi
+done
 if [ -e "$STATE" ]; then
     owner=$(stat -c '%U' "$STATE" 2>/dev/null || stat -f '%Su' "$STATE")
     if [ ! -d "$STATE" ] || [ -L "$STATE" ] || [ "$owner" != "$SVC_USER" ]; then
@@ -191,7 +206,8 @@ PROFILE="$SVC_HOME/.profile"
 LINE="export PSOPERATOR_KILL_SWITCH_PATH=\"$STATE/STOP\""
 if ! grep -qsF "$LINE" "$PROFILE" && yes_no "add the stop path to $PROFILE so 'psoperator kill' works from any folder?"; then
     if [ "$DRY" = 1 ]; then say "DRY: append to $PROFILE: $LINE"
-    else printf '%s\n' "$LINE" >> "$PROFILE"; chown "$SVC_USER" "$PROFILE"; fi
+    # Appended as the account itself, never as root: the account controls this path.
+    else su -s /bin/sh "$SVC_USER" -c "printf '%s\n' $(printf '%q' "$LINE") >> $(printf '%q' "$PROFILE")"; fi
 fi
 
 # --- enable and start ------------------------------------------------------------
