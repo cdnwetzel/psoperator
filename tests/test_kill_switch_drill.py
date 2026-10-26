@@ -120,3 +120,38 @@ def test_drill_fails_loud_if_the_stop_does_not_preempt(tmp_path):
     assert raised, "a stop that failed to pre-empt must fail the drill, loud"
     # and the drill still restored the switch it engaged
     assert not killswitch.is_engaged(config.kill_switch_path)
+
+
+def test_drill_keeps_a_stop_an_operator_engages_while_the_canary_runs(tmp_path):
+    # The switch was off when the drill began, so a drill that only remembered
+    # "was it engaged?" would lift the operator's stop along with its own.
+    config, gk = _gk(tmp_path)
+
+    class _OperatorStopsMidDrill:
+        def request_action(self, action, frame, context=None, snapshot=None):
+            killswitch.engage(config.kill_switch_path)  # the operator's real stop
+            return gk.request_action(action, frame, snapshot=snapshot)
+
+    kill_switch_drill(
+        _OperatorStopsMidDrill(),
+        config.kill_switch_path,
+        action=Action(ActionKind.WAIT, 1, seconds=0.0),
+        frame=_frame(),
+    )
+    assert killswitch.is_engaged(config.kill_switch_path), "the drill lifted an operator's stop"
+
+
+def test_lifting_an_unowned_stop_puts_it_back(tmp_path):
+    stop = tmp_path / "STOP"
+    killswitch.engage(stop)
+    killswitch.disengage_if_owned(stop, "PSOperator kill-switch drill someone-else.\n")
+    assert killswitch.is_engaged(stop)
+    assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
+
+
+def test_engage_exclusive_does_not_take_over_an_existing_stop(tmp_path):
+    stop = tmp_path / "STOP"
+    killswitch.engage(stop)
+    assert killswitch.engage_exclusive(stop, "marker\n") is False
+    killswitch.disengage_if_owned(stop, "marker\n")
+    assert killswitch.is_engaged(stop)
