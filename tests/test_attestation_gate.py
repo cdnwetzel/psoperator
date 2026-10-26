@@ -330,7 +330,7 @@ def test_a_gate_that_cannot_persist_refuses_to_admit(tmp_path):
     """If the durable record cannot be updated, admitting anyway would quietly
     restore the restart weakness with nothing reporting it."""
     home = tmp_path / "state"
-    home.mkdir()
+    home.mkdir(mode=0o700)  # the gate refuses a group-writable state dir
     gate = AttestationGate(
         AttestationKeyring([_key()]),
         expected_epoch=EPOCH_A,
@@ -352,7 +352,7 @@ def test_a_failed_write_burns_no_nonce_and_pins_no_epoch(tmp_path, monkeypatch):
     back as `replayed-nonce`. The failure is injected rather than made with
     directory permissions, so this also runs as root."""
     home = tmp_path / "state"
-    home.mkdir()
+    home.mkdir(mode=0o700)
     gate = AttestationGate(  # trust-on-first-use, so a failed admit could pin an epoch
         AttestationKeyring([_key()]),
         expected_epoch=None,

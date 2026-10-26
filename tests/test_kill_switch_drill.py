@@ -153,12 +153,14 @@ def test_an_unowned_stop_is_never_lifted_even_briefly(tmp_path, monkeypatch):
     real_read = Path.read_text
 
     def _recording_read(self, *a, **k):
-        engaged_at_reads.append(killswitch.is_engaged(stop))
+        # The file itself, not is_engaged: a claim also reads as engaged, so a
+        # rename-first regression would pass a logical check.
+        engaged_at_reads.append(stop.is_file())
         return real_read(self, *a, **k)
 
     monkeypatch.setattr(Path, "read_text", _recording_read)
     killswitch.disengage_if_owned(stop, "PSOperator kill-switch drill someone-else.\n")
-    assert engaged_at_reads and all(engaged_at_reads)
+    assert engaged_at_reads and all(engaged_at_reads), "the sentinel left its path"
     assert killswitch.is_engaged(stop)
     assert not list(tmp_path.glob("*.claim")), "the claimed sentinel leaked"
 
