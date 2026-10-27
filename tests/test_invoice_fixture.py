@@ -93,30 +93,46 @@ def test_check_mode_runs_without_a_display():
 
 
 def test_record_starts_fresh_and_refuses_an_existing_file(tmp_path):
-    from psoperator.fixtures.invoice import RecordError, read_submissions, start_record
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord, read_submissions
 
-    record = tmp_path / "run.jsonl"
-    start_record(record)
-    assert read_submissions(record) == []
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    assert read_submissions(path) == []
     with pytest.raises(RecordError, match="already exists"):
-        start_record(record)
+        SubmissionRecord(path)
+    record.close()
 
 
 def test_record_round_trips_submissions_in_field_order(tmp_path):
-    from psoperator.fixtures.invoice import append_submission, read_submissions, start_record
+    from psoperator.fixtures.invoice import SubmissionRecord, read_submissions
 
-    record = tmp_path / "run.jsonl"
-    start_record(record)
-    append_submission(record, field_rows(DEMO_INVOICE))
-    append_submission(record, field_rows(DEMO_INVOICE))
-    subs = read_submissions(record)
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    record.append(field_rows(DEMO_INVOICE))
+    record.append(field_rows(DEMO_INVOICE))
+    record.close()
+    subs = read_submissions(path)
     assert len(subs) == 2
     assert tuple(subs[0]) == FIELD_NAMES
     assert subs[0]["Vendor"] == DEMO_INVOICE.vendor
 
 
+def test_record_refuses_a_removed_or_replaced_file(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    path.unlink()
+    with pytest.raises(RecordError, match="is gone"):
+        record.append(field_rows(DEMO_INVOICE))
+    path.write_text("")  # a different file at the same path
+    with pytest.raises(RecordError, match="replaced"):
+        record.append(field_rows(DEMO_INVOICE))
+    record.close()
+
+
 def test_record_failures_are_errors_not_empty(tmp_path):
-    from psoperator.fixtures.invoice import RecordError, append_submission, read_submissions
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord, read_submissions
 
     with pytest.raises(RecordError, match="cannot read"):
         read_submissions(tmp_path / "missing.jsonl")
@@ -127,5 +143,14 @@ def test_record_failures_are_errors_not_empty(tmp_path):
     bad.write_text("not json\n")
     with pytest.raises(RecordError, match="malformed"):
         read_submissions(bad)
+    good = tmp_path / "good.jsonl"
+    record = SubmissionRecord(good)
+    record.append(field_rows(DEMO_INVOICE))
+    record.close()
+    good.write_text(good.read_text().rstrip("\n"))  # cut mid-write
+    with pytest.raises(RecordError, match="mid-line"):
+        read_submissions(good)
+    record = SubmissionRecord(tmp_path / "x.jsonl")
     with pytest.raises(RecordError, match="do not match FIELD_NAMES"):
-        append_submission(tmp_path / "x.jsonl", [("Vendor", "x")])
+        record.append([("Vendor", "x")])
+    record.close()

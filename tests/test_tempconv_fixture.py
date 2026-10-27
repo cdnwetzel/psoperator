@@ -130,7 +130,17 @@ def test_v1_refuses_two_windows_even_if_one_result_survives():
     # A second TempConv frame whose result label was dropped from the snapshot.
     elements = _window(V1_PASS_NAME) + [_el(WINDOW_TITLE, "frame", (600, 100, 400, 250))]
     passed, reason = check_v1(elements)
-    assert not passed and "found 2" in reason
+    assert not passed and "only the" in reason
+
+
+def test_v1_refuses_any_other_window_on_the_display():
+    # An overlapping application could own a label inside the fixture's bounds.
+    elements = _window(V1_PASS_NAME) + [
+        _el("Other App", "frame", (90, 90, 500, 300)),
+        _el(RESULT_PREFIX, "label", (110, 220, 300, 20)),
+    ]
+    passed, reason = check_v1(elements)
+    assert not passed and "Other App" in reason
 
 
 def test_v1_ignores_result_text_outside_the_window_and_from_ocr():
@@ -140,7 +150,7 @@ def test_v1_ignores_result_text_outside_the_window_and_from_ocr():
     ]
     passed, _ = check_v1(elements)
     assert not passed
-    # And a matching label elsewhere does not break a correct run.
+    # And a stray matching label outside the window does not break a correct run.
     elements = _window(V1_PASS_NAME) + [_el(V1_PASS_NAME, "label", (700, 700, 200, 20))]
     assert check_v1(elements)[0]
 

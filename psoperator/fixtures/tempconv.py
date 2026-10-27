@@ -113,17 +113,29 @@ def _scoped_result(elements: Sequence[_Element]) -> tuple[str | None, str]:
 
     - a snapshot at the element cap may have been truncated, so it cannot show
       that a window or result is the only one;
-    - exactly one accessibility frame titled :data:`WINDOW_TITLE`;
+    - the display holds exactly one accessibility frame, titled
+      :data:`WINDOW_TITLE`;
     - exactly one accessibility result label inside that frame.
 
     OCR text and labels outside the frame are never read as the result.
+
+    Known limit: a snapshot records neither whether the accessibility walk
+    finished nor which window owns each element. A walk cut short below the
+    element cap, or a node dropped for lacking bounds, can hide a second window
+    or the fixture's own label. Until snapshots carry traversal completeness and
+    window ancestry (R-301/R-303), a pass is trusted only on a display that the
+    run controls, as ``docs/reference-workflow.md`` requires.
     """
     if len(elements) >= MAX_SNAPSHOT_ELEMENTS:
         return None, "snapshot may be truncated; uniqueness cannot be established"
     a11y = [e for e in elements if e.source == "a11y"]
-    frames = [e for e in a11y if e.control_type == "frame" and e.label == WINDOW_TITLE]
-    if len(frames) != 1:
-        return None, f"expected one {WINDOW_TITLE!r} window, found {len(frames)}"
+    frames = [e for e in a11y if e.control_type == "frame"]
+    if [f.label for f in frames] != [WINDOW_TITLE]:
+        # The fixture's display is dedicated to it: any other window, or a
+        # second fixture, could own a label that bbox containment would
+        # attribute to this one.
+        titles = sorted(f.label for f in frames)
+        return None, f"expected only the {WINDOW_TITLE!r} window on the display, found {titles}"
     results = [
         e
         for e in a11y

@@ -36,11 +36,22 @@ loop that passes v1 and fails v2 has only proven the trivial case.
   run, pass or fail.
 - **Pass is decided by the loop from attested evidence**, never from the
   planner's `done`. A `done` without passing evidence is a failure.
-- **Evidence must be scoped and complete.** The checker reads only
-  accessibility elements, requires exactly one fixture window by title, and
-  reads only elements inside that window. A snapshot at the element cap
-  (`MAX_SNAPSHOT_ELEMENTS`) may have been truncated, so it can never establish
-  that a window or result is the only one; it fails.
+- **The display is dedicated to the fixture.** The checker reads only
+  accessibility elements, requires the display's only window to be the fixture
+  window, and reads only elements inside it. Any other window fails the check,
+  because an overlapping application could own a label inside the fixture's
+  bounds. (In the live probe the fixture's frame was the only frame the
+  snapshot carried.) A snapshot at the element cap (`MAX_SNAPSHOT_ELEMENTS`)
+  may have been truncated, so it can never establish that a window or result
+  is the only one; it fails.
+- **Known limit, and a prerequisite for trusting a pass.** A snapshot records
+  neither whether the accessibility walk finished nor which window owns each
+  element. A walk cut short below the element cap, or a node dropped for
+  lacking bounds, can hide a second window or the fixture's own label, so a
+  wrong run could still pass. Until snapshots carry traversal completeness and
+  window ancestry (R-301/R-303), a pass is trusted only on a display the run
+  controls: launched fresh, holding nothing but the fixture. This is a signed
+  snapshot schema change, so it is tracked there rather than patched here.
 
 ## v1 — temperature converter
 
@@ -114,8 +125,13 @@ With `--record PATH`, each Submit appends one JSON line to `PATH`, holding the
 field values the widgets held at that moment (`append_submission`). The file
 must not exist when the fixture starts; it is created empty, so a run's record
 holds only that run's submissions. A failed write stops the fixture with exit
-code 3, and `read_submissions` raises on a missing or malformed record. An
-unrecorded Submit can therefore never be read as "no Submit".
+code 3, and the fixture writes nothing else first, so a broken console
+cannot skip the record. The fixture holds the file it created open for the
+whole run and refuses to write if the path no longer names that file.
+`read_submissions` raises on a missing or malformed record and on an
+unterminated last line. The record is read only after the fixture has exited,
+and only if it exited 0. An unrecorded or half-written Submit can therefore
+never be read as "no Submit".
 
 **Task**
 
@@ -181,6 +197,8 @@ exhausted. The v1 failure classes also apply, except its budget of 8.
    result name updates live after Convert.
 3. R-306 loop, driving v1 to pass, first in dry-run, then with real input under
    supervision. Dry-run checks admission and audit only; it cannot change the
-   result, so v1 can only pass with real input.
+   result, so v1 can only pass with real input. Until snapshots carry
+   traversal completeness and window ancestry, a v1 pass holds only on the
+   dedicated display described above.
 4. Entry text in the snapshot (R-303), then v2 phase A.
 5. An approval path with an attested, bound preview, then v2 phase B.

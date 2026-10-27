@@ -84,49 +84,67 @@ DEMO_INVOICE = Invoice(
 # commit did or did not happen. The record is one JSON line per Submit, holding
 # the field values as the widgets held them at that moment. A run starts by
 # creating the file empty and exclusively, so an earlier run's submissions can
-# never be counted as this run's.
+# never be counted as this run's. The fixture keeps that one open file for the
+# whole run and refuses to write if the path no longer names it, so a removed
+# or replaced record cannot silently split or mix runs.
 
 
 class RecordError(RuntimeError):
     """The submission record cannot be trusted; the run's outcome is unknown."""
 
 
-def start_record(path: Path) -> None:
-    """Create an empty record for a fresh run, refusing one that already exists."""
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as exc:
-        raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
-    except OSError as exc:
-        raise RecordError(f"cannot create record {path}: {exc}") from exc
-    os.close(fd)
+class SubmissionRecord:
+    """The run's record: created exclusively, held open, appended in place."""
 
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o600)
+        except FileExistsError as exc:
+            raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
+        except OSError as exc:
+            raise RecordError(f"cannot create record {path}: {exc}") from exc
+        st = os.fstat(self._fd)
+        self._identity = (st.st_dev, st.st_ino)
 
-def append_submission(path: Path, rows: list[tuple[str, str]]) -> None:
-    """Record one Submit with the field values the widgets held."""
-    names = tuple(name for name, _ in rows)
-    if names != FIELD_NAMES:
-        raise RecordError(f"submission rows {names} do not match FIELD_NAMES {FIELD_NAMES}")
-    line = json.dumps({"fields": dict(rows)}) + "\n"
-    try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError as exc:
-        raise RecordError(f"cannot append to record {path}: {exc}") from exc
+    def append(self, rows: list[tuple[str, str]]) -> None:
+        """Record one Submit, durably, or raise."""
+        names = tuple(name for name, _ in rows)
+        if names != FIELD_NAMES:
+            raise RecordError(f"submission rows {names} do not match FIELD_NAMES {FIELD_NAMES}")
+        try:
+            st = os.stat(self.path)
+        except OSError as exc:
+            raise RecordError(f"record {self.path} is gone: {exc}") from exc
+        if (st.st_dev, st.st_ino) != self._identity:
+            raise RecordError(f"record {self.path} was replaced during the run")
+        data = (json.dumps({"fields": dict(rows)}) + "\n").encode("utf-8")
+        try:
+            written = os.write(self._fd, data)
+            if written != len(data):
+                raise RecordError(f"short write to record {self.path}")
+            os.fsync(self._fd)
+        except OSError as exc:
+            raise RecordError(f"cannot append to record {self.path}: {exc}") from exc
+
+    def close(self) -> None:
+        os.close(self._fd)
 
 
 def read_submissions(path: Path) -> list[dict[str, str]]:
     """Every recorded submission's fields, in order.
 
-    A missing or malformed record raises: "no submission" must be read from an
-    intact empty record, never inferred from one that failed.
+    A missing or malformed record raises, and so does an unterminated last
+    line: "no submission" must be read from an intact empty record, never
+    inferred from one that failed or is mid-write. Read it only after the
+    fixture has exited, and only if it exited 0; exit 3 means a write failed.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise RecordError(f"cannot read record {path}: {exc}") from exc
+    if text and not text.endswith("\n"):
+        raise RecordError(f"record {path} ends mid-line; a write did not complete")
     out: list[dict[str, str]] = []
     for n, line in enumerate(text.splitlines(), 1):
         try:

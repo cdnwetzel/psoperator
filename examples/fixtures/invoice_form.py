@@ -36,9 +36,8 @@ from psoperator.fixtures.invoice import (  # noqa: E402
     WINDOW_TITLE,
     Invoice,
     RecordError,
-    append_submission,
+    SubmissionRecord,
     field_rows,
-    start_record,
 )
 
 
@@ -52,7 +51,11 @@ def _invoice_from_args(args: argparse.Namespace) -> Invoice:
     )
 
 
-def build_window(invoice: Invoice, record: Path | None = None, failed: list[str] | None = None):
+def build_window(
+    invoice: Invoice,
+    record: SubmissionRecord | None = None,
+    failed: list[str] | None = None,
+):
     """Build (but do not run) the GTK window. Imports gi lazily so this module
     stays importable — and --check runnable — without a GUI toolkit present."""
     import gi
@@ -83,21 +86,30 @@ def build_window(invoice: Invoice, record: Path | None = None, failed: list[str]
     submit = Gtk.Button(label=SUBMIT_NAME)
     submit.get_accessible().set_name(SUBMIT_NAME)
 
+    def _say(message: str, stream=None) -> None:
+        # Diagnostics only: a broken stdout/stderr must never stop recording
+        # or the failure path.
+        try:
+            print(message, file=stream or sys.stdout, flush=True)
+        except (OSError, ValueError):
+            pass
+
     def _on_submit(_btn):
         # A visible, inert commit — the fixture never acts on its own; the
-        # governed executor replays approved input against it.
-        print(f"[fixture] {SUBMIT_NAME} pressed for {WINDOW_TITLE}", flush=True)
-        if record is None:
-            return
-        try:
-            append_submission(record, [(name, e.get_text()) for name, e in entries])
-        except RecordError as exc:
-            # An unrecorded Submit must not look like no Submit: stop, and let
-            # main() exit nonzero so the run's outcome reads as unknown.
-            print(f"[fixture] RECORD FAILED: {exc}", file=sys.stderr, flush=True)
-            if failed is not None:
-                failed.append(str(exc))
-            Gtk.main_quit()
+        # governed executor replays approved input against it. Record first,
+        # then set the failure state, and only then print.
+        if record is not None:
+            try:
+                record.append([(name, e.get_text()) for name, e in entries])
+            except RecordError as exc:
+                # An unrecorded Submit must not look like no Submit: stop, and
+                # let main() exit 3 so the run's outcome reads as unknown.
+                if failed is not None:
+                    failed.append(str(exc))
+                Gtk.main_quit()
+                _say(f"[fixture] RECORD FAILED: {exc}", sys.stderr)
+                return
+        _say(f"[fixture] {SUBMIT_NAME} pressed for {WINDOW_TITLE}")
 
     submit.connect("clicked", _on_submit)
     grid.attach(submit, 0, len(field_rows(invoice)), 2, 1)
@@ -137,15 +149,20 @@ def main(argv: list[str] | None = None) -> int:
     from gi.repository import Gtk
 
     failed: list[str] = []
+    record = None
     if args.record is not None:
         try:
-            start_record(args.record)
+            record = SubmissionRecord(args.record)
         except RecordError as exc:
             print(f"[fixture] {exc}", file=sys.stderr)
             return 3
-    win = build_window(invoice, args.record, failed)
+    win = build_window(invoice, record, failed)
     win.show_all()
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        if record is not None:
+            record.close()
     return 3 if failed else 0
 
 
