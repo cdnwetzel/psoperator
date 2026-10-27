@@ -1,4 +1,4 @@
-# CodeRabbit (coderabbit.ai) — the PRIMARY, blocking AI review.
+# CodeRabbit (coderabbit.ai) — a welcome AI review, not required; see CONTRIBUTING.md.
 # Requires the GitHub App (github.com/apps/coderabbitai) installed on this repo.
 language: "en-US"
 
@@ -13,10 +13,10 @@ reviews:
     # per hour, spent per push, and `auto_incremental_review` defaults to true —
     # so a 3-4 push fix loop burns a whole hour's budget on one PR. We hit exactly
     # that wall. Turning it off means the status check reflects the review of the
-    # OPENING commit, so it is ONLY safe paired with the mandatory step in
-    # CONTRIBUTING.md: comment `@coderabbitai full review` on the final state
-    # BEFORE merging (a small final push may otherwise be silently skipped as
-    # "similar to previous changes").
+    # OPENING commit only. The required review of the final head is the
+    # independent agent review in CONTRIBUTING.md; for a CodeRabbit review of the
+    # final state, comment `@coderabbitai full review` (a small final push may
+    # otherwise be silently skipped as "similar to previous changes").
     auto_incremental_review: false
     # Backstop if incremental review is ever re-enabled: pause after 2 reviewed
     # commits rather than the default, so a long fix loop cannot silently drain

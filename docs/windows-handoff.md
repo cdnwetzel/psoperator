@@ -26,20 +26,61 @@ the screen (the probe, the observer, the executor) is run over SSH.
 
 ## 2. Desktop session setup (as the user who will run the agent)
 
-1. GitHub access over SSH for the repository owner's account, with one
-   `git push` updating both remotes, as on the other machines.
-2. Clone this repository, then enable the privacy hooks:
+Use **Git Bash** for every command below; it is the shell Claude Code runs on
+Windows. Paths use forward slashes.
+
+1. **`python3` must be real Python.** The privacy hooks call `python3`, which a
+   Windows Python install does not provide; the Microsoft Store alias of that
+   name is a stub. Turn off the `python3` app execution alias in Windows
+   settings, then add a shim:
+
+   ```
+   mkdir -p ~/bin
+   printf '#!/bin/sh\nexec py -3.12 "$@"\n' > ~/bin/python3
+   chmod +x ~/bin/python3
+   python3 --version     # must print Python 3.12.x
+   ```
+
+   Git Bash puts `~/bin` on `PATH` when it exists; open a new shell if not.
+2. **GitHub over SSH.** Generate a key, and have the operator add it to the
+   repository owner's account. The operator also supplies the private mirror's
+   remote. One `git push` must update both:
+
+   ```
+   git remote set-url --add --push origin git@github.com:<owner>/psoperator.git
+   git remote set-url --add --push origin <private-mirror-remote>
+   git remote -v         # one fetch URL, two push URLs
+   ```
+3. **Clone and enable the privacy hooks:** `git clone`, then
    `git config core.hooksPath scripts/hooks`.
-3. Copy the private denylist to `%USERPROFILE%\.config\pxx\public-denylist` by
-   hand. It never goes through git. Without it, the hooks cannot catch real
-   hostnames.
-4. Create a virtual environment and install:
-   `py -3.12 -m venv .venv`, then
-   `.venv\Scripts\python -m pip install -e ".[dev,a11y,perception]"`.
-5. Baseline: `.venv\Scripts\python -m pytest -q` passes, and
-   `ruff check psoperator tests scripts` is clean.
-6. Sign in to Claude Code, `gh auth login`, and the Codex CLI.
-7. Open the target application on this desktop, with a synthetic test record
+4. **Private denylist.** Copy it from the operator to
+   `~/.config/pxx/public-denylist` by hand. It never goes through git. Without it
+   the hooks catch private addresses but not real names.
+5. **Prove the hooks fire** (negative controls; neither commit may succeed):
+
+   ```
+   git commit --allow-empty -m "probe $(printf '10.%s.%s.%s' 0 1 5)"   # private address
+   git commit --allow-empty -m "probe $(grep -v -e '^#' -e '^$' ~/.config/pxx/public-denylist | head -1)"
+   ```
+
+   Both must be refused. If either succeeds, stop; the privacy gate is not
+   working on this machine.
+6. **Install:**
+
+   ```
+   py -3.12 -m venv .venv
+   .venv/Scripts/python -m pip install -e ".[dev,a11y,perception]"
+   ```
+7. **Baseline.** Run `.venv/Scripts/python -m pytest -q` and
+   `.venv/Scripts/python -m ruff check psoperator tests scripts`. The suite has
+   only run on Linux and macOS until now, so expect some failures. In
+   particular, `AttestationGate` refuses persistent gate state on Windows by
+   design: it cannot verify file ownership there
+   (`psoperator/gatekeeper/attestation_gate.py`, `_read_state_bytes`). Record
+   the failing tests as the Windows baseline in the probe PR. Do not weaken a
+   refusal to make a test pass; porting those checks is part of roadmap D-01.
+8. Sign in to Claude Code, `gh auth login`, and the Codex CLI.
+9. Open the target application on this desktop, with a synthetic test record
    loaded.
 
 ## 3. Working rules
@@ -49,10 +90,15 @@ These are the operator's standing rules. They apply to every change.
 - **Updates:** short and frequent.
 - **Nothing private, anywhere** (`CONTRIBUTING.md`). Do not name the
   application, its records, the endpoint, or the organisation in files, commit
-  messages, PR titles or PR bodies. Scan commit messages and PR text with
-  `scripts/privacy_scan.py text --name X < file`, and run a negative control
-  that must fail (a fake private address). Empty output is not proof of a
-  clean scan.
+  messages, PR titles or PR bodies. The hooks scan commits; scan PR text
+  yourself before posting it:
+
+  ```
+  python3 scripts/privacy_scan.py --denylist ~/.config/pxx/public-denylist text --name pr < pr.txt
+  ```
+
+  Exit 0 is clean and 1 is a finding. Empty output is not proof: check the
+  exit code, and keep the step 5 controls passing.
 - **Never commit probe output** or screenshots. They hold on-screen text. Keep
   them outside the clone.
 - **Every gate needs a negative control:** a test that fails when the
