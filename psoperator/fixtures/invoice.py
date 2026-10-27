@@ -104,7 +104,11 @@ class SubmissionRecord:
             raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
         except (OSError, ValueError) as exc:
             raise RecordError(f"cannot create record {path!r}: {exc}") from exc
-        st = os.fstat(self._fd)
+        try:
+            st = os.fstat(self._fd)
+        except OSError as exc:
+            os.close(self._fd)
+            raise RecordError(f"cannot create record {path!r}: {exc}") from exc
         self._identity = (st.st_dev, st.st_ino)
 
     def append(self, rows: list[tuple[str, str]]) -> None:
@@ -128,7 +132,10 @@ class SubmissionRecord:
             raise RecordError(f"cannot append to record {self.path}: {exc}") from exc
 
     def close(self) -> None:
-        os.close(self._fd)
+        try:
+            os.close(self._fd)
+        except OSError as exc:
+            raise RecordError(f"cannot close record {self.path!r}: {exc}") from exc
 
 
 def read_submissions(path: Path) -> list[dict[str, str]]:

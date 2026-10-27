@@ -226,3 +226,57 @@ def test_creating_a_record_at_an_invalid_path_is_an_error(tmp_path, name):
 
     with pytest.raises(RecordError, match="cannot create"):
         SubmissionRecord(tmp_path / name)
+
+
+def test_a_failed_fstat_closes_the_record_and_raises(tmp_path, monkeypatch):
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    closed: list[int] = []
+    real_close = inv_mod.os.close
+
+    def _fstat(_fd):
+        raise OSError("injected")
+
+    def _close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(inv_mod.os, "fstat", _fstat)
+    monkeypatch.setattr(inv_mod.os, "close", _close)
+    with pytest.raises(RecordError, match="cannot create"):
+        SubmissionRecord(tmp_path / "run.jsonl")
+    assert len(closed) == 1
+
+
+def test_a_failed_close_raises(tmp_path, monkeypatch):
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    fd = record._fd
+    real_close = inv_mod.os.close
+
+    def _close(_fd):
+        raise OSError("injected")
+
+    monkeypatch.setattr(inv_mod.os, "close", _close)
+    try:
+        with pytest.raises(RecordError, match="cannot close"):
+            record.close()
+    finally:
+        monkeypatch.undo()
+        real_close(fd)
+
+
+def test_appending_after_the_path_became_invalid_raises(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    record.path = tmp_path / "bad\x00.jsonl"
+    try:
+        with pytest.raises(RecordError):
+            record.append(field_rows(DEMO_INVOICE))
+    finally:
+        record.path = tmp_path / "run.jsonl"
+        record.close()
