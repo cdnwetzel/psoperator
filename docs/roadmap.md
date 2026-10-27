@@ -234,11 +234,18 @@ UI Automation or an existing Windows application.
   gatekeeper over IPC, holding no key, secret or executor.
 - Extend the element planner with history and the supported action subset;
   an empty snapshot returns `fail` without a model call.
-- The gatekeeper service rejects any input action not bound to an attested
-  element (today `type`/`key` and coordinate-only clicks pass unbound).
+- The loop stops on every non-executed outcome, including service and
+  transport failures, never resubmits, and exits `0` only on `done`.
+- The gatekeeper service enforces the contract itself: it rejects unsupported
+  kinds (`scroll`/`drag`) and any input action not bound to an attested element
+  (today `type`/`key` and coordinate-only clicks pass unbound). It resolves
+  keyboard targets and has the executor verify focus, which depends on R-301.
 - Make Linux perception produce elements (RapidOCR installed, AT-SPI reaching
   the observer's display) and report the backends in observer health.
-- R-304's reference workflow runs through this loop, not the in-process one.
+- dx switches only after the planner runs under its own account, per R-205.
+- Acceptance: a simulated multi-step test in CI, live dry-run admission on the
+  work node, then R-304's reference workflow with supervised real input and
+  R-302 postconditions, through this loop rather than the in-process one.
 
 ### Exit criteria
 

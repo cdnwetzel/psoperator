@@ -41,18 +41,27 @@ To be precise about what is bypassed: `run_agent.py` still applies the
 gatekeeper's freshness, grounding, risk, approval and audit checks, but it does
 so in-process. What it skips is the service boundary: R-203 envelope
 authentication, the separate executor, and the IPC secret. Switching dx to
-`run_isolated.py` would restore that boundary, but every GUI task would then end
-after one step in a failure. That is safer, but useless.
+`run_isolated.py` would restore that boundary but lose multi-step orchestration:
+a one-action task can still succeed, but anything longer cannot. Its exit code
+is also unreliable, because the script checks only the response's `ok` field,
+which is true for denied and failed decisions as well.
 
 ## Why this is a redesign, not a flag
 
 The service path's planner contract is deliberate: an untrusted planner never
-receives pixels or a capture backend, and an element-bound action lets the
-gatekeeper check its target against the attested snapshot (`REJECTED_TARGET`).
-That is the property v0.2 bought. Bolting `AgentLoop` onto the services by
-passing screenshots to the planner would reopen what R-201/R-203 closed. So the
-loop has to be rebuilt around the element contract, and perception has to supply
+receives pixels or a capture backend. It works from attested element metadata,
+so the gatekeeper can check an element-bound action's target against the signed
+snapshot (`REJECTED_TARGET`). `AgentLoop` is built the other way round: a vision
+model reads the screenshot and answers with coordinates. Running it over the
+services would mean giving pixels to the planner and accepting coordinate
+actions it chose itself. Envelope authentication would still hold, but the
+gatekeeper could no longer bind an action to an observed element. So the loop
+has to be rebuilt around the element contract, and perception has to supply
 enough elements for that contract to work.
+
+v0.2 itself still permits coordinate fallback (an unbound click inside the
+frame) and unbound `type`/`key`. Making element binding mandatory on the
+service path is a tightening that R-306 adds, not a property v0.2 already has.
 
 ## Proposed fix
 
@@ -61,40 +70,54 @@ enough elements for that contract to work.
 1. **A service loop** (`psoperator/runtime/service_loop.py`, CLI
    `psoperator run --task … --max-steps N`):
    - Each step calls `ObserverClient.observe()`, then `planner.plan(snapshot, goal, history)`, then sends the request to the gatekeeper over IPC.
-   - It stops on `done`/`fail`, on `KILL_SWITCHED`, `REJECTED_STALE` or `REJECTED_TARGET`, at the step budget, or when the observer is unavailable.
-   - It also stops on `DENIED` and `EXECUTION_FAILED`, and never retries. A denied action must not come back without a new approval (R-302), and after a failed execution the screen state is unknown until a fresh observation. A planner error (for example an invented id) ends the step as `fail`, never as a traceback.
-   - The loop holds no key, no secret and no executor. Real versus dry-run input is decided only by the executor service's backend, never by a client flag.
-   - The exit code and a one-line summary per step mirror `run_agent.py`, so callers can swap with no output parsing changes.
+   - It stops on every outcome other than an executed or dry-run step:
+     - `done`, `fail`, `KILL_SWITCHED`, `REJECTED_STALE`, `REJECTED_TARGET`, `DENIED` and `EXECUTION_FAILED`;
+     - an envelope rejection (`ok: false` with no decision);
+     - a gatekeeper connection failure, timeout or malformed response;
+     - the observer being unavailable;
+     - the step budget running out.
+   - It never retries or resubmits:
+     - A denied action must not come back without a new approval (R-302).
+     - After a failed execution, or a request whose response was lost, the outcome is unknown until a fresh observation, so the run ends and says so.
+     - `ok: true` means only that a decision was made; the loop reads `decision.kind`.
+     - A planner error (for example an invented id) ends the run as `fail`, never as a traceback.
+   - Exit code `0` is reserved for `done`. `fail` and every other stop above exit nonzero, with a distinct code for "outcome unknown". This deliberately differs from `run_agent.py`, which treats `fail` as finished and exits `0`. The one-line-per-step summary stays compatible.
+   - The kill switch blocks the *next* step: the gatekeeper checks it before approval and execution. It does not interrupt input already being sent. Acceptance tests that guarantee and nothing stronger.
 2. **An element planner that can finish a task.** Give `LocalElementPlanner`:
    - the step history;
-   - the action subset R-306 supports: `click`, `double_click` and `right_click` on an element; `type` and `key` into an element; and `wait`, `done` and `fail`. `scroll` and `drag` stay out of scope until a reference workflow needs them;
+   - the action subset R-306 supports: `click`, `double_click` and `right_click` on an element; `type` and `key` into an element; and `wait`, `done` and `fail`;
    - a bounded element list;
-   - a guard that returns `fail` without calling the model when the snapshot has no elements.
+   - a guard that returns `fail` without calling the model when the snapshot has no elements, and a check that a coordinate-only answer is refused, not only an invented id.
 
    It keeps the rule that it never invents an id.
-3. **Element binding is mandatory across the boundary.** Today the
-   `GatekeeperService` passes `type` and `key` actions to `request_action` with
-   no `target_element_id`, and accepts a coordinate-only click if it lands
-   inside the frame. A service-mode planner could therefore send input to
-   whatever has focus, bypassing the attested element. The gatekeeper service
-   must reject any input action (`click`, `double_click`, `right_click`, `type`,
-   `key`) that does not name an element in the attested snapshot. For `type`
-   and `key`, the executor must focus that element before sending input. The
-   in-process loop keeps its current rules.
+3. **The gatekeeper service enforces the contract; the prompt does not.** A
+   compromised client can send anything the parser accepts, so every rule is
+   checked in `GatekeeperService`, with adversarial tests:
+   - **Allowed kinds only.** It rejects `scroll` and `drag` outright until a reference workflow needs them. The parser, gatekeeper and executors all accept them today.
+   - **Element binding is mandatory.** It rejects any input action (`click`, `double_click`, `right_click`, `type`, `key`) that does not name an element in the attested snapshot. Today `type` and `key` pass with no target, and a coordinate-only click passes if it lands inside the frame.
+   - **Trusted target resolution and focus.** For clicks the gatekeeper already resolves coordinates from the attested element. For `type` and `key` it must resolve the target as well and send it to the executor over the authenticated hop. Today `RemoteExecutor` forwards the action without its snapshot, and keyboard execution ignores the element id. The executor focuses that target and refuses if focus cannot be established or has moved. Only accessibility elements can take keyboard input; OCR text boxes are not focusable controls. This depends on R-301's window and focus checks.
+   - **Attested metadata drives risk.** Caller-supplied context may add risk keywords but never replace the attested label. A probe showed an element-bound "Delete" click dropping from `denied` to `dry-run` when the client sent `target_text: "safe"`. That is fixed separately on the current gatekeeper, ahead of R-306.
+
+   The in-process loop keeps its current rules.
 4. **Perception that sees something on Linux** (part of R-303):
    - Install `psoperator[perception]` (RapidOCR) where the observer runs.
    - Confirm that AT-SPI sees applications started on the observer's display. They must share its D-Bus session and have accessibility enabled.
    - Add an observer health field for the a11y and OCR backends in use, so "0 elements because nothing is wired" can be told apart from "0 elements because the screen is empty".
-5. **dx switches last.** `launch_gui_task` calls `psoperator run` instead of the
-   example script. It drops its `real_input` flag for this path and reports the
-   executor's mode instead. The in-process path stays available only as an
-   explicit dev mode.
+5. **dx switches last.** `launch_gui_task` calls `psoperator run` instead of the example script, after these prerequisites:
+   - The planner runs under its own account, per `docs/deployment-isolation.md`. Separate service processes are not enough on their own: "holds no key" must mean "cannot read one".
+   - A check from the planner account shows it cannot read the attestation key or the IPC secret, and cannot reach the executor directly.
+   - dx drops its `real_input` flag for this path and reports the executor's mode instead.
+   - The in-process path stays available only as an explicit dev mode.
 
-**Acceptance:**
-- On the work node, a task against a test application opened on the virtual display completes through the three services in dry-run, with audit evidence for every step.
-- `psoperator kill` stops it mid-task.
-- A `type` or `key` with no element, or a coordinate-only click, is rejected at the gatekeeper service.
-- An empty snapshot ends the run with a clear `fail`, not a hang.
+**Acceptance**, in three layers. Dry-run leaves the application unchanged, so it cannot prove a task finished:
+- **Simulated (CI):** a deterministic multi-step task runs through the three services, with a fake executor that updates a fake application, so later observations reflect earlier actions. It covers:
+  - `done` exits `0`;
+  - an empty snapshot exits nonzero with `fail`, without calling the model;
+  - each stop condition above exits nonzero and never resubmits;
+  - the kill switch blocks the next step;
+  - unbound input, `scroll`/`drag`, and caller context that tries to lower risk are all rejected or held at the attested tier.
+- **Live dry-run (work node):** a task against a test application on the virtual display is admitted step by step through the services, with audit evidence for every step.
+- **Supervised real input (R-304):** the reference workflow completes with real input under supervision, with R-302 postcondition evidence.
 
 **Considered and not chosen:**
 - Sending pixels to a vision planner across the boundary, with the gatekeeper mapping coordinates to elements. It may be needed later for applications with no accessibility tree and no readable text, and would get its own design note.
@@ -104,5 +127,5 @@ enough elements for that contract to work.
 
 dx GUI runs keep using the in-process loop. Since 2026-10-27 that loop shares the
 deployed kill-switch path, so `psoperator kill` stops it. It keeps the
-in-process gatekeeper checks but not the v0.2 service boundary. Switching the executor service to real input does nothing
-for dx until step 4 lands.
+in-process gatekeeper checks but not the v0.2 service boundary. Switching the
+executor service to real input does nothing for dx until step 5 lands.
