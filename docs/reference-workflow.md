@@ -1,8 +1,11 @@
 # Reference workflow (R-304) and pilot platform decision
 
 **Status:** v1 fixture and checker built, fixture probed live; v1 and v2 tasks
-specified; nothing runs them yet. Recorded 2026-10-27. This is also the
-pilot-platform decision note that v0.3 requires before implementation.
+specified; nothing runs them yet. Recorded 2026-10-27.
+
+**Superseded as the pilot decision** by `docs/pilot-charter.md` (also
+2026-10-27): the pilot is a Windows desktop application. These Linux tasks stay
+as the bench that proves the safety loop before it runs on Windows.
 
 ## Pilot platform
 

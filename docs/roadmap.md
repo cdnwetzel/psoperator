@@ -174,9 +174,11 @@ pilot platform with correct focus, execution, and post-action evidence.
 **Depends on:** `v0.2`
 
 The pilot OS and target application must be recorded in a decision note before
-implementation. macOS is a practical candidate for the current development
-host; Windows may be selected instead if the first target workflow depends on
-UI Automation or an existing Windows application.
+implementation. **Decided 2026-10-27 in `docs/pilot-charter.md`:** a Windows
+desktop application with no API, on a non-production test endpoint with
+synthetic records (UI Automation). The Linux work node stays as a test bench
+for the safety loop. Web/Electron and Linux applications come later; macOS is
+not planned.
 
 ### Deliverables
 
@@ -201,8 +203,8 @@ UI Automation or an existing Windows application.
 
 #### R-303 — Production-quality provider for the pilot OS
 
-- Finish the selected accessibility provider: macOS AX, Windows UIA validation,
-  or Linux AT-SPI.
+- Finish the selected accessibility provider: Windows UIA validation for the
+  pilot (`docs/pilot-charter.md`); AT-SPI for the Linux bench.
 - Select and benchmark the corresponding capture path.
 - Validate OCR fallback and coordinate translation across scaling, multiple
   displays, and negative monitor origins where applicable.
@@ -216,8 +218,10 @@ entry).
 **Status (2026-10-27, PR #7):** specs and the v1 fixture and checker are
 merged; the fixture's controls were probed live on the work node. Nothing runs
 the workflow yet. Stage 1 hardening (R-306 service contract and planner
-guards) is done. Next: the Stage 2 go/no-go probe on v1 (planner model on a
-live snapshot; result name updates after Convert).
+guards) is done. **Superseded as the pilot by `docs/pilot-charter.md`:** the
+GTK tasks stay as the Linux bench for the loop. The pilot's reference task is
+on the Windows application, after the read-only UI Automation probe
+(`docs/windows-handoff.md`).
 
 - Select a narrow workflow with deterministic success criteria.
 - Provide a fixture or test application where practical.
@@ -438,11 +442,11 @@ the milestone that needs it arrives.
 
 #### D-01 — Second-platform attestation port (Windows/UIA capture path)
 
-The pilot proves the governance loop on one platform (Linux/AT-SPI, per R-303
-and the R-304 reference workflow). A later breadth demo on Windows — where UIA
-exposes the richest accessibility tree — is expected in the post-pilot era. When
-it is scheduled, its capture path must re-prove the frame-hash contract *before*
-the demo, not after:
+**Promoted into the pilot (2026-10-27, `docs/pilot-charter.md`):** the pilot
+is now a Windows application, so this port is on the critical path, after the
+read-only UI Automation probe. The Windows test endpoint is the host the
+prerequisite below asked for. The capture path must re-prove the frame-hash
+contract *before* the reference task, not after:
 
 - Wire the independent observer, the attestation key path, and the `doctor`
   probe on the Windows capture pipeline (screen grab -> PNG -> RGB), so it
@@ -451,14 +455,14 @@ the demo, not after:
 - Add the cross-repo frame-hash contract test (the dx.observer reader against
   the Windows writer) alongside the existing Linux/macOS one, so a change to the
   Windows capture pipeline fails in CI rather than at an operator's desk.
-- Only then build the UIA reference workflow.
+- Only then build the UIA reference task.
 
 Rationale: a breadth demo whose observer is unwired would undercut the
 governance pitch at exactly the moment a skeptical audience hears it. Attestation
 leads; coverage follows — the same sequencing rule that puts the proven loop
 before any hardware purchase (infrastructure follows a proven loop, never
-precedes it). Prerequisite: a Windows host in the fleet, of which there is none
-today — every wired headless capture host is Linux or macOS.
+precedes it). Prerequisite: a Windows host. Met 2026-10-27 by the pilot's
+test endpoint.
 
 ## 11. Cross-cutting definition of done
 
