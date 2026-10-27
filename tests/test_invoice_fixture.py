@@ -10,6 +10,8 @@ preview lists. The GTK UI itself is validated live on the AT-SPI host.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from psoperator.fixtures.invoice import (
@@ -158,27 +160,35 @@ def test_record_failures_are_errors_not_empty(tmp_path):
 
 @pytest.mark.parametrize("fault", ["short_write", "write_error", "fsync_error"])
 def test_record_write_faults_raise(tmp_path, monkeypatch, fault):
-    import os
-
     import psoperator.fixtures.invoice as inv_mod
     from psoperator.fixtures.invoice import RecordError, SubmissionRecord
 
+    def _raise(*_args):
+        raise OSError("injected")
+
     record = SubmissionRecord(tmp_path / "run.jsonl")
-    if fault == "short_write":
-        monkeypatch.setattr(inv_mod.os, "write", lambda fd, data: len(data) - 1)
-    elif fault == "write_error":
+    try:
+        if fault == "short_write":
+            monkeypatch.setattr(inv_mod.os, "write", lambda fd, data: len(data) - 1)
+        elif fault == "write_error":
+            monkeypatch.setattr(inv_mod.os, "write", _raise)
+        else:
+            monkeypatch.setattr(inv_mod.os, "fsync", _raise)
+        with pytest.raises(RecordError):
+            record.append(field_rows(DEMO_INVOICE))
+    finally:
+        monkeypatch.undo()
+        record.close()
 
-        def _fail(*_a):
-            raise OSError("disk full")
 
-        monkeypatch.setattr(inv_mod.os, "write", _fail)
-    else:
+def test_record_with_invalid_utf8_or_non_string_values_is_an_error(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
 
-        def _fail(*_a):
-            raise OSError("io error")
-
-        monkeypatch.setattr(inv_mod.os, "fsync", _fail)
-    with pytest.raises(RecordError):
-        record.append(field_rows(DEMO_INVOICE))
-    monkeypatch.undo()
-    os.close(record._fd)
+    bad = tmp_path / "bad.jsonl"
+    bad.write_bytes(b'{"fields": {"Vendor": "\xff"}}\n')
+    with pytest.raises(RecordError, match="not valid UTF-8"):
+        read_submissions(bad)
+    values = {"Vendor": "a", "Invoice Number": 7, "Date": "c", "Invoice Total": None}
+    bad.write_text(json.dumps({"fields": values}) + "\n")
+    with pytest.raises(RecordError, match="non-text value"):
+        read_submissions(bad)

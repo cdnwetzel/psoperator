@@ -143,6 +143,8 @@ def read_submissions(path: Path) -> list[dict[str, str]]:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise RecordError(f"cannot read record {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise RecordError(f"record {path} is not valid UTF-8") from exc
     if text and not text.endswith("\n"):
         raise RecordError(f"record {path} ends mid-line; a write did not complete")
     out: list[dict[str, str]] = []
@@ -153,5 +155,7 @@ def read_submissions(path: Path) -> list[dict[str, str]]:
             raise RecordError(f"record {path} line {n} is malformed") from exc
         if not isinstance(fields, dict) or tuple(fields) != FIELD_NAMES:
             raise RecordError(f"record {path} line {n} does not name FIELD_NAMES")
+        if not all(isinstance(value, str) for value in fields.values()):
+            raise RecordError(f"record {path} line {n} has a non-text value")
         out.append(fields)
     return out
