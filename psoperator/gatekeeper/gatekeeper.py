@@ -144,6 +144,7 @@ class Gatekeeper:
             )
 
         # 3. element binding — reject invented/stale ids, then resolve coordinates
+        risk_contexts: tuple[ActionContext, ...] = ()
         if action.target_element_id:
             element = snapshot.find(action.target_element_id) if snapshot is not None else None
             if element is None:
@@ -161,10 +162,19 @@ class Gatekeeper:
                 ActionKind.DOUBLE_CLICK,
             ):
                 action = replace(action, x=element.center[0], y=element.center[1])
+            # Caller context must not lower the tier of an attested element: a
+            # planner calling "Delete" "safe" does not make it safe. Policy
+            # patterns are regexes (anchored, multi-word), so merging texts can
+            # break a match; score each reading on its own and keep the highest.
+            attested = ActionContext(target_text=element.label)
             if context is None:
-                context = ActionContext(target_text=element.label)
-            elif not context.target_text:
-                context = replace(context, target_text=element.label)
+                context = attested
+            else:
+                risk_contexts = (
+                    replace(context, target_text=element.label),
+                    attested,
+                    context,
+                )
 
         # Coordinate fallbacks must still land inside the observed frame.
         screen_size = getattr(getattr(frame, "image", None), "size", None)
@@ -189,7 +199,10 @@ class Gatekeeper:
             )
 
         # 4. risk — deterministic and never reads model reasoning
-        risk = classify(action, context, self._policy)
+        risk = max(
+            (classify(action, c, self._policy) for c in risk_contexts or (context,)),
+            key=lambda assessment: assessment.tier,
+        )
 
         # 5. terminal actions never touch devices
         if action.kind is ActionKind.DONE:
