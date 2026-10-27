@@ -4,6 +4,27 @@ For the operator and for a coding agent (Claude Code) working on the Windows
 test endpoint described in `docs/pilot-charter.md`. An agent there starts with
 only this repository, so everything it must know is here or linked from here.
 
+## 0. Start here (agent on the first endpoint)
+
+Read `docs/pilot-charter.md`, then this file, then `CONTRIBUTING.md`. State on
+the first endpoint as of 2026-10-27:
+
+| step | state |
+| --- | --- |
+| §1 machine tools: Git, Python 3.13.17, GitHub CLI, Node | done, verified |
+| §2.1 `python3` shim pinned to the all-users 3.13.17 | done, verified |
+| §2.2 GitHub SSH keys for both accounts | done, both authenticate |
+| §2.3 clone, hooks, identity, both push remotes | **check** (the operator may have done it to pull this file) |
+| §2.4 private denylist | **ask the operator**; it never comes through git |
+| §2.5 hook negative controls | next |
+| §2.6 install, §2.7 baseline | next |
+| §2.8 agents | Claude Code done (you are it); Codex installed; check sign-ins |
+| §4 read-only probe | after the baseline |
+
+Pick up at the first row not marked done: check it, report in one short
+message, and continue. Stop and ask before anything that is not in this file,
+and before any input to the application.
+
 ## 1. Machine setup (from the management host, over SSH)
 
 The endpoint runs OpenSSH Server, with key-based access for an admin account.
@@ -12,7 +33,7 @@ Install machine-wide, and check each version afterwards:
 | tool | why | check |
 | --- | --- | --- |
 | Git for Windows | clone, hooks; its Git Bash is the shell Claude Code uses | `git --version` |
-| Python 3.13 | PSOperator; 3.13.17 is the last 3.13 release with a Windows installer, and CI tests 3.11–3.13 | `py -3.13 --version` |
+| Python 3.13 | PSOperator; 3.13.17 is the last 3.13 release with a Windows installer, and CI tests 3.11–3.13 | `& "C:\Program Files\Python313\python.exe" --version` |
 | Node.js LTS | the Codex CLI | `node --version` |
 | GitHub CLI | PRs and CI checks | `gh --version` |
 
@@ -29,23 +50,31 @@ the screen (the probe, the observer, the executor) is run over SSH.
 ## 2. Desktop session setup (as the user who will run the agent)
 
 Use **Git Bash** for every command below; it is the shell Claude Code runs on
-Windows. Paths use forward slashes.
+Windows. Paths use forward slashes. An MSYS2 shell (prompt `UCRT64` or
+`MSYS`) shares the same home directory but has its own `git` and `PATH`
+order, so do not mix it in.
 
-1. **`python3` must be real Python.** The privacy hooks call `python3`, which a
-   Windows Python install does not provide; the Microsoft Store alias of that
-   name is a stub. Turn off the `python3` app execution alias in Windows
-   settings, then add a shim:
+1. **`python3` must be the verified Python.** The privacy hooks call
+   `python3`, which a Windows Python install does not provide. The names that
+   may already answer to it are traps: the Microsoft Store alias is a stub,
+   and the Python Install Manager's `python3` (and `py -3.13`) can pick a
+   different, per-user 3.13 than the one installed in §1. Turn off the
+   `python3` app execution alias in Windows settings, then pin a shim to the
+   all-users interpreter by its path:
 
    ```
    mkdir -p ~/bin
-   printf '#!/bin/sh\nexec py -3.13 "$@"\n' > ~/bin/python3
+   printf '#!/bin/sh\nexec "/c/Program Files/Python313/python.exe" "$@"\n' > ~/bin/python3
    chmod +x ~/bin/python3
-   python3 --version     # must print Python 3.13.x
+   hash -r; which python3; python3 --version   # ~/bin/python3, then Python 3.13.17
    ```
 
    Git Bash puts `~/bin` on `PATH` when it exists; open a new shell if not.
-2. **GitHub over SSH.** Generate a key, and have the operator add it to the
-   repository owner's account.
+2. **GitHub over SSH, both accounts.** Generate one key for the repository
+   owner's account and one for the private mirror's account, map each in
+   `~/.ssh/config` (the mirror under its own `Host` alias), and have the
+   operator add each public key to its account. `ssh -T` to each host must
+   greet the right account.
 3. **Clone, enable the privacy hooks, and add both push remotes.** The
    operator supplies the owner and the private mirror's remote; replace every
    `<...>` placeholder before running. One `git push` must update both:
@@ -78,7 +107,8 @@ Windows. Paths use forward slashes.
 6. **Install:**
 
    ```
-   py -3.13 -m venv .venv
+   python3 -m venv .venv          # the pinned interpreter, not py -3.13
+   .venv/Scripts/python --version  # Python 3.13.17
    .venv/Scripts/python -m pip install -e ".[dev,a11y,perception]"
    ```
 7. **Baseline.** Run `.venv/Scripts/python -m pytest -q` and
