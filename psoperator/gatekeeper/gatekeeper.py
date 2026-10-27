@@ -51,6 +51,55 @@ class DecisionKind(str, Enum):
     FAILED = "failed"
 
 
+_SERVICE_REFUSED_KINDS = frozenset({ActionKind.SCROLL, ActionKind.DRAG})
+_INPUT_KINDS = frozenset(
+    {
+        ActionKind.CLICK,
+        ActionKind.RIGHT_CLICK,
+        ActionKind.DOUBLE_CLICK,
+        ActionKind.TYPE,
+        ActionKind.KEY,
+    }
+)
+_KEYBOARD_KINDS = frozenset({ActionKind.TYPE, ActionKind.KEY})
+
+
+def _service_contract_refusal(
+    action: Action, snapshot: PerceptionSnapshot | None
+) -> tuple[DecisionKind, str] | None:
+    """Why an action falls outside the service contract, or None if it is inside.
+
+    The planner client is untrusted, so the contract is checked here rather
+    than relied on from its prompt: no scroll or drag, no coordinate-only or
+    unbound input, and keyboard input only into an accessibility element (an
+    OCR text box is not a focusable control).
+    """
+    if action.kind in _SERVICE_REFUSED_KINDS:
+        return (
+            DecisionKind.DENIED,
+            f"{action.kind.value} is not allowed across the service boundary",
+        )
+    if action.kind not in _INPUT_KINDS:
+        return None
+    if not action.target_element_id:
+        return (
+            DecisionKind.REJECTED_TARGET,
+            "input must name an element of the attested snapshot",
+        )
+    element = snapshot.find(action.target_element_id) if snapshot is not None else None
+    if element is None:
+        return (
+            DecisionKind.REJECTED_TARGET,
+            "target_element_id is absent from the current perception snapshot",
+        )
+    if action.kind in _KEYBOARD_KINDS and element.source != "a11y":
+        return (
+            DecisionKind.REJECTED_TARGET,
+            f"keyboard input needs an accessibility element, not {element.source}",
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class Decision:
     kind: DecisionKind
@@ -113,6 +162,8 @@ class Gatekeeper:
         frame: Frame,
         context: ActionContext | None = None,
         snapshot: PerceptionSnapshot | None = None,
+        *,
+        require_bound_input: bool = False,
     ) -> Decision:
         # 1. global stop — fail closed, including terminal/no-op actions
         if killswitch.is_engaged(self._config.kill_switch_path):
@@ -142,6 +193,15 @@ class Gatekeeper:
                 f"snapshot_match={not snapshot_mismatch}",
                 frame=frame,
             )
+
+        # 2b. service contract (R-306): across the service boundary only the
+        # supported kinds are admitted, and all input names an attested element.
+        if require_bound_input:
+            refusal = _service_contract_refusal(action, snapshot)
+            if refusal is not None:
+                return self._record(
+                    refusal[0], action, None, approver="gatekeeper", reason=refusal[1], frame=frame
+                )
 
         # 3. element binding — reject invented/stale ids, then resolve coordinates
         risk_contexts: tuple[ActionContext, ...] = ()

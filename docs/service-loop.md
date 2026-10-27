@@ -21,8 +21,8 @@ The obvious fix, pointing dx at `examples/run_isolated.py`, does not work today:
    steps.
 2. **The planner has nothing to aim at.** Across the boundary the planner sees
    only the snapshot's element list, never pixels. `LocalElementPlanner` checks
-   any element id it is given against that list, but today it also accepts a
-   coordinate-only answer; mandatory binding is part of the proposal below. On
+   any element id it is given against that list, but until Stage 1 it also
+   accepted a coordinate-only answer; mandatory binding is part of the proposal below. On
    the work node the observer
    reported a 1920×1080 frame with **0 elements**:
    - the virtual display had no application open, so AT-SPI had nothing to report;
@@ -66,6 +66,8 @@ it to work.
 v0.2 itself still permits coordinate fallback (an unbound click inside the
 frame) and unbound `type`/`key`. Making element binding mandatory on the
 service path is a tightening that R-306 adds, not a property v0.2 already has.
+Stage 1 (2026-10-27) added it to the gatekeeper service; the in-process
+gatekeeper keeps the v0.2 rules.
 
 ## Proposed fix
 
@@ -91,14 +93,14 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
    - the step history;
    - the action subset R-306 supports: `click`, `double_click` and `right_click` on an element; `type` and `key` into an element; and `wait`, `done` and `fail`;
    - a bounded element list;
-   - a guard that returns `fail` without calling the model when the snapshot has no elements, and a check that a coordinate-only answer is refused, not only an invented id.
+   - a guard that returns `fail` without calling the model when the snapshot has no elements, and a check that a coordinate-only answer is refused, not only an invented id. Done in Stage 1, which also refuses `scroll` and `drag` answers.
 
    It keeps the rule that it never invents an id.
 3. **The gatekeeper service enforces the contract; the prompt does not.** A
    compromised client can send anything the parser accepts, so every rule is
    checked in `GatekeeperService`, with adversarial tests:
-   - **Allowed kinds only.** It rejects `scroll` and `drag` outright until a reference workflow needs them. The parser, gatekeeper and executors all accept them today.
-   - **Element binding is mandatory.** It rejects any input action (`click`, `double_click`, `right_click`, `type`, `key`) that does not name an element in the attested snapshot. Today `type` and `key` pass with no target, and a coordinate-only click passes if it lands inside the frame.
+   - **Allowed kinds only.** It rejects `scroll` and `drag` outright until a reference workflow needs them. Done in Stage 1. The parser and the in-process gatekeeper and executors still accept them.
+   - **Element binding is mandatory.** It rejects any input action (`click`, `double_click`, `right_click`, `type`, `key`) that does not name an element in the attested snapshot. Done in Stage 1, which also refuses `type` and `key` into an element that is not an accessibility element. The in-process gatekeeper still lets `type` and `key` pass with no target, and a coordinate-only click pass if it lands inside the frame.
    - **Trusted target resolution and focus.** For clicks the gatekeeper already resolves coordinates from the attested element. For `type` and `key` it must resolve the target as well and send it to the executor over the authenticated hop. Today `RemoteExecutor` forwards the action without its snapshot, and keyboard execution ignores the element id. The executor focuses that target and refuses if focus cannot be established or has moved. Only accessibility elements can take keyboard input; OCR text boxes are not focusable controls. This depends on R-301's window and focus checks.
    - **Attested metadata drives risk.** Caller-supplied context may add risk keywords but never replace the attested label. A probe showed an element-bound "Delete" click dropping from `denied` to `dry-run` when the client sent `target_text: "safe"`. The current gatekeeper still has this bug. Its fix is a separate change (psoperator PR #6), to land ahead of R-306: each reading of the context is scored on its own and the highest tier is kept.
 

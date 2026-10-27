@@ -215,8 +215,9 @@ entry).
 
 **Status (2026-10-27, PR #7):** specs and the v1 fixture and checker are
 merged; the fixture's controls were probed live on the work node. Nothing runs
-the workflow yet. Next: Stage 1 hardening, then the Stage 2 go/no-go probe on
-v1 (planner model on a live snapshot; result name updates after Convert).
+the workflow yet. Stage 1 hardening (R-306 service contract and planner
+guards) is done. Next: the Stage 2 go/no-go probe on v1 (planner model on a
+live snapshot; result name updates after Convert).
 
 - Select a narrow workflow with deterministic success criteria.
 - Provide a fixture or test application where practical.
@@ -246,8 +247,9 @@ v1 (planner model on a live snapshot; result name updates after Convert).
 - The loop stops on every outcome other than executed or dry-run, including service and
   transport failures, never resubmits, and exits `0` only on `done`.
 - The gatekeeper service enforces the contract itself: it rejects unsupported
-  kinds (`scroll`/`drag`) and any input action not bound to an attested element
-  (today `type`/`key` and coordinate-only clicks pass unbound). It resolves
+  kinds (`scroll`/`drag`) and any input action not bound to an attested element,
+  and keyboard input into anything but an accessibility element (done
+  2026-10-27, Stage 1; the planner guards above are also done). It resolves
   keyboard targets and has the executor verify focus, which depends on R-301.
 - Make Linux perception produce elements (RapidOCR installed, AT-SPI reaching
   the observer's display) and report the backends in observer health.
