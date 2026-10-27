@@ -182,3 +182,72 @@ def test_in_process_gatekeeper_keeps_its_looser_rules(tmp_path):
     )
     assert decision.kind is DecisionKind.EXECUTED
     assert len(executor.actions) == 1
+
+
+def _submit_raw(service, envelope, raw_action):
+    return service.handle(
+        {"action": raw_action, "attestation": envelope.model_dump(mode="json"), "context": {}}
+    )
+
+
+def test_bound_click_lands_on_the_element_not_the_supplied_coordinates(tmp_path):
+    service, envelope, executor, _, _, _, _ = _setup(tmp_path)
+    response = _submit(
+        service, envelope, Action(ActionKind.CLICK, 1, target_element_id="a11y-1", x=99, y=79)
+    )
+    assert response["decision"]["kind"] == DecisionKind.EXECUTED.value
+    assert (executor.actions[0].x, executor.actions[0].y) == (25, 30)  # bbox centre
+
+
+@pytest.mark.parametrize(
+    "raw_action",
+    [
+        {"action": "SCROLL", "x": 5, "y": 5, "amount": -3, "frame_id": 1},
+        {"action": "Click", "x": 25, "y": 30, "frame_id": 1},
+        {"action": "click", "x": 25, "y": 30, "button": "right", "frame_id": 1},
+    ],
+)
+def test_kind_spelling_and_button_do_not_bypass_the_contract(tmp_path, raw_action):
+    service, envelope, executor, _, _, _, _ = _setup(tmp_path)
+    response = _submit_raw(service, envelope, raw_action)
+    assert response["ok"] and not response["decision"]["approved"]
+    assert not executor.actions
+
+
+def test_call_syntax_is_held_to_the_same_contract(tmp_path):
+    # Call syntax carries no frame_id, and the service never supplies one, so
+    # `click(25, 30)` is an invalid request before any decision is made.
+    service, envelope, executor, _, _, _, config = _setup(tmp_path)
+    response = _submit_raw(service, envelope, "click(25, 30)")
+    assert not response["ok"] and "invalid request" in response["error"]
+    assert not executor.actions
+
+
+@pytest.mark.parametrize(
+    "raw_action",
+    [
+        {"action": "wait", "seconds": 0.5, "x": 25, "y": 30, "frame_id": 1},
+        {"action": "done", "x": 25, "y": 30, "text": "212", "frame_id": 1},
+    ],
+)
+def test_extra_fields_on_wait_and_done_send_no_input(tmp_path, raw_action):
+    service, envelope, executor, _, _, _, _ = _setup(tmp_path)
+    _submit_raw(service, envelope, raw_action)
+    assert all(a.kind is ActionKind.WAIT for a in executor.actions)
+
+
+def test_kill_switch_is_reported_before_the_contract(tmp_path):
+    from psoperator.gatekeeper import killswitch
+
+    service, envelope, executor, _, _, _, config = _setup(tmp_path)
+    killswitch.engage(config.kill_switch_path)
+    response = _submit(service, envelope, Action(ActionKind.SCROLL, 1, x=5, y=5, amount=-3))
+    assert response["decision"]["kind"] == DecisionKind.KILL_SWITCHED.value
+    assert not executor.actions
+
+
+def test_staleness_is_reported_before_the_contract(tmp_path):
+    service, envelope, executor, _, _, _, _ = _setup(tmp_path)
+    response = _submit(service, envelope, Action(ActionKind.SCROLL, 0, x=5, y=5, amount=-3))
+    assert response["decision"]["kind"] == DecisionKind.REJECTED_STALE.value
+    assert not executor.actions
