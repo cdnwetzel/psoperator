@@ -12,14 +12,16 @@ Install machine-wide, and check each version afterwards:
 | tool | why | check |
 | --- | --- | --- |
 | Git for Windows | clone, hooks; its Git Bash is the shell Claude Code uses | `git --version` |
-| Python 3.12 | PSOperator | `py -3.12 --version` |
-| Node.js LTS | Claude Code and the Codex CLI | `node --version` |
+| Python 3.13 | PSOperator; 3.13.17 is the last 3.13 release with a Windows installer, and CI tests 3.11–3.13 | `py -3.13 --version` |
+| Node.js LTS | the Codex CLI | `node --version` |
 | GitHub CLI | PRs and CI checks | `gh --version` |
-| Claude Code | the coding agent | `claude --version` |
-| Codex CLI | independent review | `codex --version` |
 
-`winget` is unreliable inside SSH sessions; use the vendors' installers where
-it fails.
+Use the vendors' installers, each checked against the vendor's published
+checksum or signature, and its Authenticode signer, before it runs. `winget` is
+unreliable inside SSH sessions.
+
+Claude Code and the Codex CLI install **per user**, in the desktop session
+(section 2): an install over SSH would land in the admin account's profile.
 
 An SSH session cannot see the logged-in desktop. Nothing that reads or drives
 the screen (the probe, the observer, the executor) is run over SSH.
@@ -36,9 +38,9 @@ Windows. Paths use forward slashes.
 
    ```
    mkdir -p ~/bin
-   printf '#!/bin/sh\nexec py -3.12 "$@"\n' > ~/bin/python3
+   printf '#!/bin/sh\nexec py -3.13 "$@"\n' > ~/bin/python3
    chmod +x ~/bin/python3
-   python3 --version     # must print Python 3.12.x
+   python3 --version     # must print Python 3.13.x
    ```
 
    Git Bash puts `~/bin` on `PATH` when it exists; open a new shell if not.
@@ -76,7 +78,7 @@ Windows. Paths use forward slashes.
 6. **Install:**
 
    ```
-   py -3.12 -m venv .venv
+   py -3.13 -m venv .venv
    .venv/Scripts/python -m pip install -e ".[dev,a11y,perception]"
    ```
 7. **Baseline.** Run `.venv/Scripts/python -m pytest -q` and
@@ -87,7 +89,11 @@ Windows. Paths use forward slashes.
    (`psoperator/gatekeeper/attestation_gate.py`, `_read_state_bytes`). Record
    the failing tests as the Windows baseline in the probe PR. Do not weaken a
    refusal to make a test pass; porting those checks is part of roadmap D-01.
-8. Sign in to Claude Code, `gh auth login`, and the Codex CLI.
+8. **Agents.** Install Claude Code with its native Windows installer, which
+   runs in **PowerShell** (the one exception to Git Bash above), and the Codex
+   CLI with `npm install -g @openai/codex`. Open a new Git Bash, check
+   `claude --version` and `codex --version`, sign in to both, and run
+   `gh auth login`.
 9. Open the target application on this desktop, with a synthetic test record
    loaded.
 
