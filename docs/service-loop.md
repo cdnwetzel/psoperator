@@ -73,11 +73,11 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
 
 1. **A service loop** (`psoperator/runtime/service_loop.py`, CLI
    `psoperator run --task … --max-steps N`):
-   - Each step calls `ObserverClient.observe()`, then `planner.plan(snapshot, goal, history)`, then sends the request to the gatekeeper over IPC.
+   - Each step calls `ObserverClient.observe()`, then `planner.plan(snapshot, goal, history)` (the `Planner` protocol and both planners gain a `history` parameter; today they take only `snapshot` and `goal`), then sends the request to the gatekeeper over IPC.
    - It stops on every outcome other than an executed or dry-run step:
      - `done`, `fail`, `KILL_SWITCHED`, `REJECTED_STALE`, `REJECTED_TARGET`, `DENIED` and `EXECUTION_FAILED`;
      - an envelope rejection (`ok: false` with no decision);
-     - a gatekeeper connection failure, timeout or malformed response;
+     - a gatekeeper connection failure, timeout or malformed response. A failure before the request is sent cannot have executed anything and is a plain error. A timeout, a lost response or a malformed response after it is sent may follow an execution, so it is reported as "outcome unknown";
      - the observer being unavailable;
      - the step budget running out.
    - It never retries or resubmits:
@@ -86,7 +86,7 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
      - `ok: true` means only that a decision was made; the loop reads `decision.kind`.
      - A planner error (for example an invented id) ends the run as `fail`, never as a traceback.
    - Exit code `0` is reserved for `done`. `fail` and every other stop above exit nonzero, with a distinct code for "outcome unknown". This deliberately differs from `run_agent.py`, which treats `fail` as finished and exits `0`. The one-line-per-step summary stays compatible.
-   - The kill switch blocks the *next* step: the gatekeeper checks it before approval and execution. It does not interrupt input already being sent. Acceptance tests that guarantee and nothing stronger.
+   - The kill switch blocks the *next* step: the gatekeeper checks it before approval and execution. It does not interrupt input already being sent. The acceptance tests check that the kill switch blocks the next step, and the docs and tests must not claim it interrupts input in progress.
 2. **An element planner that can finish a task.** Give `LocalElementPlanner`:
    - the step history;
    - the action subset R-306 supports: `click`, `double_click` and `right_click` on an element; `type` and `key` into an element; and `wait`, `done` and `fail`;
@@ -100,7 +100,7 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
    - **Allowed kinds only.** It rejects `scroll` and `drag` outright until a reference workflow needs them. The parser, gatekeeper and executors all accept them today.
    - **Element binding is mandatory.** It rejects any input action (`click`, `double_click`, `right_click`, `type`, `key`) that does not name an element in the attested snapshot. Today `type` and `key` pass with no target, and a coordinate-only click passes if it lands inside the frame.
    - **Trusted target resolution and focus.** For clicks the gatekeeper already resolves coordinates from the attested element. For `type` and `key` it must resolve the target as well and send it to the executor over the authenticated hop. Today `RemoteExecutor` forwards the action without its snapshot, and keyboard execution ignores the element id. The executor focuses that target and refuses if focus cannot be established or has moved. Only accessibility elements can take keyboard input; OCR text boxes are not focusable controls. This depends on R-301's window and focus checks.
-   - **Attested metadata drives risk.** Caller-supplied context may add risk keywords but never replace the attested label. A probe showed an element-bound "Delete" click dropping from `denied` to `dry-run` when the client sent `target_text: "safe"`. That is fixed separately on the current gatekeeper, ahead of R-306.
+   - **Attested metadata drives risk.** Caller-supplied context may add risk keywords but never replace the attested label. A probe showed an element-bound "Delete" click dropping from `denied` to `dry-run` when the client sent `target_text: "safe"`. The current gatekeeper still has this bug. Its fix is a separate change (psoperator PR #6), to land ahead of R-306: each reading of the context is scored on its own and the highest tier is kept.
 
    The in-process loop keeps its current rules.
 4. **Perception that sees something on Linux** (part of R-303):
@@ -109,7 +109,7 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
    - Add an observer health field for the a11y and OCR backends in use, so "0 elements because nothing is wired" can be told apart from "0 elements because the screen is empty".
 5. **dx switches last.** `launch_gui_task` calls `psoperator run` instead of the example script, after these prerequisites:
    - The planner runs under its own account, per `docs/deployment-isolation.md`. Separate service processes are not enough on their own: "holds no key" must mean "cannot read one".
-   - A check from the planner account shows it cannot read the attestation key or the IPC secret, and cannot reach the executor directly.
+   - A check from the planner account shows it cannot read the attestation key or the IPC secret, and cannot authenticate to or drive the executor directly. It can still connect to the executor's loopback port; what it lacks is the IPC secret.
    - dx drops its `real_input` flag for this path and reports the executor's mode instead.
    - The in-process path stays available only as an explicit dev mode.
 
