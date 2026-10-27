@@ -43,16 +43,19 @@ Windows. Paths use forward slashes.
 
    Git Bash puts `~/bin` on `PATH` when it exists; open a new shell if not.
 2. **GitHub over SSH.** Generate a key, and have the operator add it to the
-   repository owner's account. The operator also supplies the private mirror's
-   remote. One `git push` must update both:
+   repository owner's account.
+3. **Clone, enable the privacy hooks, and add both push remotes.** The
+   operator supplies the owner and the private mirror's remote; replace both
+   `<...>` placeholders before running. One `git push` must update both:
 
    ```
+   git clone git@github.com:<owner>/psoperator.git
+   cd psoperator
+   git config core.hooksPath scripts/hooks
    git remote set-url --add --push origin git@github.com:<owner>/psoperator.git
    git remote set-url --add --push origin <private-mirror-remote>
    git remote -v         # one fetch URL, two push URLs
    ```
-3. **Clone and enable the privacy hooks:** `git clone`, then
-   `git config core.hooksPath scripts/hooks`.
 4. **Private denylist.** Copy it from the operator to
    `~/.config/pxx/public-denylist` by hand. It never goes through git. Without it
    the hooks catch private addresses but not real names.
