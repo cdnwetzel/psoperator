@@ -14,7 +14,7 @@ the first endpoint as of 2026-10-27:
 | §1 machine tools: Git, Python 3.13.17, GitHub CLI, Node | done, verified |
 | §2.1 `python3` shim pinned to the all-users 3.13.17 | done, verified |
 | §2.2 GitHub SSH keys for both accounts | done, both authenticate |
-| §2.3 clone, hooks, identity, both push remotes | **check** (the operator may have done it to pull this file) |
+| §2.3 clone, hooks, identity, both push remotes | **check**, including the line-ending check |
 | §2.4 private denylist | **ask the operator**; it never comes through git |
 | §2.5 hook negative controls | next |
 | §2.6 install, §2.7 baseline | next |
@@ -88,6 +88,18 @@ order, so do not mix it in.
    git remote set-url --add --push origin git@github.com:<owner>/psoperator.git
    git remote set-url --add --push origin <private-mirror-remote>
    git remote -v         # one fetch URL, two push URLs
+   git ls-files --eol scripts/hooks   # both lines must show w/lf
+   ```
+
+   `.gitattributes` keeps every text file LF. A clone made before it existed may
+   hold CRLF copies, which break the hooks (they run without the denylist).
+   If `git ls-files --eol` shows `w/crlf`, re-check out the hooks and look
+   again:
+
+   ```
+   rm scripts/hooks/pre-commit scripts/hooks/commit-msg
+   git checkout -- scripts/hooks
+   git ls-files --eol scripts/hooks
    ```
 4. **Private denylist.** Copy it from the operator to
    `~/.config/pxx/public-denylist` by hand. It never goes through git. Without it
@@ -158,6 +170,29 @@ These are the operator's standing rules. They apply to every change.
 - **No input to the application** until the operator approves that step.
 - **Keep docs current:** the charter and roadmap change in the same PR as the
   state they describe.
+- **Scope.** Work only in this repository, on this endpoint. Do not change the
+  monitoring system, other endpoints, or other repositories. Stop and ask the
+  operator before anything this file does not cover.
+
+### The PR loop, as commands
+
+Run from the clone in Git Bash. `H` is the head you just pushed.
+
+```
+H=$(git rev-parse HEAD)
+# CI on that exact commit (wait until every check has completed, then read them)
+until [ "$(gh api repos/<owner>/psoperator/commits/$H/check-runs -q '[.check_runs[]|select(.name!="CodeRabbit" and .status!="completed")]|length')" = 0 ]; do sleep 15; done
+gh api repos/<owner>/psoperator/commits/$H/check-runs -q '.check_runs[]|"\(.name) \(.conclusion)"'
+
+# independent review of the final head; stdin must be closed or it waits forever
+codex exec -s read-only "Review 'git diff main...$H' ... Reply Blocking / Non-blocking / Nit, then APPROVE or CHANGES NEEDED." < /dev/null
+
+# merge only after APPROVE and all checks success on $H, pinned to $H
+gh pr merge <n> --squash --delete-branch --match-head-commit "$H"
+git checkout main && git pull   # then read CI on the new main head the same way
+```
+
+An empty or missing reviewer reply is not an approval; run it again.
 
 ## 4. Step 1: read-only UI Automation probe
 
