@@ -224,6 +224,29 @@ UI Automation or an existing Windows application.
 - Keep hardware validation out of the release gate when Topology B is not part
   of the selected pilot.
 
+#### R-306 — Service-mode agent loop
+
+- The only multi-step agent (`examples/run_agent.py`) runs its own in-process
+  gatekeeper and executor, so real tasks skip the v0.2 boundary; the separated
+  path (`examples/run_isolated.py`) submits a single action. Found on the first
+  deployment of the three services; see `docs/service-loop.md`.
+- Add a loop and `psoperator run` CLI that drives observer → element planner →
+  gatekeeper over IPC, holding no key, secret or executor.
+- Extend the element planner with history and the supported action subset;
+  an empty snapshot returns `fail` without a model call.
+- The loop stops on every outcome other than executed or dry-run, including service and
+  transport failures, never resubmits, and exits `0` only on `done`.
+- The gatekeeper service enforces the contract itself: it rejects unsupported
+  kinds (`scroll`/`drag`) and any input action not bound to an attested element
+  (today `type`/`key` and coordinate-only clicks pass unbound). It resolves
+  keyboard targets and has the executor verify focus, which depends on R-301.
+- Make Linux perception produce elements (RapidOCR installed, AT-SPI reaching
+  the observer's display) and report the backends in observer health.
+- dx switches only after the planner runs under its own account, per R-205.
+- Acceptance: a simulated multi-step test in CI, live dry-run admission on the
+  work node, then R-304's reference workflow with supervised real input and
+  R-302 postconditions, through this loop rather than the in-process one.
+
 ### Exit criteria
 
 `v0.3` is complete when:
