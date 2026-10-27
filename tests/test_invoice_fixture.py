@@ -181,14 +181,48 @@ def test_record_write_faults_raise(tmp_path, monkeypatch, fault):
         record.close()
 
 
-def test_record_with_invalid_utf8_or_non_string_values_is_an_error(tmp_path):
+def test_record_with_invalid_utf8_is_an_error(tmp_path):
     from psoperator.fixtures.invoice import RecordError, read_submissions
 
     bad = tmp_path / "bad.jsonl"
     bad.write_bytes(b'{"fields": {"Vendor": "\xff"}}\n')
     with pytest.raises(RecordError, match="not valid UTF-8"):
         read_submissions(bad)
-    values = {"Vendor": "a", "Invoice Number": 7, "Date": "c", "Invoice Total": None}
-    bad.write_text(json.dumps({"fields": values}) + "\n")
+
+
+@pytest.mark.parametrize("value", [7, 1.5, None, True, ["x"], {"x": "y"}])
+@pytest.mark.parametrize("field", FIELD_NAMES)
+def test_record_with_a_non_text_value_is_an_error(tmp_path, field, value):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    fields = dict(field_rows(DEMO_INVOICE))
+    fields[field] = value
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"fields": fields}) + "\n")
     with pytest.raises(RecordError, match="non-text value"):
         read_submissions(bad)
+
+
+def test_record_nested_too_deep_is_an_error(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    bad = tmp_path / "deep.jsonl"
+    bad.write_text('{"fields": {"Vendor": ' + "[" * 100_000 + "]" * 100_000 + "}}\n")
+    with pytest.raises(RecordError, match="malformed"):
+        read_submissions(bad)
+
+
+@pytest.mark.parametrize("name", ["bad\x00.jsonl", "bad\ud800.jsonl"])
+def test_record_with_an_invalid_path_is_an_error(tmp_path, name):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    with pytest.raises(RecordError):
+        read_submissions(tmp_path / name)
+
+
+@pytest.mark.parametrize("name", ["bad\x00.jsonl", "bad\ud800.jsonl"])
+def test_creating_a_record_at_an_invalid_path_is_an_error(tmp_path, name):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    with pytest.raises(RecordError, match="cannot create"):
+        SubmissionRecord(tmp_path / name)

@@ -102,8 +102,8 @@ class SubmissionRecord:
             self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o600)
         except FileExistsError as exc:
             raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
-        except OSError as exc:
-            raise RecordError(f"cannot create record {path}: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            raise RecordError(f"cannot create record {path!r}: {exc}") from exc
         st = os.fstat(self._fd)
         self._identity = (st.st_dev, st.st_ino)
 
@@ -114,7 +114,7 @@ class SubmissionRecord:
             raise RecordError(f"submission rows {names} do not match FIELD_NAMES {FIELD_NAMES}")
         try:
             st = os.stat(self.path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise RecordError(f"record {self.path} is gone: {exc}") from exc
         if (st.st_dev, st.st_ino) != self._identity:
             raise RecordError(f"record {self.path} was replaced during the run")
@@ -141,17 +141,18 @@ def read_submissions(path: Path) -> list[dict[str, str]]:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise RecordError(f"cannot read record {path}: {exc}") from exc
     except UnicodeDecodeError as exc:
-        raise RecordError(f"record {path} is not valid UTF-8") from exc
+        raise RecordError(f"record {path!r} is not valid UTF-8") from exc
+    except (OSError, ValueError) as exc:
+        # ValueError covers paths the OS cannot take (NUL, unencodable names).
+        raise RecordError(f"cannot read record {path!r}: {exc}") from exc
     if text and not text.endswith("\n"):
         raise RecordError(f"record {path} ends mid-line; a write did not complete")
     out: list[dict[str, str]] = []
     for n, line in enumerate(text.splitlines(), 1):
         try:
             fields = json.loads(line)["fields"]
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, RecursionError) as exc:
             raise RecordError(f"record {path} line {n} is malformed") from exc
         if not isinstance(fields, dict) or tuple(fields) != FIELD_NAMES:
             raise RecordError(f"record {path} line {n} does not name FIELD_NAMES")
