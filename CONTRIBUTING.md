@@ -7,44 +7,37 @@ backed by human merge authority.
 
 ## Review model
 
-One AI reviewer (CodeRabbit, blocking) plus the human who merges. No second AI
-reviewer is configured, so do not read a green PR as two independent reviews.
-Verify every finding against the code before acting; the reviewer can be wrong.
+Every PR is reviewed by an AI agent **other than the one that wrote it**, plus
+the human who holds merge authority. Verify every finding against the code
+before acting; the reviewer can be wrong.
 
-### CodeRabbit — primary, blocking
+### The independent reviewer — required
 
-**CodeRabbit must pass before any PR is merged.** It is configured in
-`.coderabbit.yaml` with `auto_incremental_review: false` — it reviews a PR **once,
-on the opening commit, not on every push.**
+Any capable agent that did not write the change qualifies: for example the
+Codex CLI reviewing a change Claude wrote, or the reverse. Review the **final
+head** of the PR. A review of an earlier commit does not cover later pushes, so
+after fixes, the reviewer re-reviews the change since its last verdict.
 
-That is deliberate: CodeRabbit's limits are enforced **per developer per hour**,
-spent per push, so a 3–4 push fix loop otherwise burns a whole hour's budget on
-one PR (we hit exactly that wall). The trade-off is real — after the opening
-review the status check stays green while you push fixes, a gate passing on code
-it did not read.
+### CodeRabbit — welcome, not required
 
-> **Before merging, comment `@coderabbitai full review` on the PR and wait for
-> the review of the final state.** Use `full review`, not `review`: a small final
-> push is otherwise silently skipped as "similar to previous changes," leaving no
-> verdict at all. If nothing has been pushed since CodeRabbit's most recent
-> review, that review already covers the final state and no re-trigger is needed.
-
-**Note on substantial new modules:** a module assembled over several commits needs
-at least one `@coderabbitai full review` of the whole thing before merge.
-Incremental review only diffs each push, so it structurally never re-reads the
-assembled whole — real defects can hide in code that already passed increment-by-
-increment (this repo has seen exactly that).
+CodeRabbit is configured in `.coderabbit.yaml` with
+`auto_incremental_review: false`, so it reviews a PR once, on the opening
+commit. Its limits are enforced per developer per hour, and it is often
+rate-limited. When it does review, treat its findings like any other
+reviewer's. When it is rate-limited or skipped, the independent agent review
+stands in; do not hold a merge waiting for it. To have it review the final
+state, comment `@coderabbitai full review` (not `review`, which can silently
+skip a small final push).
 
 ### The merge bar
 
-A PR is mergeable when **no Major or Minor findings remain** from CodeRabbit
-(and internal review + tests are clean). Do **not** block a merge chasing an
-assertive reviewer to literally zero comments — on a substantial module it will
-almost always surface a couple of Trivial style/coverage/refactor nits on any
-diff, and chasing them burns rate-limited reviews for non-defects (the exact
-"over-flagging trains people to ignore reviewers" failure mode). Fold in the
-Trivial nits that are genuinely worthwhile; track or drop the rest. Major/Minor
-findings **do** block. Human authority owns the merge either way.
+A PR is mergeable when the independent reviewer approves the final head, no
+Major or Minor findings remain from any reviewer, and CI passes on that head.
+Do not block a merge chasing a reviewer to literally zero comments: fold in the
+Trivial nits that are worthwhile and track or drop the rest. The human with
+merge authority owns the merge; they may give standing approval to merge once
+those conditions hold. Merge pinned to the reviewed head, then confirm CI on
+`main`.
 
 ## Nothing private, anywhere
 
@@ -83,8 +76,8 @@ marked.
    bad case, not just passes on the good one.
 3. **Protected paths are the trusted control plane** (see the `protected_paths`
    list in `WORKFLOW.md`): the gatekeeper, services, common auth/ipc/schema, and
-   the boundary tests. Changes there need independent human review — never
-   self-approved or self-merged.
+   the boundary tests. Changes there need independent review by an agent that
+   did not write them, under the merge bar above — never self-approved.
 4. **Data-egress surfaces come only from operator config/env/CLI**, never a
    checked-in file. No secrets, organisation names, internal hostnames, or
    internal private-LAN addresses in tracked content. Example presets use

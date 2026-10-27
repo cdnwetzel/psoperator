@@ -1,17 +1,20 @@
-# Reference workflow (R-304) and pilot platform decision
+# Reference workflow (R-304): the Linux bench
 
 **Status:** v1 fixture and checker built, fixture probed live; v1 and v2 tasks
-specified; nothing runs them yet. Recorded 2026-10-27. This is also the
-pilot-platform decision note that v0.3 requires before implementation.
+specified; nothing runs them yet. Recorded 2026-10-27.
 
-## Pilot platform
+**Superseded as the pilot decision** by `docs/pilot-charter.md` (also
+2026-10-27): the pilot is a Windows desktop application. These Linux tasks stay
+as the bench that proves the safety loop before it runs on Windows.
+
+## Bench platform
 
 - **OS:** Linux, AT-SPI accessibility, on a work node's virtual X display (Xvfb
   `:99` with openbox), the same display the deployed observer service captures.
 - **Toolkit:** GTK 3, whose AT-SPI tree for these fixtures is complete and
   stable (probed live, below). The converter the violoop harness drove was
   Tkinter, which exposes no AT-SPI tree on Linux, so it had to be ported. Other
-  toolkits, including Electron applications, are out of scope for the pilot
+  toolkits, including Electron applications, are out of scope for the bench
   until one is probed the same way.
 - **Planner lane:** a small local text model (the work node has an 8 GB GPU).
   Stage 2's probe tests whether it is good enough before the loop is built.
