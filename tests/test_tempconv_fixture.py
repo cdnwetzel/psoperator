@@ -39,7 +39,6 @@ from psoperator.perception.a11y import AtSpiA11y
 from psoperator.perception.capture import Frame
 from psoperator.perception.ocr import NullOCR
 from psoperator.perception.snapshot import SnapshotBuilder
-from tests.test_a11y import COORD, FakeAcc, FakeExtents
 
 
 @pytest.mark.parametrize(
@@ -175,6 +174,8 @@ def test_baseline_requires_a_fresh_fixture():
 def _fixture_desktop(result: str):
     """A fake AT-SPI desktop shaped like the GTK fixture, with the roles and
     layout the live stack emitted for it on the work node (GTK 3.24)."""
+    from tests.test_a11y import FakeAcc, FakeExtents
+
     controls = [
         FakeAcc("text", VALUE_NAME, extents=FakeExtents(776, 438, 368, 34)),
         FakeAcc("radio button", C_TO_F_NAME, extents=FakeExtents(776, 480, 368, 21)),
@@ -190,6 +191,8 @@ def _fixture_desktop(result: str):
 
 
 def _snapshot(result: str):
+    from tests.test_a11y import COORD
+
     builder = SnapshotBuilder(
         a11y=AtSpiA11y(desktop=_fixture_desktop(result), coord_type=COORD), ocr=NullOCR()
     )
