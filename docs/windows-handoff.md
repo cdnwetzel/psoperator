@@ -70,8 +70,11 @@ order, so do not mix it in.
    ```
 
    Git Bash puts `~/bin` on `PATH` when it exists; open a new shell if not.
-2. **GitHub over SSH.** Generate a key, and have the operator add it to the
-   repository owner's account.
+2. **GitHub over SSH, both accounts.** Generate one key for the repository
+   owner's account and one for the private mirror's account, map each in
+   `~/.ssh/config` (the mirror under its own `Host` alias), and have the
+   operator add each public key to its account. `ssh -T` to each host must
+   greet the right account.
 3. **Clone, enable the privacy hooks, and add both push remotes.** The
    operator supplies the owner and the private mirror's remote; replace every
    `<...>` placeholder before running. One `git push` must update both:
