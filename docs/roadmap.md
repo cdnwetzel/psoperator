@@ -224,6 +224,19 @@ UI Automation or an existing Windows application.
 - Keep hardware validation out of the release gate when Topology B is not part
   of the selected pilot.
 
+#### R-306 — Service-mode agent loop
+
+- The only multi-step agent (`examples/run_agent.py`) runs its own in-process
+  gatekeeper and executor, so real tasks skip the v0.2 boundary; the separated
+  path (`examples/run_isolated.py`) submits a single action. Found on the first
+  deployment of the three services; see `docs/service-loop.md`.
+- Add a loop and `psoperator run` CLI that drives observer → element planner →
+  gatekeeper over IPC, holding no key, secret or executor.
+- Extend the element planner with history and the full action vocabulary.
+- Make Linux perception produce elements (RapidOCR installed, AT-SPI reaching
+  the observer's display) and report the backends in observer health.
+- R-304's reference workflow runs through this loop, not the in-process one.
+
 ### Exit criteria
 
 `v0.3` is complete when:
