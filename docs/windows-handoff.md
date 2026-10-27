@@ -45,13 +45,15 @@ Windows. Paths use forward slashes.
 2. **GitHub over SSH.** Generate a key, and have the operator add it to the
    repository owner's account.
 3. **Clone, enable the privacy hooks, and add both push remotes.** The
-   operator supplies the owner and the private mirror's remote; replace both
-   `<...>` placeholders before running. One `git push` must update both:
+   operator supplies the owner and the private mirror's remote; replace every
+   `<...>` placeholder before running. One `git push` must update both:
 
    ```
    git clone git@github.com:<owner>/psoperator.git
    cd psoperator
    git config core.hooksPath scripts/hooks
+   git config user.name "<name>"
+   git config user.email "<email>"
    git remote set-url --add --push origin git@github.com:<owner>/psoperator.git
    git remote set-url --add --push origin <private-mirror-remote>
    git remote -v         # one fetch URL, two push URLs
@@ -66,8 +68,11 @@ Windows. Paths use forward slashes.
    git commit --allow-empty -m "probe $(grep -v -e '^#' -e '^$' ~/.config/pxx/public-denylist | head -1)"
    ```
 
-   Both must be refused. If either succeeds, stop; the privacy gate is not
-   working on this machine.
+   Both must be refused **by the privacy hook**: the output must name the
+   rule, `private-lan-address` for the first and `denylist term` for the
+   second. A refusal without that line (for example, a missing Git identity)
+   proves nothing. If either commit succeeds or fails for another reason, stop;
+   the privacy gate is not working on this machine.
 6. **Install:**
 
    ```
