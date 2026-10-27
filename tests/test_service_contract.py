@@ -224,16 +224,25 @@ def test_call_syntax_is_held_to_the_same_contract(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "raw_action",
+    ("raw_action", "kind", "executed"),
     [
-        {"action": "wait", "seconds": 0.5, "x": 25, "y": 30, "frame_id": 1},
-        {"action": "done", "x": 25, "y": 30, "text": "212", "frame_id": 1},
+        (
+            {"action": "wait", "seconds": 0.5, "x": 25, "y": 30, "frame_id": 1},
+            DecisionKind.EXECUTED,
+            [ActionKind.WAIT],
+        ),
+        (
+            {"action": "done", "x": 25, "y": 30, "text": "212", "frame_id": 1},
+            DecisionKind.DONE,
+            [],
+        ),
     ],
 )
-def test_extra_fields_on_wait_and_done_send_no_input(tmp_path, raw_action):
+def test_extra_fields_on_wait_and_done_send_no_input(tmp_path, raw_action, kind, executed):
     service, envelope, executor, _, _, _, _ = _setup(tmp_path)
-    _submit_raw(service, envelope, raw_action)
-    assert all(a.kind is ActionKind.WAIT for a in executor.actions)
+    response = _submit_raw(service, envelope, raw_action)
+    assert response["ok"] and response["decision"]["kind"] == kind.value
+    assert [a.kind for a in executor.actions] == executed
 
 
 def test_kill_switch_is_reported_before_the_contract(tmp_path):
