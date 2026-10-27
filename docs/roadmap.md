@@ -213,6 +213,11 @@ Platform decision and task specs: `docs/reference-workflow.md` (Linux/AT-SPI on
 the work node's virtual display, GTK 3; v1 temperature converter, v2 invoice
 entry).
 
+**Status (2026-10-27, PR #7):** specs and the v1 fixture and checker are
+merged; the fixture's controls were probed live on the work node. Nothing runs
+the workflow yet. Next: Stage 1 hardening, then the Stage 2 go/no-go probe on
+v1 (planner model on a live snapshot; result name updates after Convert).
+
 - Select a narrow workflow with deterministic success criteria.
 - Provide a fixture or test application where practical.
 - Run first in dry-run/shadow mode, then supervised real-input mode.
