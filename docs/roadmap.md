@@ -232,7 +232,10 @@ UI Automation or an existing Windows application.
   deployment of the three services; see `docs/service-loop.md`.
 - Add a loop and `psoperator run` CLI that drives observer → element planner →
   gatekeeper over IPC, holding no key, secret or executor.
-- Extend the element planner with history and the full action vocabulary.
+- Extend the element planner with history and the supported action subset;
+  an empty snapshot returns `fail` without a model call.
+- The gatekeeper service rejects any input action not bound to an attested
+  element (today `type`/`key` and coordinate-only clicks pass unbound).
 - Make Linux perception produce elements (RapidOCR installed, AT-SPI reaching
   the observer's display) and report the backends in observer health.
 - R-304's reference workflow runs through this loop, not the in-process one.
