@@ -10,6 +10,18 @@ import httpx
 from psoperator.common.schema import PerceptionSnapshot
 from psoperator.runtime.actions import Action, ActionKind, parse_action
 
+# The R-306 action subset: input is element-bound; scroll and drag are out.
+_UNSUPPORTED_KINDS = frozenset({ActionKind.SCROLL, ActionKind.DRAG})
+_INPUT_KINDS = frozenset(
+    {
+        ActionKind.CLICK,
+        ActionKind.RIGHT_CLICK,
+        ActionKind.DOUBLE_CLICK,
+        ActionKind.TYPE,
+        ActionKind.KEY,
+    }
+)
+
 
 class Planner(Protocol):
     def plan(self, snapshot: PerceptionSnapshot, goal: str) -> Action: ...
@@ -56,6 +68,13 @@ class LocalElementPlanner:
         )
 
     def plan(self, snapshot: PerceptionSnapshot, goal: str) -> Action:
+        if not snapshot.elements:
+            # Nothing to aim at: a model call could only guess coordinates.
+            return Action(
+                kind=ActionKind.FAIL,
+                frame_id=snapshot.frame_id,
+                reason="the snapshot has no elements",
+            )
         elements = [
             {
                 "id": item.element_id,
@@ -88,6 +107,10 @@ class LocalElementPlanner:
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"]
         action = parse_action(raw)
+        if action.kind in _UNSUPPORTED_KINDS:
+            raise ValueError(f"planner proposed {action.kind.value}, which is not supported")
+        if action.kind in _INPUT_KINDS and not action.target_element_id:
+            raise ValueError("planner proposed input that is not bound to an element")
         if action.target_element_id and snapshot.find(action.target_element_id) is None:
             raise ValueError("planner proposed an element id absent from the snapshot")
         return action

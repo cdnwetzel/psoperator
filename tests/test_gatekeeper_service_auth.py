@@ -60,7 +60,7 @@ class _FakeGatekeeper:
     def __init__(self) -> None:
         self.calls: list = []
 
-    def request_action(self, action, frame, context, snapshot):
+    def request_action(self, action, frame, context, snapshot, **_):
         self.calls.append((action, frame, snapshot))
         return SimpleNamespace(
             kind=SimpleNamespace(value="APPROVED_AUTO"),

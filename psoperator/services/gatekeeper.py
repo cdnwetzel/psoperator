@@ -63,7 +63,11 @@ class GatekeeperService:
         snapshot = attestation.snapshot
         self._freshness.observe(snapshot.frame_id)
         frame = FrameEvidence(snapshot.frame_id, snapshot.frame_hash)
-        decision = self._gatekeeper.request_action(action, frame, context, snapshot)
+        # R-306: an untrusted client gets only element-bound input of the
+        # supported kinds; the in-process loop keeps its looser rules.
+        decision = self._gatekeeper.request_action(
+            action, frame, context, snapshot, require_bound_input=True
+        )
         return {
             "ok": True,
             "decision": {
