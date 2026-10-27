@@ -108,7 +108,7 @@ requirements above also hold.
 | two fixture windows, even if only one result survives the snapshot | two `TempConv` frames |
 | the planner said `done` with any result above | `check_v1` fails |
 | kill switch engaged mid-run | the next step is `KILL_SWITCHED` |
-| empty snapshot | `fail` without a model call |
+| empty snapshot after a passing baseline (an empty baseline is a setup error) | `fail` without a model call |
 | step budget exhausted | no passing result within 8 steps |
 | snapshot at the element cap | cannot establish uniqueness |
 
@@ -200,5 +200,8 @@ exhausted. The v1 failure classes also apply, except its budget of 8.
    result, so v1 can only pass with real input. Until snapshots carry
    traversal completeness and window ancestry, a v1 pass holds only on the
    dedicated display described above.
-4. Entry text in the snapshot (R-303), then v2 phase A.
-5. An approval path with an attested, bound preview, then v2 phase B.
+4. Entry text in the snapshot (R-303), and the pilot policy's T2 rule for
+   `submit`, so Submit is denied; then v2 phase A. Without the rule, Submit
+   could execute and phase A could not pass.
+5. An interactive approval path with an attested, bound preview, then v2
+   phase B.
