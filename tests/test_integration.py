@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
 from PIL import Image
 
 from psoperator.common.attestation import AttestationKey, AttestationKeyring, SnapshotSigner
@@ -213,6 +216,34 @@ def test_planner_target_text_cannot_replace_attested_label(tmp_path):
         frame,
         context=ActionContext(target_text="safe"),
         snapshot=_snapshot(frame, label="Delete permanently"),
+    )
+    assert decision.kind is DecisionKind.DENIED
+    assert not executor.actions
+
+
+@pytest.mark.parametrize(
+    ("label", "action", "context", "t3_policy"),
+    [
+        # A multi-word built-in phrase must not be split by caller text.
+        ("Remove", (ActionKind.TYPE, {"text": "permanently"}), {"target_text": "safe"}, []),
+        # Anchored operator patterns must still see the attested label alone.
+        ("Destroy", (ActionKind.CLICK, {}), {"target_text": "safe"}, [r"\bdestroy\s*$"]),
+        ("Destroy", (ActionKind.CLICK, {}), {"window_title": "safe"}, [r"^\s*destroy\b"]),
+        ("Destroy", (ActionKind.CLICK, {}), {"app_name": "safe"}, [r"^\s*destroy\b"]),
+        # Caller text that is itself high-risk keeps its own tier.
+        ("Save", (ActionKind.CLICK, {}), {"target_text": "Destroy"}, [r"^\s*destroy\s*$"]),
+    ],
+)
+def test_caller_context_never_lowers_attested_tier(tmp_path, label, action, context, t3_policy):
+    (tmp_path / "policy.json").write_text(json.dumps({"t3": t3_policy}))
+    executor = RecordingExecutor()
+    _, gate = _gate(tmp_path, executor)
+    frame = _frame()
+    decision = gate.request_action(
+        Action(action[0], 1, target_element_id="button-save", **action[1]),
+        frame,
+        context=ActionContext(**context),
+        snapshot=_snapshot(frame, label=label),
     )
     assert decision.kind is DecisionKind.DENIED
     assert not executor.actions
