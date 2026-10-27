@@ -90,3 +90,42 @@ def test_check_mode_runs_without_a_display():
     assert WINDOW_TITLE in out.stdout
     for name in FIELD_NAMES:
         assert name in out.stdout
+
+
+def test_record_starts_fresh_and_refuses_an_existing_file(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, read_submissions, start_record
+
+    record = tmp_path / "run.jsonl"
+    start_record(record)
+    assert read_submissions(record) == []
+    with pytest.raises(RecordError, match="already exists"):
+        start_record(record)
+
+
+def test_record_round_trips_submissions_in_field_order(tmp_path):
+    from psoperator.fixtures.invoice import append_submission, read_submissions, start_record
+
+    record = tmp_path / "run.jsonl"
+    start_record(record)
+    append_submission(record, field_rows(DEMO_INVOICE))
+    append_submission(record, field_rows(DEMO_INVOICE))
+    subs = read_submissions(record)
+    assert len(subs) == 2
+    assert tuple(subs[0]) == FIELD_NAMES
+    assert subs[0]["Vendor"] == DEMO_INVOICE.vendor
+
+
+def test_record_failures_are_errors_not_empty(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, append_submission, read_submissions
+
+    with pytest.raises(RecordError, match="cannot read"):
+        read_submissions(tmp_path / "missing.jsonl")
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"fields": {"Vendor": "x"}}\n')
+    with pytest.raises(RecordError, match="does not name FIELD_NAMES"):
+        read_submissions(bad)
+    bad.write_text("not json\n")
+    with pytest.raises(RecordError, match="malformed"):
+        read_submissions(bad)
+    with pytest.raises(RecordError, match="do not match FIELD_NAMES"):
+        append_submission(tmp_path / "x.jsonl", [("Vendor", "x")])

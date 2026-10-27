@@ -11,6 +11,11 @@ Run on the AT-SPI host (a real display + a11y bus required):
 
     python examples/fixtures/invoice_form.py
     python examples/fixtures/invoice_form.py --vendor "ACME" --total "$9.99"
+    python examples/fixtures/invoice_form.py --record /tmp/run-1.jsonl   # v2 runs
+
+With --record, each Submit appends the fields as the widgets held them. The file
+must not exist yet, and a failed write stops the fixture with exit code 3, so an
+unrecorded Submit never reads as no Submit.
 
 Off a display, validate the data contract without importing GTK:
 
@@ -30,7 +35,10 @@ from psoperator.fixtures.invoice import (  # noqa: E402
     SUBMIT_NAME,
     WINDOW_TITLE,
     Invoice,
+    RecordError,
+    append_submission,
     field_rows,
+    start_record,
 )
 
 
@@ -44,7 +52,7 @@ def _invoice_from_args(args: argparse.Namespace) -> Invoice:
     )
 
 
-def build_window(invoice: Invoice):
+def build_window(invoice: Invoice, record: Path | None = None, failed: list[str] | None = None):
     """Build (but do not run) the GTK window. Imports gi lazily so this module
     stays importable — and --check runnable — without a GUI toolkit present."""
     import gi
@@ -60,9 +68,11 @@ def build_window(invoice: Invoice):
     grid = Gtk.Grid(row_spacing=8, column_spacing=12)
     win.add(grid)
 
+    entries: list[tuple[str, object]] = []
     for row, (name, value) in enumerate(field_rows(invoice)):
         label = Gtk.Label(label=name, halign=Gtk.Align.END)
         entry = Gtk.Entry(text=value, hexpand=True)
+        entries.append((name, entry))
         # The load-bearing line: give the entry the exact accessible name the
         # walk and the operator preview both key on.
         entry.get_accessible().set_name(name)
@@ -76,7 +86,18 @@ def build_window(invoice: Invoice):
     def _on_submit(_btn):
         # A visible, inert commit — the fixture never acts on its own; the
         # governed executor replays approved input against it.
-        print(f"[fixture] {SUBMIT_NAME} pressed for {WINDOW_TITLE}")
+        print(f"[fixture] {SUBMIT_NAME} pressed for {WINDOW_TITLE}", flush=True)
+        if record is None:
+            return
+        try:
+            append_submission(record, [(name, e.get_text()) for name, e in entries])
+        except RecordError as exc:
+            # An unrecorded Submit must not look like no Submit: stop, and let
+            # main() exit nonzero so the run's outcome reads as unknown.
+            print(f"[fixture] RECORD FAILED: {exc}", file=sys.stderr, flush=True)
+            if failed is not None:
+                failed.append(str(exc))
+            Gtk.main_quit()
 
     submit.connect("clicked", _on_submit)
     grid.attach(submit, 0, len(field_rows(invoice)), 2, 1)
@@ -90,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--number")
     ap.add_argument("--date")
     ap.add_argument("--total")
+    ap.add_argument(
+        "--record",
+        type=Path,
+        help="record each Submit as a JSON line here; the file must not exist yet",
+    )
     ap.add_argument(
         "--check",
         action="store_true",
@@ -110,10 +136,17 @@ def main(argv: list[str] | None = None) -> int:
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gtk
 
-    win = build_window(invoice)
+    failed: list[str] = []
+    if args.record is not None:
+        try:
+            start_record(args.record)
+        except RecordError as exc:
+            print(f"[fixture] {exc}", file=sys.stderr)
+            return 3
+    win = build_window(invoice, args.record, failed)
     win.show_all()
     Gtk.main()
-    return 0
+    return 3 if failed else 0
 
 
 if __name__ == "__main__":

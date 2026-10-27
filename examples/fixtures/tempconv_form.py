@@ -29,8 +29,8 @@ from psoperator.fixtures.tempconv import (  # noqa: E402
     DEFAULT_DIRECTION,
     F2C,
     F_TO_C_NAME,
-    V1_EXPECTED,
     V1_GOAL,
+    V1_PASS_NAME,
     VALUE_NAME,
     WINDOW_TITLE,
     convert_text,
@@ -66,19 +66,23 @@ def build_window():
     box.pack_start(f_to_c, False, False, 0)
 
     result = Gtk.Label(label="")
-    result.get_accessible().set_name(result_name(""))
+    result.get_accessible().set_name(result_name())
     box.pack_start(result, False, False, 0)
 
     convert = Gtk.Button(label=CONVERT_NAME)
     convert.get_accessible().set_name(CONVERT_NAME)
 
     def _on_convert(_btn):
-        shown = convert_text(entry.get_text(), F2C if f_to_c.get_active() else C2F)
+        value = entry.get_text()
+        direction = F2C if f_to_c.get_active() else C2F
+        shown = convert_text(value, direction)
         result.set_text(shown)
         # The load-bearing line: the checker reads the result from the
-        # snapshot, which carries accessible names, not widget text.
-        result.get_accessible().set_name(result_name(shown))
-        print(f"[fixture] {CONVERT_NAME}: {shown}", flush=True)
+        # snapshot, which carries accessible names, not widget text. The name
+        # repeats the exact input and direction, because the number alone
+        # does not prove which conversion produced it.
+        result.get_accessible().set_name(result_name(shown, value, direction))
+        print(f"[fixture] {CONVERT_NAME}: {result_name(shown, value, direction)}", flush=True)
 
     convert.connect("clicked", _on_convert)
     box.pack_start(convert, False, False, 0)
@@ -98,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"window: {WINDOW_TITLE}")
         print(f"controls: {VALUE_NAME}, {C_TO_F_NAME}, {F_TO_C_NAME}, {CONVERT_NAME}")
         print(f"v1 goal: {V1_GOAL}")
-        print(f"v1 pass: {result_name(V1_EXPECTED)}")
+        print(f"v1 pass: {V1_PASS_NAME}")
         return 0
 
     import gi

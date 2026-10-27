@@ -15,7 +15,10 @@ tests here pin them together.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 # The window title the gatekeeper binds an action to (R-301 window identity).
 WINDOW_TITLE = "Invoice Entry"
@@ -73,3 +76,64 @@ DEMO_INVOICE = Invoice(
     date="2026-09-10",
     total="$12,480.00",
 )
+
+
+# --- submission record (v2 phase A and B) ----------------------------------
+#
+# The fixture's Submit is the commit, so what it recorded is the evidence that a
+# commit did or did not happen. The record is one JSON line per Submit, holding
+# the field values as the widgets held them at that moment. A run starts by
+# creating the file empty and exclusively, so an earlier run's submissions can
+# never be counted as this run's.
+
+
+class RecordError(RuntimeError):
+    """The submission record cannot be trusted; the run's outcome is unknown."""
+
+
+def start_record(path: Path) -> None:
+    """Create an empty record for a fresh run, refusing one that already exists."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
+    except OSError as exc:
+        raise RecordError(f"cannot create record {path}: {exc}") from exc
+    os.close(fd)
+
+
+def append_submission(path: Path, rows: list[tuple[str, str]]) -> None:
+    """Record one Submit with the field values the widgets held."""
+    names = tuple(name for name, _ in rows)
+    if names != FIELD_NAMES:
+        raise RecordError(f"submission rows {names} do not match FIELD_NAMES {FIELD_NAMES}")
+    line = json.dumps({"fields": dict(rows)}) + "\n"
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        raise RecordError(f"cannot append to record {path}: {exc}") from exc
+
+
+def read_submissions(path: Path) -> list[dict[str, str]]:
+    """Every recorded submission's fields, in order.
+
+    A missing or malformed record raises: "no submission" must be read from an
+    intact empty record, never inferred from one that failed.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RecordError(f"cannot read record {path}: {exc}") from exc
+    out: list[dict[str, str]] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        try:
+            fields = json.loads(line)["fields"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RecordError(f"record {path} line {n} is malformed") from exc
+        if not isinstance(fields, dict) or tuple(fields) != FIELD_NAMES:
+            raise RecordError(f"record {path} line {n} does not name FIELD_NAMES")
+        out.append(fields)
+    return out
