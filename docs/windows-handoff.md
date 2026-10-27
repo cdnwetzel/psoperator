@@ -12,7 +12,7 @@ Install machine-wide, and check each version afterwards:
 | tool | why | check |
 | --- | --- | --- |
 | Git for Windows | clone, hooks; its Git Bash is the shell Claude Code uses | `git --version` |
-| Python 3.13 | PSOperator (3.12 no longer ships Windows installers) | `py -3.13 --version` |
+| Python 3.13 | PSOperator; 3.13.17 is the last 3.13 release with a Windows installer, and CI tests 3.11–3.13 | `py -3.13 --version` |
 | Node.js LTS | the Codex CLI | `node --version` |
 | GitHub CLI | PRs and CI checks | `gh --version` |
 
@@ -89,9 +89,11 @@ Windows. Paths use forward slashes.
    (`psoperator/gatekeeper/attestation_gate.py`, `_read_state_bytes`). Record
    the failing tests as the Windows baseline in the probe PR. Do not weaken a
    refusal to make a test pass; porting those checks is part of roadmap D-01.
-8. **Agents.** Install Claude Code with its native Windows installer, and the
-   Codex CLI with `npm install -g @openai/codex`; check `claude --version` and
-   `codex --version`. Then sign in to both, and run `gh auth login`.
+8. **Agents.** Install Claude Code with its native Windows installer, which
+   runs in **PowerShell** (the one exception to Git Bash above), and the Codex
+   CLI with `npm install -g @openai/codex`. Open a new Git Bash, check
+   `claude --version` and `codex --version`, sign in to both, and run
+   `gh auth login`.
 9. Open the target application on this desktop, with a synthetic test record
    loaded.
 
