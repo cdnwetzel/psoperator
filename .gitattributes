@@ -1,4 +1,4 @@
-# LF everywhere, on every platform. A CRLF checkout breaks the privacy hooks
+# LF for every text file, on every platform. A CRLF checkout breaks the privacy hooks
 # (a line-continuation backslash before CR no longer continues the line).
 * text=auto eol=lf
 *.png binary

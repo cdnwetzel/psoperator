@@ -91,7 +91,7 @@ order, so do not mix it in.
    git ls-files --eol scripts/hooks   # both lines must show w/lf
    ```
 
-   `.gitattributes` keeps every file LF. A clone made before it existed may
+   `.gitattributes` keeps every text file LF. A clone made before it existed may
    hold CRLF copies, which break the hooks (they run without the denylist).
    If `git ls-files --eol` shows `w/crlf`, re-check out the hooks and look
    again:
