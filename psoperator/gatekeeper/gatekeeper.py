@@ -161,9 +161,15 @@ class Gatekeeper:
                 ActionKind.DOUBLE_CLICK,
             ):
                 action = replace(action, x=element.center[0], y=element.center[1])
+            # The attested label always reaches the risk check. Caller text is
+            # kept beside it (it can only add keywords, never lower a tier), but
+            # it must not replace the label: a planner calling "Delete" "safe"
+            # would otherwise lower the tier of an element it does not control.
             if context is None:
                 context = ActionContext(target_text=element.label)
-            elif not context.target_text:
+            elif context.target_text and context.target_text != element.label:
+                context = replace(context, target_text=f"{element.label} {context.target_text}")
+            else:
                 context = replace(context, target_text=element.label)
 
         # Coordinate fallbacks must still land inside the observed frame.

@@ -204,6 +204,49 @@ def test_target_label_drives_risk_not_planner_prose(tmp_path):
     assert not executor.actions
 
 
+def test_planner_target_text_cannot_replace_attested_label(tmp_path):
+    executor = RecordingExecutor()
+    _, gate = _gate(tmp_path, executor)
+    frame = _frame()
+    decision = gate.request_action(
+        Action(ActionKind.CLICK, 1, target_element_id="button-save"),
+        frame,
+        context=ActionContext(target_text="safe"),
+        snapshot=_snapshot(frame, label="Delete permanently"),
+    )
+    assert decision.kind is DecisionKind.DENIED
+    assert not executor.actions
+
+
+def test_service_context_cannot_lower_risk_of_attested_element(tmp_path):
+    executor = RecordingExecutor()
+    config, gatekeeper = _gate(tmp_path, executor)
+    freshness = FreshnessTracker()
+    frame = _frame()
+    observer_key = AttestationKey("observer-v1", b"s" * 32)
+    gate = AttestationGate(
+        AttestationKeyring([observer_key]),
+        expected_epoch="e" * 64,
+        clock=lambda: frame.captured_at + 2,
+    )
+    service = GatekeeperService(gatekeeper, freshness, gate)
+    envelope = SnapshotSigner(
+        observer_key,
+        observer_epoch="e" * 64,
+    ).sign(_snapshot(frame, label="Delete permanently"), issued_at=frame.captured_at + 1)
+
+    response = service.handle(
+        {
+            "action": Action(ActionKind.CLICK, 1, target_element_id="button-save").to_dict(),
+            "attestation": envelope.model_dump(mode="json"),
+            "context": {"target_text": "safe"},
+        }
+    )
+    assert response["ok"]
+    assert response["decision"]["kind"] == DecisionKind.DENIED.value
+    assert not executor.actions
+
+
 def test_t3_can_only_execute_after_two_explicit_config_changes(tmp_path):
     executor = RecordingExecutor()
     _, gate = _gate(tmp_path, executor, hard_block_t3=False, require_approval_for_t3=True)
