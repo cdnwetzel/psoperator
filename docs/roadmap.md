@@ -234,7 +234,7 @@ UI Automation or an existing Windows application.
   gatekeeper over IPC, holding no key, secret or executor.
 - Extend the element planner with history and the supported action subset;
   an empty snapshot returns `fail` without a model call.
-- The loop stops on every non-executed outcome, including service and
+- The loop stops on every outcome other than executed or dry-run, including service and
   transport failures, never resubmits, and exits `0` only on `done`.
 - The gatekeeper service enforces the contract itself: it rejects unsupported
   kinds (`scroll`/`drag`) and any input action not bound to an attested element

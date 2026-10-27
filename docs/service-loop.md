@@ -20,8 +20,10 @@ The obvious fix, pointing dx at `examples/run_isolated.py`, does not work today:
    no stop condition. A task like "open the editor and type hello" needs several
    steps.
 2. **The planner has nothing to aim at.** Across the boundary the planner sees
-   only the snapshot's element list, never pixels, and `LocalElementPlanner` may
-   only target an element id from that list. On the work node the observer
+   only the snapshot's element list, never pixels. `LocalElementPlanner` checks
+   any element id it is given against that list, but today it also accepts a
+   coordinate-only answer; mandatory binding is part of the proposal below. On
+   the work node the observer
    reported a 1920×1080 frame with **0 elements**:
    - the virtual display had no application open, so AT-SPI had nothing to report;
    - RapidOCR (`psoperator[perception]`) is not installed, so the OCR fallback is
@@ -32,10 +34,11 @@ The obvious fix, pointing dx at `examples/run_isolated.py`, does not work today:
    planner raises `ValueError`. `run_isolated.py` catches only
    `ObserverUnavailable`, so the run ends in a traceback rather than a clean
    `fail`.
-3. **The two paths use different planners.** `AgentLoop` sends the screenshot to
-   a vision model and accepts coordinate actions. The service path sends element
-   metadata to a text model and expects element-bound actions. Swapping the
-   script changes the planner contract as well as the transport.
+3. **The two paths use different planners.** `AgentLoop` sends the screenshot,
+   together with the element list, to a vision model. It prefers element ids but
+   also accepts coordinate actions. The service path sends element metadata
+   only, to a text model. Swapping the script changes the planner's inputs as
+   well as the transport.
 
 To be precise about what is bypassed: `run_agent.py` still applies the
 gatekeeper's freshness, grounding, risk, approval and audit checks, but it does
@@ -51,13 +54,14 @@ which is true for denied and failed decisions as well.
 The service path's planner contract is deliberate: an untrusted planner never
 receives pixels or a capture backend. It works from attested element metadata,
 so the gatekeeper can check an element-bound action's target against the signed
-snapshot (`REJECTED_TARGET`). `AgentLoop` is built the other way round: a vision
-model reads the screenshot and answers with coordinates. Running it over the
-services would mean giving pixels to the planner and accepting coordinate
-actions it chose itself. Envelope authentication would still hold, but the
-gatekeeper could no longer bind an action to an observed element. So the loop
-has to be rebuilt around the element contract, and perception has to supply
-enough elements for that contract to work.
+snapshot (`REJECTED_TARGET`). `AgentLoop` gives a vision model the screenshot as
+well as the element list, and takes coordinate answers when the model offers
+them. Pixels alone would not stop element binding, but they widen what an
+untrusted planner sees, and the coordinate fallback is what lets an action skip
+binding. R-306 therefore keeps the planner on element metadata and makes
+binding mandatory at the gatekeeper service (step 3). The loop has to be
+rebuilt around that contract, and perception has to supply enough elements for
+it to work.
 
 v0.2 itself still permits coordinate fallback (an unbound click inside the
 frame) and unbound `type`/`key`. Making element binding mandatory on the
@@ -113,7 +117,7 @@ service path is a tightening that R-306 adds, not a property v0.2 already has.
 - **Simulated (CI):** a deterministic multi-step task runs through the three services, with a fake executor that updates a fake application, so later observations reflect earlier actions. It covers:
   - `done` exits `0`;
   - an empty snapshot exits nonzero with `fail`, without calling the model;
-  - each stop condition above exits nonzero and never resubmits;
+  - each stop condition above other than `done` exits nonzero, and none resubmits;
   - the kill switch blocks the next step;
   - unbound input, `scroll`/`drag`, and caller context that tries to lower risk are all rejected or held at the attested tier.
 - **Live dry-run (work node):** a task against a test application on the virtual display is admitted step by step through the services, with audit evidence for every step.
