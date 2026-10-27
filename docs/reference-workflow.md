@@ -122,7 +122,7 @@ button, and the window title `Invoice Entry`. It opens pre-filled with the demo
 invoice.
 
 With `--record PATH`, each Submit appends one JSON line to `PATH`, holding the
-field values the widgets held at that moment (`append_submission`). The file
+field values the widgets held at that moment (`SubmissionRecord.append`). The file
 must not exist when the fixture starts; it is created empty, so a run's record
 holds only that run's submissions. A failed write stops the fixture with exit
 code 3, and the fixture writes nothing else first, so a broken console

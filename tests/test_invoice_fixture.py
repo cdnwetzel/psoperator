@@ -154,3 +154,31 @@ def test_record_failures_are_errors_not_empty(tmp_path):
     with pytest.raises(RecordError, match="do not match FIELD_NAMES"):
         record.append([("Vendor", "x")])
     record.close()
+
+
+@pytest.mark.parametrize("fault", ["short_write", "write_error", "fsync_error"])
+def test_record_write_faults_raise(tmp_path, monkeypatch, fault):
+    import os
+
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    if fault == "short_write":
+        monkeypatch.setattr(inv_mod.os, "write", lambda fd, data: len(data) - 1)
+    elif fault == "write_error":
+
+        def _fail(*_a):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(inv_mod.os, "write", _fail)
+    else:
+
+        def _fail(*_a):
+            raise OSError("io error")
+
+        monkeypatch.setattr(inv_mod.os, "fsync", _fail)
+    with pytest.raises(RecordError):
+        record.append(field_rows(DEMO_INVOICE))
+    monkeypatch.undo()
+    os.close(record._fd)
