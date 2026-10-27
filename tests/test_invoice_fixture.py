@@ -10,6 +10,8 @@ preview lists. The GTK UI itself is validated live on the AT-SPI host.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from psoperator.fixtures.invoice import (
@@ -90,3 +92,191 @@ def test_check_mode_runs_without_a_display():
     assert WINDOW_TITLE in out.stdout
     for name in FIELD_NAMES:
         assert name in out.stdout
+
+
+def test_record_starts_fresh_and_refuses_an_existing_file(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord, read_submissions
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    assert read_submissions(path) == []
+    with pytest.raises(RecordError, match="already exists"):
+        SubmissionRecord(path)
+    record.close()
+
+
+def test_record_round_trips_submissions_in_field_order(tmp_path):
+    from psoperator.fixtures.invoice import SubmissionRecord, read_submissions
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    record.append(field_rows(DEMO_INVOICE))
+    record.append(field_rows(DEMO_INVOICE))
+    record.close()
+    subs = read_submissions(path)
+    assert len(subs) == 2
+    assert tuple(subs[0]) == FIELD_NAMES
+    assert subs[0]["Vendor"] == DEMO_INVOICE.vendor
+
+
+def test_record_refuses_a_removed_or_replaced_file(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    path.unlink()
+    with pytest.raises(RecordError, match="is gone"):
+        record.append(field_rows(DEMO_INVOICE))
+    path.write_text("")  # a different file at the same path
+    with pytest.raises(RecordError, match="replaced"):
+        record.append(field_rows(DEMO_INVOICE))
+    record.close()
+
+
+def test_record_failures_are_errors_not_empty(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord, read_submissions
+
+    with pytest.raises(RecordError, match="cannot read"):
+        read_submissions(tmp_path / "missing.jsonl")
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"fields": {"Vendor": "x"}}\n')
+    with pytest.raises(RecordError, match="does not name FIELD_NAMES"):
+        read_submissions(bad)
+    bad.write_text("not json\n")
+    with pytest.raises(RecordError, match="malformed"):
+        read_submissions(bad)
+    good = tmp_path / "good.jsonl"
+    record = SubmissionRecord(good)
+    record.append(field_rows(DEMO_INVOICE))
+    record.close()
+    good.write_text(good.read_text().rstrip("\n"))  # cut mid-write
+    with pytest.raises(RecordError, match="mid-line"):
+        read_submissions(good)
+    record = SubmissionRecord(tmp_path / "x.jsonl")
+    with pytest.raises(RecordError, match="do not match FIELD_NAMES"):
+        record.append([("Vendor", "x")])
+    record.close()
+
+
+@pytest.mark.parametrize("fault", ["short_write", "write_error", "fsync_error"])
+def test_record_write_faults_raise(tmp_path, monkeypatch, fault):
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    def _raise(*_args):
+        raise OSError("injected")
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    try:
+        if fault == "short_write":
+            monkeypatch.setattr(inv_mod.os, "write", lambda fd, data: len(data) - 1)
+        elif fault == "write_error":
+            monkeypatch.setattr(inv_mod.os, "write", _raise)
+        else:
+            monkeypatch.setattr(inv_mod.os, "fsync", _raise)
+        with pytest.raises(RecordError):
+            record.append(field_rows(DEMO_INVOICE))
+    finally:
+        monkeypatch.undo()
+        record.close()
+
+
+def test_record_with_invalid_utf8_is_an_error(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    bad = tmp_path / "bad.jsonl"
+    bad.write_bytes(b'{"fields": {"Vendor": "\xff"}}\n')
+    with pytest.raises(RecordError, match="not valid UTF-8"):
+        read_submissions(bad)
+
+
+@pytest.mark.parametrize("value", [7, 1.5, None, True, ["x"], {"x": "y"}])
+@pytest.mark.parametrize("field", FIELD_NAMES)
+def test_record_with_a_non_text_value_is_an_error(tmp_path, field, value):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    fields = dict(field_rows(DEMO_INVOICE))
+    fields[field] = value
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"fields": fields}) + "\n")
+    with pytest.raises(RecordError, match="non-text value"):
+        read_submissions(bad)
+
+
+def test_record_nested_too_deep_is_an_error(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    bad = tmp_path / "deep.jsonl"
+    bad.write_text('{"fields": {"Vendor": ' + "[" * 100_000 + "]" * 100_000 + "}}\n")
+    with pytest.raises(RecordError, match="malformed"):
+        read_submissions(bad)
+
+
+@pytest.mark.parametrize("name", ["bad\x00.jsonl", "bad\ud800.jsonl"])
+def test_record_with_an_invalid_path_is_an_error(tmp_path, name):
+    from psoperator.fixtures.invoice import RecordError, read_submissions
+
+    with pytest.raises(RecordError):
+        read_submissions(tmp_path / name)
+
+
+@pytest.mark.parametrize("name", ["bad\x00.jsonl", "bad\ud800.jsonl"])
+def test_creating_a_record_at_an_invalid_path_is_an_error(tmp_path, name):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    with pytest.raises(RecordError, match="cannot create"):
+        SubmissionRecord(tmp_path / name)
+
+
+def test_a_failed_fstat_closes_the_record_and_raises(tmp_path, monkeypatch):
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    closed: list[int] = []
+    real_close = inv_mod.os.close
+
+    def _fstat(_fd):
+        raise OSError("injected")
+
+    def _close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(inv_mod.os, "fstat", _fstat)
+    monkeypatch.setattr(inv_mod.os, "close", _close)
+    with pytest.raises(RecordError, match="cannot create"):
+        SubmissionRecord(tmp_path / "run.jsonl")
+    assert len(closed) == 1
+
+
+def test_a_failed_close_raises(tmp_path, monkeypatch):
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    fd = record._fd
+    real_close = inv_mod.os.close
+
+    def _close(_fd):
+        raise OSError("injected")
+
+    monkeypatch.setattr(inv_mod.os, "close", _close)
+    try:
+        with pytest.raises(RecordError, match="cannot close"):
+            record.close()
+    finally:
+        monkeypatch.undo()
+        real_close(fd)
+
+
+def test_appending_after_the_path_became_invalid_raises(tmp_path):
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord
+
+    record = SubmissionRecord(tmp_path / "run.jsonl")
+    record.path = tmp_path / "bad\x00.jsonl"
+    try:
+        with pytest.raises(RecordError):
+            record.append(field_rows(DEMO_INVOICE))
+    finally:
+        record.path = tmp_path / "run.jsonl"
+        record.close()

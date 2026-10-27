@@ -209,6 +209,10 @@ UI Automation or an existing Windows application.
 
 #### R-304 — Reference workflow
 
+Platform decision and task specs: `docs/reference-workflow.md` (Linux/AT-SPI on
+the work node's virtual display, GTK 3; v1 temperature converter, v2 invoice
+entry).
+
 - Select a narrow workflow with deterministic success criteria.
 - Provide a fixture or test application where practical.
 - Run first in dry-run/shadow mode, then supervised real-input mode.

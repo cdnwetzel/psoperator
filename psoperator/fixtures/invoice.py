@@ -15,7 +15,10 @@ tests here pin them together.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 # The window title the gatekeeper binds an action to (R-301 window identity).
 WINDOW_TITLE = "Invoice Entry"
@@ -73,3 +76,94 @@ DEMO_INVOICE = Invoice(
     date="2026-09-10",
     total="$12,480.00",
 )
+
+
+# --- submission record (v2 phase A and B) ----------------------------------
+#
+# The fixture's Submit is the commit, so what it recorded is the evidence that a
+# commit did or did not happen. The record is one JSON line per Submit, holding
+# the field values as the widgets held them at that moment. A run starts by
+# creating the file empty and exclusively, so an earlier run's submissions can
+# never be counted as this run's. The fixture keeps that one open file for the
+# whole run and refuses to write if the path no longer names it, so a removed
+# or replaced record cannot silently split or mix runs.
+
+
+class RecordError(RuntimeError):
+    """The submission record cannot be trusted; the run's outcome is unknown."""
+
+
+class SubmissionRecord:
+    """The run's record: created exclusively, held open, appended in place."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self._fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o600)
+        except FileExistsError as exc:
+            raise RecordError(f"record {path} already exists; each run needs a fresh one") from exc
+        except (OSError, ValueError) as exc:
+            raise RecordError(f"cannot create record {path!r}: {exc}") from exc
+        try:
+            st = os.fstat(self._fd)
+        except OSError as exc:
+            os.close(self._fd)
+            raise RecordError(f"cannot create record {path!r}: {exc}") from exc
+        self._identity = (st.st_dev, st.st_ino)
+
+    def append(self, rows: list[tuple[str, str]]) -> None:
+        """Record one Submit, durably, or raise."""
+        names = tuple(name for name, _ in rows)
+        if names != FIELD_NAMES:
+            raise RecordError(f"submission rows {names} do not match FIELD_NAMES {FIELD_NAMES}")
+        try:
+            st = os.stat(self.path)
+        except (OSError, ValueError) as exc:
+            raise RecordError(f"record {self.path} is gone: {exc}") from exc
+        if (st.st_dev, st.st_ino) != self._identity:
+            raise RecordError(f"record {self.path} was replaced during the run")
+        data = (json.dumps({"fields": dict(rows)}) + "\n").encode("utf-8")
+        try:
+            written = os.write(self._fd, data)
+            if written != len(data):
+                raise RecordError(f"short write to record {self.path}")
+            os.fsync(self._fd)
+        except OSError as exc:
+            raise RecordError(f"cannot append to record {self.path}: {exc}") from exc
+
+    def close(self) -> None:
+        try:
+            os.close(self._fd)
+        except OSError as exc:
+            raise RecordError(f"cannot close record {self.path!r}: {exc}") from exc
+
+
+def read_submissions(path: Path) -> list[dict[str, str]]:
+    """Every recorded submission's fields, in order.
+
+    A missing or malformed record raises, and so does an unterminated last
+    line: "no submission" must be read from an intact empty record, never
+    inferred from one that failed or is mid-write. Read it only after the
+    fixture has exited, and only if it exited 0; exit 3 means a write failed.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise RecordError(f"record {path!r} is not valid UTF-8") from exc
+    except (OSError, ValueError) as exc:
+        # ValueError covers paths the OS cannot take (NUL, unencodable names).
+        raise RecordError(f"cannot read record {path!r}: {exc}") from exc
+    if text and not text.endswith("\n"):
+        raise RecordError(f"record {path} ends mid-line; a write did not complete")
+    out: list[dict[str, str]] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        try:
+            fields = json.loads(line)["fields"]
+        except (ValueError, KeyError, TypeError, RecursionError) as exc:
+            raise RecordError(f"record {path} line {n} is malformed") from exc
+        if not isinstance(fields, dict) or tuple(fields) != FIELD_NAMES:
+            raise RecordError(f"record {path} line {n} does not name FIELD_NAMES")
+        if not all(isinstance(value, str) for value in fields.values()):
+            raise RecordError(f"record {path} line {n} has a non-text value")
+        out.append(fields)
+    return out
