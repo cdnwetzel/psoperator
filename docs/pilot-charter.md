@@ -100,6 +100,17 @@ These hold from the start, so they never have to be retrofitted:
      image name and pid, since Windows reuses pids. (Done in the provider.)
   5. **The audit records identity, the frame hash and the rectangles**,
      never text.
+
+  The gate (`psoperator/gatekeeper/bound_target.py`, entry point
+  `Gatekeeper.request_bound_key`) meets all five and adds an **allow-list**:
+  a key is admitted only on a menu path explicitly listed as read-only,
+  only the key listed for that step, and only when the screen's window-tree
+  signature (Edit and dialog counts, focus, paired-field label hashes; no
+  text) matches the step's expected one, since one wrong digit in a path is
+  a different screen. An empty allow-list refuses everything. The real
+  allow-list, the application map and its dangerous paths are private
+  configuration, never in this repository; the repository holds only the
+  mechanism, tested with made-up paths.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
   values or window text.

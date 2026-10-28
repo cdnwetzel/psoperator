@@ -20,12 +20,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 
 from psoperator.common.schema import PerceptionSnapshot
 from psoperator.config import PSOperatorConfig
 from psoperator.gatekeeper import killswitch
 from psoperator.gatekeeper.approval import ApprovalBackend, ApprovalRequest, CLIApproval
 from psoperator.gatekeeper.audit import AuditLog
+from psoperator.gatekeeper.bound_target import (
+    AllowList,
+    BoundKeyRequest,
+    audit_record,
+    bound_key_problem,
+)
 from psoperator.gatekeeper.executor import DryRunExecutor, Executor
 from psoperator.gatekeeper.risk import (
     ActionContext,
@@ -156,6 +163,35 @@ class Gatekeeper:
         )
 
     # ------------------------------------------------------------------ API
+    def request_bound_key(
+        self, request: BoundKeyRequest, frame: Frame, allow: AllowList
+    ) -> Decision:
+        """One key for the pilot application, admitted only through the
+        bound-target gate (``bound_target``): allow-listed path and step, the
+        expected screen, the bound instance in front and on top, a visible
+        target. A refusal is audited like any decision; the audit entry
+        carries the target's identity, never text. An admitted key continues
+        through the ordinary pipeline (freshness, risk, execution)."""
+        binding = (
+            audit_record(request.target, frame.sha256)
+            if request.target is not None
+            else {"kind": "none", "frame_hash": frame.sha256}
+        )
+        if killswitch.is_engaged(self._config.kill_switch_path):
+            return self.request_action(request.action, frame, binding=binding)
+        problem = bound_key_problem(request, allow)
+        if problem is not None:
+            return self._record(
+                DecisionKind.DENIED,
+                request.action,
+                None,
+                approver="gatekeeper",
+                reason=problem,
+                frame=frame,
+                binding=binding,
+            )
+        return self.request_action(request.action, frame, binding=binding)
+
     def request_action(
         self,
         action: Action,
@@ -164,10 +200,12 @@ class Gatekeeper:
         snapshot: PerceptionSnapshot | None = None,
         *,
         require_bound_input: bool = False,
+        binding: dict | None = None,
     ) -> Decision:
+        record = partial(self._record, binding=binding)
         # 1. global stop — fail closed, including terminal/no-op actions
         if killswitch.is_engaged(self._config.kill_switch_path):
-            return self._record(
+            return record(
                 DecisionKind.KILL_SWITCHED,
                 action,
                 None,
@@ -183,7 +221,7 @@ class Gatekeeper:
             snapshot.frame_id != frame.frame_id or snapshot.frame_hash != frame.sha256
         )
         if not verdict.ok or evidence_mismatch or snapshot_mismatch:
-            return self._record(
+            return record(
                 DecisionKind.REJECTED_STALE,
                 action,
                 None,
@@ -199,7 +237,7 @@ class Gatekeeper:
         if require_bound_input:
             refusal = _service_contract_refusal(action, snapshot)
             if refusal is not None:
-                return self._record(
+                return record(
                     refusal[0], action, None, approver="gatekeeper", reason=refusal[1], frame=frame
                 )
 
@@ -208,7 +246,7 @@ class Gatekeeper:
         if action.target_element_id:
             element = snapshot.find(action.target_element_id) if snapshot is not None else None
             if element is None:
-                return self._record(
+                return record(
                     DecisionKind.REJECTED_TARGET,
                     action,
                     None,
@@ -249,7 +287,7 @@ class Gatekeeper:
             and not (0 <= x < screen_size[0] and 0 <= y < screen_size[1])
             for x, y in points
         ):
-            return self._record(
+            return record(
                 DecisionKind.REJECTED_TARGET,
                 action,
                 None,
@@ -266,11 +304,9 @@ class Gatekeeper:
 
         # 5. terminal actions never touch devices
         if action.kind is ActionKind.DONE:
-            return self._record(
-                DecisionKind.DONE, action, risk, "auto:terminal", "task complete", frame
-            )
+            return record(DecisionKind.DONE, action, risk, "auto:terminal", "task complete", frame)
         if action.kind is ActionKind.FAIL:
-            return self._record(
+            return record(
                 DecisionKind.FAILED,
                 action,
                 risk,
@@ -281,7 +317,7 @@ class Gatekeeper:
 
         # T3 is a hard block by default: approval is not an override path.
         if risk.tier is RiskTier.T3_DESTRUCTIVE and self._config.hard_block_t3:
-            return self._record(
+            return record(
                 DecisionKind.DENIED,
                 action,
                 risk,
@@ -296,7 +332,7 @@ class Gatekeeper:
         if needs_approval:
             ok = self._approval.request(ApprovalRequest(action, risk, frame.frame_id))
             if not ok:
-                return self._record(
+                return record(
                     DecisionKind.DENIED,
                     action,
                     risk,
@@ -312,7 +348,7 @@ class Gatekeeper:
         try:
             outcome = self._executor.execute(action)
         except Exception as exc:  # execution boundary must fail closed
-            return self._record(
+            return record(
                 DecisionKind.EXECUTION_FAILED,
                 action,
                 risk,
@@ -321,7 +357,7 @@ class Gatekeeper:
                 frame,
             )
         kind = DecisionKind.DRY_RUN if self._executor.name == "dry-run" else DecisionKind.EXECUTED
-        return self._record(kind, action, risk, approver, "ok", frame, outcome=outcome)
+        return record(kind, action, risk, approver, "ok", frame, outcome=outcome)
 
     # --------------------------------------------------------------- internals
     def _record(
@@ -333,14 +369,26 @@ class Gatekeeper:
         reason: str,
         frame: Frame,
         outcome: str = "",
+        binding: dict | None = None,
     ) -> Decision:
         d = Decision(
             kind=kind, action=action, risk=risk, approver=approver, reason=reason, outcome=outcome
         )
+        if binding is None:
+            entry = action.to_dict()
+        else:
+            # A bound action is recorded by kind, keys and target identity only:
+            # never typed text, even when the gate is refusing a typing attempt.
+            entry = {
+                "action": action.kind.value,
+                "frame_id": action.frame_id,
+                "keys": list(action.keys),
+                "binding": binding,
+            }
         self._audit.append(
             frame_id=action.frame_id,
             frame_hash=frame.sha256,
-            action=action.to_dict(),
+            action=entry,
             tier=int(risk.tier) if risk else -1,
             decision=kind.value,
             approver=approver,
