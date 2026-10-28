@@ -58,6 +58,7 @@ paths = [
     "psoperator/perception/snapshot.py",
     "psoperator/services/",
     "tests/test_gatekeeper.py",
+    "tests/conftest.py",
     "tests/test_attestation.py",
     "tests/test_ipc.py",
     "tests/test_isolation.py",
