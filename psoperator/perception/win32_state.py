@@ -117,39 +117,43 @@ def _centre(user32, hwnd: int) -> tuple[int, int]:
     return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
 
-def _window_state(user32, info_type, main_hwnd: int) -> tuple:
+def _recipient(user32, info_type, main_hwnd: int) -> tuple:
+    """Who would receive a key now: the foreground window, the focused control,
+    whether no menu/move-size/capture mode is active, the focused control's
+    centre and the top-level window there."""
     focus, clear = _thread_state(user32, info_type, main_hwnd)
     if not focus:
         raise Win32FieldError("the main window's thread has no keyboard focus")
     point = _centre(user32, focus)
-    return (
-        int(user32.GetForegroundWindow() or 0),
-        focus,
-        clear,
-        point,
-        topmost_at(point),
-        _owned_visible(user32, main_hwnd),
-    )
+    return (int(user32.GetForegroundWindow() or 0), focus, clear, point, topmost_at(point))
 
 
 def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:
     """Observe the main window ``main_hwnd`` for a key to its focused control.
-    Raises if the window is gone or its state changes during observation."""
+
+    The slow work (enumerating dialogs, walking the tree) runs between two
+    readings of the recipient state, and the second reading is the last thing
+    done: if the recipient, the dialogs or the process changed at any point,
+    no observation is returned. Raises if the window is gone."""
     user32, info_type = _api()
     if not user32.IsWindow(main_hwnd):
         raise Win32FieldError("the main window no longer exists")
     at = time.monotonic()
     pid, started, image = process_of(main_hwnd)
-    before = _window_state(user32, info_type, main_hwnd)
+    first = _recipient(user32, info_type, main_hwnd)
+    owned = _owned_visible(user32, main_hwnd)
     tree = read_window_tree(main_hwnd, label_class=label_class)
-    foreground, focus, clear, point, top, owned = before
+    foreground, focus, clear, point, top = first
     signature = signature_of(
         tree, focus, owned, instance=(pid, started), image=image, label_class=label_class
     )
-    if _window_state(user32, info_type, main_hwnd) != before:
-        raise Win32FieldError("the window state changed during observation")
+    if _owned_visible(user32, main_hwnd) != owned:
+        raise Win32FieldError("the dialogs changed during observation")
     if process_of(main_hwnd)[:2] != (pid, started):
         raise Win32FieldError("the main window's process changed during observation")
+    # Last: the recipient state, read after all other work.
+    if _recipient(user32, info_type, main_hwnd) != first:
+        raise Win32FieldError("the recipient changed during observation")
     return Observation(
         at=at,
         main_hwnd=int(main_hwnd),

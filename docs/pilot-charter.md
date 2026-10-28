@@ -111,11 +111,13 @@ These hold from the start, so they never have to be retrofitted:
   every visible Edit's position, every label-class caption on screen as a
   hash and position (so menus without fields are told apart), every
   labelled field's hash and position, dialogs and focus. The gatekeeper does
-  not take the screen from the caller: its observer and clock are fixed at
-  construction, and it observes (the foreground window, the top-level window
+  not take the screen from the caller: its observer, clock, allow-list and
+  the application it applies to are fixed at construction (a request only
+  selects a path and step within them), and it observes (the foreground window, the top-level window
   at the focused control, keyboard focus, menu and capture modes, dialogs,
   the window tree) before checking and again immediately before sending; any
-  change refuses. The audited identity is built from that observation.
+  change refuses; the kill switch is checked again at the last moment. The
+  audited identity is built from that observation.
   Refusals are audited with fixed codes; with `bound_input_only`, ordinary
   input that bypasses the gate is refused. An empty allow-list refuses
   everything. The real allow-list, the application map and its dangerous

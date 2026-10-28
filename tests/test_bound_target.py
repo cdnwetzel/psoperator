@@ -137,7 +137,9 @@ MENU_STEP_8 = AllowedStep(MENU, "8", (SUBMENU,))
 
 
 def _check(req=None, obs=None, now=100.5, allow=ALLOW):
-    return bound_key_problem(req or _req(), allow, obs or _obs(), now=now, max_age_s=1.0)
+    return bound_key_problem(
+        req or _req(), allow, obs or _obs(), now=now, max_age_s=1.0, app_image="app.exe"
+    )
 
 
 # --- keys and signatures ---------------------------------------------------------
@@ -397,6 +399,7 @@ _REFUSALS = {
     "from-the-future": (dict(now=99.0), Code.STALE),
     "other-instance": (dict(obs=_obs(instance=(4242, 8))), Code.INSTANCE),
     "other-main-window": (dict(obs=_obs(main_hwnd=OTHER)), Code.INSTANCE),
+    "other-application": (dict(obs=_obs(image="other.exe")), Code.WRONG_APP),
     "menu-mode": (dict(obs=_obs(input_clear=False)), Code.INPUT_MODE),
     "covered": (dict(obs=_obs(topmost_hwnd=OTHER)), Code.COVERED),
     "same-process-popup-in-front": (dict(obs=_obs(foreground_hwnd=OTHER)), Code.NOT_FOREGROUND),
@@ -532,11 +535,12 @@ def _gatekeeper(tmp_path, observer=None, **kwargs):
     freshness = FreshnessTracker()
     freshness.observe(1)
     recorder = _Recorder()
-    gk = Gatekeeper(
-        config, freshness, executor=recorder,
+    settings = dict(
         bound_observer=observer if observer is not None else Observer(), clock=lambda: 100.5,
-        **kwargs,
+        bound_allow=ALLOW, bound_app_image="app.exe",
     )  # fmt: skip
+    settings.update(kwargs)
+    gk = Gatekeeper(config, freshness, executor=recorder, **settings)
     return gk, config, recorder
 
 
@@ -548,7 +552,7 @@ def _audit(config):
 def test_an_admitted_key_is_observed_twice_executed_once_and_audited(tmp_path):
     observer = Observer()
     gk, config, recorder = _gatekeeper(tmp_path, observer)
-    decision = gk.request_bound_key(_req(), _frame(), ALLOW)
+    decision = gk.request_bound_key(_req(), _frame())
     assert decision.kind is DecisionKind.EXECUTED
     assert observer.calls == [MAIN, MAIN] and len(recorder.calls) == 1
     entry = _audit(config)[-1]
@@ -560,21 +564,34 @@ def test_an_admitted_key_is_observed_twice_executed_once_and_audited(tmp_path):
     assert verify(config.audit_log_path).ok
 
 
-def test_without_an_observer_nothing_is_admitted(tmp_path):
-    config = load_config(
-        audit_log_path=tmp_path / "audit.jsonl", kill_switch_path=tmp_path / "STOP"
-    )
-    gk = Gatekeeper(config, FreshnessTracker(), executor=_Recorder())
-    decision = gk.request_bound_key(_req(), _frame(), ALLOW)
+@pytest.mark.parametrize("missing", ["bound_observer", "bound_allow", "bound_app_image"])
+def test_without_full_configuration_nothing_is_admitted(tmp_path, missing):
+    gk, _, recorder = _gatekeeper(tmp_path, **{missing: None})
+    decision = gk.request_bound_key(_req(), _frame())
     assert decision.kind is DecisionKind.DENIED and decision.reason == Code.NO_OBSERVER.value
+    assert recorder.calls == []
 
 
-def test_the_observer_and_clock_cannot_come_from_the_request(tmp_path):
-    gk, _, _ = _gatekeeper(tmp_path)
+def test_the_allow_list_observer_and_clock_cannot_come_from_the_request(tmp_path):
+    gk, _, recorder = _gatekeeper(tmp_path)
+    permissive = AllowList([AllowedPath("9-8", (AllowedStep(REPORT, "ENTER", (NEIGHBOUR,)),))])
     with pytest.raises(TypeError):
-        gk.request_bound_key(_req(), _frame(), ALLOW, Observer())
+        gk.request_bound_key(_req(path="9-8"), _frame(), permissive)
     with pytest.raises(TypeError):
-        gk.request_bound_key(_req(), _frame(), ALLOW, clock=lambda: 0.0)
+        gk.request_bound_key(_req(), _frame(), allow=permissive)
+    with pytest.raises(TypeError):
+        gk.request_bound_key(_req(), _frame(), Observer())
+    with pytest.raises(TypeError):
+        gk.request_bound_key(_req(), _frame(), clock=lambda: 0.0)
+    # A path only another allow-list would admit is refused by the configured one.
+    decision = gk.request_bound_key(_req(path="9-8"), _frame())
+    assert decision.reason == Code.NO_PATH.value and recorder.calls == []
+
+
+def test_another_application_is_refused_at_the_gatekeeper(tmp_path):
+    gk, _, recorder = _gatekeeper(tmp_path, Observer(_obs(image="other.exe")))
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.reason == Code.WRONG_APP.value and recorder.calls == []
 
 
 _GATEKEEPER_REFUSALS = {
@@ -599,7 +616,7 @@ _GATEKEEPER_REFUSALS = {
 )
 def test_a_refused_key_never_executes_and_the_audit_holds_a_code_not_text(tmp_path, args, code):
     gk, config, recorder = _gatekeeper(tmp_path, args.get("observer"))
-    decision = gk.request_bound_key(args.get("req", _req()), _frame(), ALLOW)
+    decision = gk.request_bound_key(args.get("req", _req()), _frame())
     assert decision.kind is DecisionKind.DENIED and decision.reason.startswith(code.value)
     assert recorder.calls == []
     entry = _audit(config)[-1]
@@ -610,7 +627,7 @@ def test_a_refused_key_never_executes_and_the_audit_holds_a_code_not_text(tmp_pa
 def test_a_change_between_check_and_send_is_refused_even_if_still_allowed(tmp_path):
     moved = _obs(point=(241, 142))  # still a valid observation, just not the one checked
     gk, _, recorder = _gatekeeper(tmp_path, Observer(_obs(), moved))
-    decision = gk.request_bound_key(_req(), _frame(), ALLOW)
+    decision = gk.request_bound_key(_req(), _frame())
     assert decision.kind is DecisionKind.DENIED and decision.reason == Code.CHANGED.value
     assert recorder.calls == []
 
@@ -634,7 +651,7 @@ def test_a_change_during_approval_is_caught_by_the_second_observation(tmp_path, 
         lambda *a, **k: RiskAssessment(RiskTier.T2_SENSITIVE, ("forced for the test",)),
     )
     gk, _, recorder = _gatekeeper(tmp_path, observer, approval_backend=_Approves())
-    decision = gk.request_bound_key(_req(), _frame(), ALLOW)
+    decision = gk.request_bound_key(_req(), _frame())
     assert len(approvals) == 1 and len(observer.calls) == 2
     assert decision.kind is DecisionKind.DENIED and decision.reason == Code.NOT_FOREGROUND.value
     assert recorder.calls == []
@@ -645,13 +662,73 @@ class _Explodes:
         raise RuntimeError("secret attribute text")
 
 
+def test_a_kill_switch_engaged_during_approval_stops_the_key(tmp_path, monkeypatch):
+    config_holder = {}
+
+    class _EngagesThenApproves:
+        name = "engages"
+
+        def request(self, req, timeout_s=120.0):
+            config_holder["config"].kill_switch_path.write_text("stop", encoding="utf-8")
+            return True
+
+    monkeypatch.setattr(
+        gatekeeper_module,
+        "classify",
+        lambda *a, **k: RiskAssessment(RiskTier.T2_SENSITIVE, ("forced for the test",)),
+    )
+    gk, config, recorder = _gatekeeper(tmp_path, approval_backend=_EngagesThenApproves())
+    config_holder["config"] = config
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.KILL_SWITCHED and recorder.calls == []
+
+
+def test_a_kill_switch_engaged_during_the_last_observation_stops_the_key(tmp_path):
+    holder = {}
+
+    class _EngagingObserver(Observer):
+        def __call__(self, main_hwnd):
+            obs = super().__call__(main_hwnd)
+            if len(self.calls) == 2:
+                holder["config"].kill_switch_path.write_text("stop", encoding="utf-8")
+            return obs
+
+    gk, config, recorder = _gatekeeper(tmp_path, _EngagingObserver())
+    holder["config"] = config
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.KILL_SWITCHED and recorder.calls == []
+
+
+class _HostileAction:
+    @property
+    def kind(self):
+        raise RuntimeError("secret kind text")
+
+    @property
+    def keys(self):
+        raise RuntimeError("secret keys text")
+
+    @property
+    def frame_id(self):
+        raise RuntimeError("secret frame text")
+
+
+def test_an_action_whose_properties_raise_is_refused_and_recorded(tmp_path):
+    gk, config, recorder = _gatekeeper(tmp_path)
+    decision = gk.request_bound_key(_req(action=_HostileAction()), _frame())
+    assert decision.kind is DecisionKind.DENIED and recorder.calls == []
+    entry = _audit(config)[-1]
+    assert entry["action"]["action"] == "<invalid>" and entry["action"]["keys"] == ["<invalid>"]
+    assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
+
+
 def test_the_kill_switch_is_checked_before_the_request_is_read(tmp_path):
     observer = Observer()
     gk, config, recorder = _gatekeeper(tmp_path, observer)
     config.kill_switch_path.write_text("stop", encoding="utf-8")
     for req in (_req(), _req(path="9-8"), _Explodes(),
                 _req(action=SimpleNamespace(kind="x", keys=None))):  # fmt: skip
-        assert gk.request_bound_key(req, _frame(), ALLOW).kind is DecisionKind.KILL_SWITCHED
+        assert gk.request_bound_key(req, _frame()).kind is DecisionKind.KILL_SWITCHED
     assert observer.calls == [] and recorder.calls == []
     raw = config.audit_log_path.read_text(encoding="utf-8")
     assert "secret" not in raw and all(e["decision"] == "kill-switched" for e in _audit(config))
@@ -659,7 +736,7 @@ def test_the_kill_switch_is_checked_before_the_request_is_read(tmp_path):
 
 def test_a_request_that_explodes_is_refused_and_audited(tmp_path):
     gk, config, recorder = _gatekeeper(tmp_path)
-    decision = gk.request_bound_key(_Explodes(), _frame(), ALLOW)
+    decision = gk.request_bound_key(_Explodes(), _frame())
     assert decision.kind is DecisionKind.DENIED and recorder.calls == []
     assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
 
@@ -679,7 +756,7 @@ def test_bound_input_only_closes_the_ordinary_path(tmp_path):
         gk.request_action(Action(ActionKind.KEY, 1, keys=("ENTER",)), _frame(), binding={})
     assert recorder.calls == []
     assert gk.request_action(Action(ActionKind.WAIT, 1, seconds=0.1), _frame()).approved
-    assert gk.request_bound_key(_req(), _frame(), ALLOW).kind is DecisionKind.EXECUTED
+    assert gk.request_bound_key(_req(), _frame()).kind is DecisionKind.EXECUTED
     assert [a.kind for a in recorder.calls] == [ActionKind.WAIT, ActionKind.KEY]
 
 
@@ -784,7 +861,7 @@ def test_a_real_covering_window_stops_the_key_at_the_gatekeeper(tmp_path):
 
     def send():
         gk, _, recorder = _gatekeeper(tmp_path, observe)
-        decision = gk.request_bound_key(_req(main_hwnd=bound), _frame(), ALLOW)
+        decision = gk.request_bound_key(_req(main_hwnd=bound), _frame())
         return decision, recorder
 
     try:
@@ -818,3 +895,78 @@ def test_a_real_covering_window_stops_the_key_at_the_gatekeeper(tmp_path):
             child.wait(timeout=10)
     finally:
         user32.DestroyWindow(bound)
+
+
+class _FakeUser32:
+    def IsWindow(self, hwnd):
+        return True
+
+
+def _patched_observer(monkeypatch, recipients, owned=(0, 0), processes=None):
+    """win32_state.observe with every system read replaced: the recipient
+    state and dialog counts come from the given sequences, in call order."""
+    from psoperator.perception import win32_state
+
+    recipients = list(recipients)
+    owned = list(owned)
+    processes = list(processes or [(4242, 7, "app.exe"), (4242, 7, "app.exe")])
+    monkeypatch.setattr(win32_state, "_api", lambda: (_FakeUser32(), None))
+    monkeypatch.setattr(win32_state, "process_of", lambda hwnd: processes.pop(0))
+    monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: recipients.pop(0))
+    monkeypatch.setattr(win32_state, "_owned_visible", lambda u, hwnd: owned.pop(0))
+    monkeypatch.setattr(win32_state, "read_window_tree", lambda hwnd, label_class: _tree())
+    return win32_state
+
+
+RECIPIENT = (MAIN, EDIT, True, (240, 142), MAIN)
+
+
+def test_a_consistent_live_observation_is_returned(monkeypatch):
+    win32_state = _patched_observer(monkeypatch, [RECIPIENT, RECIPIENT])
+    obs = win32_state.observe(MAIN)
+    assert (obs.foreground_hwnd, obs.focus_hwnd, obs.input_clear) == (MAIN, EDIT, True)
+    assert obs.signature == REPORT and obs.image == "app.exe"
+
+
+@pytest.mark.parametrize(
+    "recipients, owned, processes, match",
+    [
+        ([RECIPIENT, (OTHER, EDIT, True, (240, 142), MAIN)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, EDIT, False, (240, 142), MAIN)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, OTHER, True, (240, 142), MAIN)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, EDIT, True, (240, 142), OTHER)], (0, 0), None, "recipient"),
+        ([RECIPIENT, RECIPIENT], (0, 1), None, "dialogs"),
+        ([RECIPIENT, RECIPIENT], (0, 0), [(4242, 7, "app.exe"), (4242, 8, "app.exe")], "process"),
+    ],
+    ids=["foreground-switched", "menu-opened", "focus-moved", "covered", "dialog-opened",
+         "process-restarted"],
+)  # fmt: skip
+def test_a_change_during_the_live_observation_returns_nothing(
+    monkeypatch, recipients, owned, processes, match
+):
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    win32_state = _patched_observer(monkeypatch, recipients, owned, processes)
+    with pytest.raises(Win32FieldError, match=match):
+        win32_state.observe(MAIN)
+
+
+def test_the_recipient_is_read_last(monkeypatch):
+    # A change that happens while the dialogs are enumerated for the second
+    # time is still caught, because the recipient is read after it.
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    state = {"recipient": RECIPIENT}
+    win32_state = _patched_observer(monkeypatch, [], owned=())
+
+    def owned_visible(u, hwnd):
+        if owned_visible.calls == 1:
+            state["recipient"] = (OTHER, EDIT, True, (240, 142), MAIN)
+        owned_visible.calls += 1
+        return 0
+
+    owned_visible.calls = 0
+    monkeypatch.setattr(win32_state, "_owned_visible", owned_visible)
+    monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: state["recipient"])
+    with pytest.raises(Win32FieldError, match="recipient"):
+        win32_state.observe(MAIN)

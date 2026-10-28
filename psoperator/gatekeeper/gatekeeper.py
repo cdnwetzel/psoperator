@@ -79,6 +79,14 @@ _KEYBOARD_KINDS = frozenset({ActionKind.TYPE, ActionKind.KEY})
 _ACTION_KIND_VALUES = frozenset(kind.value for kind in ActionKind)
 
 
+def _guarded(read):
+    """A value read from an untrusted object, or None if reading it fails."""
+    try:
+        return read()
+    except Exception:
+        return None
+
+
 def _service_contract_refusal(
     action: Action, snapshot: PerceptionSnapshot | None
 ) -> tuple[DecisionKind, str] | None:
@@ -143,6 +151,8 @@ class Gatekeeper:
         *,
         bound_input_only: bool = False,
         bound_observer: Callable[[int], Observation] | None = None,
+        bound_allow: AllowList | None = None,
+        bound_app_image: str | None = None,
         observation_max_age_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -152,6 +162,10 @@ class Gatekeeper:
         # The observer and the clock are trusted configuration fixed here; a
         # request can neither supply nor replace them.
         self._observe = bound_observer
+        # The allow-list and the application it applies to are trusted
+        # configuration too: a request only selects a path and step within them.
+        self._allow = bound_allow
+        self._app_image = bound_app_image
         self._max_age_s = observation_max_age_s
         self._clock = clock
         self._config = config
@@ -184,9 +198,7 @@ class Gatekeeper:
         )
 
     # ------------------------------------------------------------------ API
-    def request_bound_key(
-        self, request: BoundKeyRequest, frame: Frame, allow: AllowList
-    ) -> Decision:
+    def request_bound_key(self, request: BoundKeyRequest, frame: Frame) -> Decision:
         """One key for the pilot application, admitted only through the
         bound-target gate (``bound_target``). The screen is observed by the
         gatekeeper's own observer (fixed at construction): now, and again
@@ -230,7 +242,7 @@ class Gatekeeper:
 
         if not readable:
             return refuse(Refusal(Code.INVALID))
-        if self._observe is None:
+        if self._observe is None or self._allow is None or self._app_image is None:
             return refuse(Refusal(Code.NO_OBSERVER))
 
         def check() -> tuple[Observation | None, dict | None, Refusal | None]:
@@ -240,7 +252,12 @@ class Gatekeeper:
                 return None, None, Refusal(Code.OBSERVE_FAILED)
             try:
                 identity, refusal = bound_key_problem(
-                    request, allow, observed, now=self._clock(), max_age_s=self._max_age_s
+                    request,
+                    self._allow,
+                    observed,
+                    now=self._clock(),
+                    max_age_s=self._max_age_s,
+                    app_image=self._app_image,
                 )
             except Exception:
                 return observed, None, Refusal(Code.INVALID)
@@ -463,6 +480,18 @@ class Gatekeeper:
                     audit_reason=changed,
                 )
 
+        # 5c. the kill switch is checked again at the last moment: it may have
+        # been engaged while approval or the final observation was pending.
+        if killswitch.is_engaged(self._config.kill_switch_path):
+            return record(
+                DecisionKind.KILL_SWITCHED,
+                action,
+                risk,
+                approver="gatekeeper",
+                reason="kill switch engaged",
+                frame=frame,
+            )
+
         # 6. execute; failures are decisions too and must enter the audit chain.
         try:
             outcome = self._executor.execute(action)
@@ -503,11 +532,12 @@ class Gatekeeper:
             # binding only, with a fixed reason code: never typed text, never a
             # caller-supplied string, never an executor message. Safe for a
             # malformed action.
-            kind_value = getattr(getattr(action, "kind", None), "value", None)
-            frame_id = getattr(action, "frame_id", None)
+            kind_value = _guarded(lambda: action.kind.value)
+            frame_id = _guarded(lambda: action.frame_id)
             frame_id = frame_id if type(frame_id) is int else -1
+            valid_kind = type(kind_value) is str and kind_value in _ACTION_KIND_VALUES
             entry = {
-                "action": kind_value if kind_value in _ACTION_KIND_VALUES else "<invalid>",
+                "action": kind_value if valid_kind else "<invalid>",
                 "frame_id": frame_id,
                 "keys": audited_keys(action),
                 "binding": binding,

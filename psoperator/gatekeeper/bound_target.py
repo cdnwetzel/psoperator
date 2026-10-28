@@ -80,6 +80,7 @@ class Code(str, Enum):
     STALE = "observation-stale"
     OBSERVE_FAILED = "observation-failed"
     INSTANCE = "wrong-instance"
+    WRONG_APP = "wrong-application"
     INPUT_MODE = "input-mode-active"
     COVERED = "target-point-covered"
     NOT_FOREGROUND = "not-foreground"
@@ -557,6 +558,7 @@ def bound_key_problem(
     *,
     now: float,
     max_age_s: float,
+    app_image: str,
 ) -> tuple[dict | None, Refusal | None]:
     """The observed identity of the target and None, or None and why the key
     may not be sent on this observation."""
@@ -573,6 +575,8 @@ def bound_key_problem(
         return None, Refusal(Code.STALE)
     if obs.main_hwnd != request.main_hwnd or obs.instance != request.app_instance:
         return None, Refusal(Code.INSTANCE)
+    if not isinstance(app_image, str) or obs.image.lower() != app_image.lower():
+        return None, Refusal(Code.WRONG_APP)
     if obs.input_clear is not True:
         return None, Refusal(Code.INPUT_MODE)
     if obs.topmost_hwnd != obs.main_hwnd:
@@ -616,7 +620,10 @@ def unverified_record(target: object, frame_hash: object) -> dict:
 
 def audited_keys(action: object) -> list[str]:
     """Key names for the audit: recognised names only, safe for any input."""
-    keys = getattr(action, "keys", None)
+    try:
+        keys = action.keys
+    except Exception:
+        keys = None
     if not isinstance(keys, tuple):
         return ["<invalid>"]
     return [k if valid_key(k) else "<invalid>" for k in keys][:4]
