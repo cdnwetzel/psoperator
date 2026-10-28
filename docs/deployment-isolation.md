@@ -182,7 +182,7 @@ neither is not claimed and **fails closed**.
 | --- | --- | --- |
 | **Linux** | owner-only mode + owner-uid + TOCTOU-safe; verified in CI | **supported** |
 | **macOS** | same POSIX path; verified in CI | **supported** |
-| **Windows** | owner-only DACL, read from the opened handle; files created relative to a held, verified directory handle | **ported (D-01); Windows CI job to follow** |
+| **Windows** | owner-only DACL, read from the opened handle; files created relative to a held, verified directory handle | **supported; verified in CI** (D-01) |
 
 On Windows, "owner-only" means: owned by the running account; a present,
 protected DACL with no inherited entry; and every allow entry naming that
