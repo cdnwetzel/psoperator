@@ -115,8 +115,7 @@ def _obs(**change) -> Observation:
 
 def _req(**change) -> BoundKeyRequest:
     values = dict(
-        action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9", step=1,
-        app_instance=APP, main_hwnd=MAIN, target=FIELD,
+        action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9", step=1, target=FIELD,
     )  # fmt: skip
     values.update(change)
     return BoundKeyRequest(**values)
@@ -138,8 +137,9 @@ MENU_STEP_8 = AllowedStep(MENU, "8", (SUBMENU,))
 
 def _check(req=None, obs=None, now=100.5, allow=ALLOW):
     return bound_key_problem(
-        req or _req(), allow, obs or _obs(), now=now, max_age_s=1.0, app_image="app.exe"
-    )
+        req or _req(), allow, obs or _obs(), now=now, max_age_s=1.0, app_image="app.exe",
+        main_hwnd=MAIN, instance=APP,
+    )  # fmt: skip
 
 
 # --- keys and signatures ---------------------------------------------------------
@@ -214,6 +214,21 @@ def test_the_signature_and_fields_of_an_observed_tree():
     assert observed_fields(tree, APP, "app.exe") == (FIELD,)
     with pytest.raises(ValueError, match="focus"):
         signature_of(tree, OTHER, 0, instance=APP, image="app.exe")
+
+
+def test_a_menu_without_fields_is_told_apart_by_its_captions():
+    # A menu-shaped screen: one wide Edit (the menu's search box) and captions
+    # that label no field. Only the captions' hashes and places tell menus apart.
+    def menu(caption):
+        heading = WindowNode("wxWindowClassNR", (105, 105, 30, 20), name_hash=caption, hwnd=PANEL)
+        box = WindowNode("Edit", (160, 140, 600, 28), hwnd=EDIT, client_rect=(160, 140, 600, 28))
+        main = (100, 100, 800, 600)
+        return WindowNode("wxWindowNR", main, hwnd=MAIN, client_rect=main, children=(heading, box))
+
+    assert observed_fields(menu(D), APP, "app.exe") == ()
+    assert signature_of(menu(D), EDIT, 0, instance=APP, image="app.exe") == MENU
+    assert signature_of(menu(E), EDIT, 0, instance=APP, image="app.exe") == SUBMENU
+    assert MENU != SUBMENU
 
 
 # --- the allow-list ------------------------------------------------------------------
@@ -537,7 +552,7 @@ def _gatekeeper(tmp_path, observer=None, **kwargs):
     recorder = _Recorder()
     settings = dict(
         bound_observer=observer if observer is not None else Observer(), clock=lambda: 100.5,
-        bound_allow=ALLOW, bound_app_image="app.exe",
+        bound_allow=ALLOW, bound_app_image="app.exe", bound_window=(MAIN, APP),
     )  # fmt: skip
     settings.update(kwargs)
     gk = Gatekeeper(config, freshness, executor=recorder, **settings)
@@ -564,7 +579,86 @@ def test_an_admitted_key_is_observed_twice_executed_once_and_audited(tmp_path):
     assert verify(config.audit_log_path).ok
 
 
-@pytest.mark.parametrize("missing", ["bound_observer", "bound_allow", "bound_app_image"])
+class _Shifting:
+    """A request whose ``action`` is a different key on every read."""
+
+    def __init__(self, *actions):
+        self.actions = list(actions)
+        self.reads = 0
+        self.path, self.step, self.target = "9-9", 1, FIELD
+
+    @property
+    def action(self):
+        self.reads += 1
+        return self.actions[(self.reads - 1) % len(self.actions)]
+
+
+def test_the_action_checked_is_the_action_executed(tmp_path):
+    enter = Action(ActionKind.KEY, 1, keys=("ENTER",))
+    chord = Action(ActionKind.KEY, 1, keys=("ctrl", "y"))
+    request = _Shifting(enter, chord)
+    gk, config, recorder = _gatekeeper(tmp_path)
+    decision = gk.request_bound_key(request, _frame())
+    assert decision.kind is DecisionKind.EXECUTED and request.reads == 1
+    assert [a.keys for a in recorder.calls] == [("ENTER",)]
+    assert recorder.calls[0] is not enter  # a private copy was executed
+    assert _audit(config)[-1]["action"]["keys"] == ["ENTER"]
+    # Read first as the chord, the same request is refused and nothing runs.
+    request = _Shifting(chord, enter)
+    gk, _, recorder = _gatekeeper(tmp_path)
+    decision = gk.request_bound_key(request, _frame())
+    assert decision.reason == Code.CHORD.value and recorder.calls == [] and request.reads == 1
+
+
+class _ActionLike(Action):
+    pass
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        SimpleNamespace(action=_ActionLike(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9",
+                        step=1, target=FIELD),
+        SimpleNamespace(action=Action(ActionKind.KEY, 1, keys=["ENTER"]), path="9-9", step=1,
+                        target=FIELD),
+        SimpleNamespace(action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path=["9-9"],
+                        step=1, target=FIELD),
+        SimpleNamespace(action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9",
+                        step=True, target=FIELD),
+        SimpleNamespace(action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9", step=1,
+                        target="the field"),
+    ],
+    ids=["action-subclass", "keys-list", "path-list", "step-bool", "target-text"],
+)  # fmt: skip
+def test_a_request_that_is_not_plainly_a_key_request_is_refused(tmp_path, request_):
+    gk, _, recorder = _gatekeeper(tmp_path)
+    decision = gk.request_bound_key(request_, _frame())
+    assert decision.reason == Code.INVALID.value and recorder.calls == []
+
+
+def test_the_window_and_instance_are_fixed_at_construction(tmp_path):
+    with pytest.raises(TypeError):
+        BoundKeyRequest(
+            action=Action(ActionKind.KEY, 1, keys=("ENTER",)), path="9-9", step=1,
+            target=FIELD, main_hwnd=OTHER,
+        )  # fmt: skip
+    # Another window or instance of the same application, showing the same
+    # signature, is refused: the gatekeeper observes only its bound window.
+    for other in (_obs(main_hwnd=OTHER), _obs(instance=(4242, 8)), _obs(instance=(99, 7))):
+        observer = Observer(other)
+        gk, _, recorder = _gatekeeper(tmp_path, observer)
+        decision = gk.request_bound_key(_req(), _frame())
+        assert decision.reason == Code.INSTANCE.value and recorder.calls == []
+        assert observer.calls == [MAIN]
+    observer = Observer(_obs(main_hwnd=OTHER, foreground_hwnd=OTHER, topmost_hwnd=OTHER))
+    gk, _, recorder = _gatekeeper(tmp_path, observer, bound_window=(OTHER, APP))
+    assert gk.request_bound_key(_req(), _frame()).kind is DecisionKind.EXECUTED
+    assert observer.calls == [OTHER, OTHER]
+
+
+@pytest.mark.parametrize(
+    "missing", ["bound_observer", "bound_allow", "bound_app_image", "bound_window"]
+)
 def test_without_full_configuration_nothing_is_admitted(tmp_path, missing):
     gk, _, recorder = _gatekeeper(tmp_path, **{missing: None})
     decision = gk.request_bound_key(_req(), _frame())
@@ -603,7 +697,7 @@ _GATEKEEPER_REFUSALS = {
     "menu-mode": (dict(observer=Observer(_obs(input_clear=False))), Code.INPUT_MODE),
     "neighbour": (dict(observer=Observer(_obs(signature=NEIGHBOUR))), Code.SCREEN),
     "observer-fails": (dict(observer=Observer(fail=True)), Code.OBSERVE_FAILED),
-    "malformed-action": (dict(req=BROKEN), Code.CHORD),
+    "malformed-action": (dict(req=BROKEN), Code.INVALID),
     "focus-before-send": (dict(observer=_then(focus_hwnd=OTHER)), Code.NOT_FOCUSED),
     "screen-before-send": (dict(observer=_then(signature=MOVED_CAPTION)), Code.SCREEN),
     "menu-before-send": (dict(observer=_then(input_clear=False)), Code.INPUT_MODE),
@@ -760,6 +854,50 @@ def test_bound_input_only_closes_the_ordinary_path(tmp_path):
     assert [a.kind for a in recorder.calls] == [ActionKind.WAIT, ActionKind.KEY]
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        Action(ActionKind.CLICK, 1, x=1, y=1),
+        Action(ActionKind.RIGHT_CLICK, 1, x=1, y=1),
+        Action(ActionKind.DOUBLE_CLICK, 1, x=1, y=1),
+        Action(ActionKind.TYPE, 1, text="x"),
+        Action(ActionKind.KEY, 1, keys=("ENTER",)),
+        Action(ActionKind.SCROLL, 1, amount=-3),
+        Action(ActionKind.DRAG, 1, x=1, y=1, to_x=5, to_y=5),
+    ],
+    ids=lambda a: a.kind.value,
+)
+def test_bound_input_only_refuses_every_device_input_kind(tmp_path, action):
+    gk, _, recorder = _gatekeeper(tmp_path, bound_input_only=True)
+    decision = gk.request_action(action, _frame())
+    assert decision.kind is DecisionKind.DENIED and "bound-target gate" in decision.reason
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    "readings, kind",
+    [
+        ((True, False, False, False), DecisionKind.KILL_SWITCHED),
+        ((False, True, False, False), DecisionKind.DENIED),
+        ((False, False, False, False), DecisionKind.DENIED),
+    ],
+    ids=["on-then-off", "off-on-off", "off"],
+)
+def test_a_flipping_kill_switch_never_lets_unbound_input_through(
+    tmp_path, monkeypatch, readings, kind
+):
+    # Whatever the switch reads at each check, unbound input never executes:
+    # an engaged switch at the first check is recorded as such, and otherwise
+    # the bound-input denial applies however the switch reads later.
+    reads = list(readings)
+    monkeypatch.setattr(
+        gatekeeper_module.killswitch, "is_engaged", lambda path: reads.pop(0) if reads else False
+    )
+    gk, _, recorder = _gatekeeper(tmp_path, bound_input_only=True)
+    decision = gk.request_action(Action(ActionKind.KEY, 1, keys=("ENTER",)), _frame())
+    assert decision.kind is kind and recorder.calls == []
+
+
 def test_without_bound_input_only_the_ordinary_path_is_unchanged(tmp_path):
     gk, config, recorder = _gatekeeper(tmp_path)
     decision = gk.request_action(Action(ActionKind.KEY, 1, keys=("ENTER",)), _frame())
@@ -860,8 +998,8 @@ def test_a_real_covering_window_stops_the_key_at_the_gatekeeper(tmp_path):
         )
 
     def send():
-        gk, _, recorder = _gatekeeper(tmp_path, observe)
-        decision = gk.request_bound_key(_req(main_hwnd=bound), _frame())
+        gk, _, recorder = _gatekeeper(tmp_path, observe, bound_window=(bound, APP))
+        decision = gk.request_bound_key(_req(), _frame())
         return decision, recorder
 
     try:
@@ -882,17 +1020,18 @@ def test_a_real_covering_window_stops_the_key_at_the_gatekeeper(tmp_path):
             [sys.executable, "-c", _COVER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True,
         )  # fmt: skip
-        try:
-            owner = int(child.stdout.readline().strip())
-            assert owner, "the covering window was not created"
-            time.sleep(0.2)
-            assert process_of(win32_state.topmost_at(point))[0] == owner
-            decision, recorder = send()
-            assert decision.reason == Code.COVERED.value and recorder.calls == []
-        finally:
-            child.stdin.write("\n")
-            child.stdin.flush()
-            child.wait(timeout=10)
+        with child:  # closes both pipes
+            try:
+                owner = int(child.stdout.readline().strip())
+                assert owner, "the covering window was not created"
+                time.sleep(0.2)
+                assert process_of(win32_state.topmost_at(point))[0] == owner
+                decision, recorder = send()
+                assert decision.reason == Code.COVERED.value and recorder.calls == []
+            finally:
+                child.stdin.write("\n")
+                child.stdin.flush()
+                child.wait(timeout=10)
     finally:
         user32.DestroyWindow(bound)
 
@@ -970,3 +1109,98 @@ def test_the_recipient_is_read_last(monkeypatch):
     monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: state["recipient"])
     with pytest.raises(Win32FieldError, match="recipient"):
         win32_state.observe(MAIN)
+
+
+class _RecipientUser32:
+    def __init__(self, foregrounds):
+        self.foregrounds = list(foregrounds)
+
+    def GetForegroundWindow(self):
+        return self.foregrounds.pop(0) if len(self.foregrounds) > 1 else self.foregrounds[0]
+
+
+def _patched_recipient(monkeypatch, threads, foregrounds, on_topmost=None):
+    from psoperator.perception import win32_state
+
+    threads = list(threads)
+
+    def thread_state(u, i, hwnd):
+        return threads.pop(0) if len(threads) > 1 else threads[0]
+
+    def topmost(point):
+        if on_topmost:
+            on_topmost(threads)
+        return MAIN
+
+    monkeypatch.setattr(win32_state, "_thread_state", thread_state)
+    monkeypatch.setattr(win32_state, "_centre", lambda u, hwnd: (240, 142))
+    monkeypatch.setattr(win32_state, "topmost_at", topmost)
+    return win32_state, _RecipientUser32(foregrounds)
+
+
+def test_a_consistent_recipient_is_read(monkeypatch):
+    win32_state, user32 = _patched_recipient(monkeypatch, [(EDIT, True)], [MAIN])
+    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN)
+
+
+@pytest.mark.parametrize(
+    "threads, foregrounds",
+    [
+        ([(EDIT, True), (OTHER, True)], [MAIN]),
+        ([(EDIT, True), (EDIT, False)], [MAIN]),
+        ([(EDIT, True)], [MAIN, OTHER]),
+    ],
+    ids=["focus-moved", "menu-opened", "foreground-switched"],
+)
+def test_a_recipient_that_changes_while_read_is_refused(monkeypatch, threads, foregrounds):
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    win32_state, user32 = _patched_recipient(monkeypatch, threads, foregrounds)
+    with pytest.raises(Win32FieldError, match="while it was being read"):
+        win32_state._recipient(user32, None, MAIN)
+
+
+def test_focus_moving_during_the_covering_check_is_refused(monkeypatch):
+    # The focus moves while the top-level window at its centre is looked up:
+    # the point checked belonged to a control that no longer has focus.
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    def move(threads):
+        threads[:] = [(OTHER, True)]
+
+    win32_state, user32 = _patched_recipient(monkeypatch, [(EDIT, True)], [MAIN], move)
+    with pytest.raises(Win32FieldError, match="while it was being read"):
+        win32_state._recipient(user32, None, MAIN)
+
+
+class _EnumUser32:
+    def __init__(self, windows, ok=True):
+        self.windows, self.ok = windows, ok
+
+    def IsWindowVisible(self, h):
+        return True
+
+    def GetWindow(self, h, kind):
+        return self.windows[h]
+
+    def EnumWindows(self, visit, lparam):
+        for h in self.windows:
+            visit(h, lparam)
+        return int(self.ok)
+
+
+@windows_only
+def test_owned_dialogs_are_counted():
+    from psoperator.perception import win32_state
+
+    assert win32_state._owned_visible(_EnumUser32({0x50: MAIN, 0x60: OTHER}), MAIN) == 1
+
+
+@windows_only
+def test_a_failed_window_enumeration_is_not_zero_dialogs():
+    from psoperator.perception import win32_state
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    failing = _EnumUser32({}, ok=False)
+    with pytest.raises(Win32FieldError, match="enumerate"):
+        win32_state._owned_visible(failing, MAIN)

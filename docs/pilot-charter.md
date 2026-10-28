@@ -111,15 +111,19 @@ These hold from the start, so they never have to be retrofitted:
   every visible Edit's position, every label-class caption on screen as a
   hash and position (so menus without fields are told apart), every
   labelled field's hash and position, dialogs and focus. The gatekeeper does
-  not take the screen from the caller: its observer, clock, allow-list and
-  the application it applies to are fixed at construction (a request only
-  selects a path and step within them), and it observes (the foreground window, the top-level window
-  at the focused control, keyboard focus, menu and capture modes, dialogs,
-  the window tree) before checking and again immediately before sending; any
-  change refuses; the kill switch is checked again at the last moment. The
-  audited identity is built from that observation.
-  Refusals are audited with fixed codes; with `bound_input_only`, ordinary
-  input that bypasses the gate is refused. An empty allow-list refuses
+  not take the screen from the caller: its observer, clock, allow-list, the
+  application it applies to and the one main window and process instance it
+  may send to are fixed at construction. A request carries only the key, a
+  path and step within the allow-list, and the target; it is read once, and
+  the values checked are the values executed. The gatekeeper observes (the
+  foreground window, the top-level window at the focused control, keyboard
+  focus, menu and capture modes, dialogs, the window tree) before checking
+  and again immediately before sending; any change, or a failed read,
+  refuses; the kill switch is checked again at the last moment. The audited
+  identity is built from that observation. Refusals are audited with fixed
+  codes; with `bound_input_only`, every kind of device input (clicks, typing,
+  keys, scrolling, dragging) that bypasses the gate is refused, whatever the
+  kill switch reads after its first check. An empty allow-list refuses
   everything. The real allow-list, the application map and its dangerous
   paths are private configuration, never in this repository; the repository
   holds only the mechanism, tested with made-up paths.

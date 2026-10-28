@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -451,16 +451,35 @@ class OcrBox:
 
 @dataclass(frozen=True)
 class BoundKeyRequest:
-    """What a caller may say about a key: which, where in the allow-list, for
-    which process instance and main window, aimed at which control. The
-    screen itself is never part of the request."""
+    """What a caller may say about a key: which, where in the allow-list, and
+    aimed at which control. The application window, its process instance and
+    the screen are never part of the request: they are the gatekeeper's
+    configuration and observation."""
 
     action: Action
     path: str
     step: int
-    app_instance: tuple[int, int]
-    main_hwnd: int
     target: Win32Field | FocusedEdit | OcrBox | None
+
+
+_TARGET_TYPES = (Win32Field, FocusedEdit, OcrBox, type(None))
+
+
+def normalized(request: object) -> BoundKeyRequest:
+    """Read each field of ``request`` exactly once into a fresh, immutable
+    request, so the values checked are the values executed. Raises
+    ``ValueError`` for anything that is not plainly a key request."""
+    action, path, step, target = request.action, request.path, request.step, request.target
+    if type(action) is not Action:
+        raise ValueError("the action must be an Action")
+    keys = action.keys
+    if type(keys) is not tuple or not all(type(k) is str for k in keys):
+        raise ValueError("the keys must be a tuple of names")
+    if type(path) is not str or not _is_int(step) or type(target) not in _TARGET_TYPES:
+        raise ValueError("the path, step or target is malformed")
+    # A private copy: nobody else holds a reference to the action executed.
+    action = replace(action, keys=keys)
+    return BoundKeyRequest(action=action, path=path, step=step, target=target)
 
 
 def _path_to(root: WindowNode, hwnd: int) -> list[WindowNode] | None:
@@ -559,6 +578,8 @@ def bound_key_problem(
     now: float,
     max_age_s: float,
     app_image: str,
+    main_hwnd: int,
+    instance: tuple[int, int],
 ) -> tuple[dict | None, Refusal | None]:
     """The observed identity of the target and None, or None and why the key
     may not be sent on this observation."""
@@ -573,7 +594,7 @@ def bound_key_problem(
         return None, Refusal(Code.BAD_KEY)
     if not 0 <= now - obs.at <= max_age_s:
         return None, Refusal(Code.STALE)
-    if obs.main_hwnd != request.main_hwnd or obs.instance != request.app_instance:
+    if obs.main_hwnd != main_hwnd or obs.instance != instance:
         return None, Refusal(Code.INSTANCE)
     if not isinstance(app_image, str) or obs.image.lower() != app_image.lower():
         return None, Refusal(Code.WRONG_APP)

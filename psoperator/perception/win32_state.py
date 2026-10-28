@@ -57,6 +57,7 @@ def _api():
     user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
     return user32, GUITHREADINFO
 
 
@@ -103,7 +104,10 @@ def _owned_visible(user32, hwnd: int) -> int:
             found.append(h)
         return True
 
-    user32.EnumWindows(visit, 0)
+    # The callback never stops the enumeration, so a zero return is a failure:
+    # it must not pass for "no dialogs" (and two failures must not agree).
+    if not user32.EnumWindows(visit, 0):
+        raise Win32FieldError("cannot enumerate the top-level windows")
     return len(found)
 
 
@@ -121,11 +125,21 @@ def _recipient(user32, info_type, main_hwnd: int) -> tuple:
     """Who would receive a key now: the foreground window, the focused control,
     whether no menu/move-size/capture mode is active, the focused control's
     centre and the top-level window there."""
-    focus, clear = _thread_state(user32, info_type, main_hwnd)
+    thread = _thread_state(user32, info_type, main_hwnd)
+    foreground = int(user32.GetForegroundWindow() or 0)
+    focus, clear = thread
     if not focus:
         raise Win32FieldError("the main window's thread has no keyboard focus")
     point = _centre(user32, focus)
-    return (int(user32.GetForegroundWindow() or 0), focus, clear, point, topmost_at(point))
+    top = topmost_at(point)
+    # Focus, input modes and the foreground are sampled on both sides of the
+    # other reads: a change in between is an inconsistent recipient.
+    if (
+        _thread_state(user32, info_type, main_hwnd) != thread
+        or int(user32.GetForegroundWindow() or 0) != foreground
+    ):
+        raise Win32FieldError("the recipient changed while it was being read")
+    return (foreground, focus, clear, point, top)
 
 
 def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:

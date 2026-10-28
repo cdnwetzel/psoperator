@@ -78,7 +78,8 @@ class AuditLog:
     def _seq(self) -> int:
         if not self.path.exists():
             return 1
-        return sum(1 for _ in self.path.open("r", encoding="utf-8")) + 1
+        with self.path.open("r", encoding="utf-8") as f:
+            return sum(1 for _ in f) + 1
 
 
 @dataclass(frozen=True)

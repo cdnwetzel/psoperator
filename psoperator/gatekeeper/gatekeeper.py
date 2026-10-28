@@ -37,6 +37,7 @@ from psoperator.gatekeeper.bound_target import (
     Refusal,
     audited_keys,
     bound_key_problem,
+    normalized,
     unchanged,
     unverified_record,
 )
@@ -76,6 +77,8 @@ _INPUT_KINDS = frozenset(
     }
 )
 _KEYBOARD_KINDS = frozenset({ActionKind.TYPE, ActionKind.KEY})
+# Every kind that reaches the input device: what bound_input_only closes.
+_DEVICE_KINDS = _INPUT_KINDS | _SERVICE_REFUSED_KINDS
 _ACTION_KIND_VALUES = frozenset(kind.value for kind in ActionKind)
 
 
@@ -153,6 +156,7 @@ class Gatekeeper:
         bound_observer: Callable[[int], Observation] | None = None,
         bound_allow: AllowList | None = None,
         bound_app_image: str | None = None,
+        bound_window: tuple[int, tuple[int, int]] | None = None,
         observation_max_age_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -166,6 +170,9 @@ class Gatekeeper:
         # configuration too: a request only selects a path and step within them.
         self._allow = bound_allow
         self._app_image = bound_app_image
+        # The one main window (and its process instance: pid, start time) the
+        # gate may send keys to, fixed for this gatekeeper's lifetime.
+        self._window = bound_window
         self._max_age_s = observation_max_age_s
         self._clock = clock
         self._config = config
@@ -219,11 +226,12 @@ class Gatekeeper:
         # Reading the request is itself guarded: a malformed or hostile request
         # becomes an audited refusal, never an exception.
         try:
-            action, main_hwnd = request.action, request.main_hwnd
+            request = normalized(request)
+            action = request.action
             unverified = unverified_record(request.target, frame.sha256)
             readable = True
         except Exception:
-            action, main_hwnd = None, None
+            action = None
             unverified = {"kind": "invalid", "verified": False}
             readable = False
 
@@ -242,8 +250,10 @@ class Gatekeeper:
 
         if not readable:
             return refuse(Refusal(Code.INVALID))
-        if self._observe is None or self._allow is None or self._app_image is None:
+        if None in (self._observe, self._allow, self._app_image, self._window):
             return refuse(Refusal(Code.NO_OBSERVER))
+
+        main_hwnd, instance = self._window
 
         def check() -> tuple[Observation | None, dict | None, Refusal | None]:
             try:
@@ -258,6 +268,8 @@ class Gatekeeper:
                     now=self._clock(),
                     max_age_s=self._max_age_s,
                     app_image=self._app_image,
+                    main_hwnd=main_hwnd,
+                    instance=instance,
                 )
             except Exception:
                 return observed, None, Refusal(Code.INVALID)
@@ -287,13 +299,19 @@ class Gatekeeper:
         *,
         require_bound_input: bool = False,
     ) -> Decision:
-        # With bound_input_only, unbound input never reaches the device. The
-        # kill switch still wins, so it is recorded as such.
-        if (
-            self._bound_input_only
-            and action.kind in _INPUT_KINDS
-            and not killswitch.is_engaged(self._config.kill_switch_path)
-        ):
+        # The kill switch wins and is recorded as such. Otherwise, with
+        # bound_input_only, unbound input never reaches the device: that denial
+        # does not depend on the switch, which may change between two reads.
+        if killswitch.is_engaged(self._config.kill_switch_path):
+            return self._record(
+                DecisionKind.KILL_SWITCHED,
+                action,
+                None,
+                approver="gatekeeper",
+                reason="kill switch engaged",
+                frame=frame,
+            )
+        if self._bound_input_only and action.kind in _DEVICE_KINDS:
             return self._record(
                 DecisionKind.DENIED,
                 action,
