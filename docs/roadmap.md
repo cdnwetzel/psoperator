@@ -472,8 +472,12 @@ and DACL, read from the opened handle, and creates, renames and removes them
 relative to a held, verified directory handle (`psoperator/common/winacl.py`,
 `docs/deployment-isolation.md`). The gate's persistent state now works on
 Windows, and CI runs the whole suite on Windows (Python 3.11 to 3.13).
-Remaining here: the capture frame-hash pin test on Windows. The `doctor`
-probe and the cross-repo contract test live in the dx repository.
+The frame-hash contract on the capture path is pinned
+(`tests/test_capture_pin.py`): the BGRA-to-RGB conversion against a fixed
+digest on every platform, and on Windows a real desktop grab against an
+independent reader of the same shot and a PNG round trip. What remains of
+D-01 lives in the dx repository: the `doctor` probe and the cross-repo
+contract test (the dx.observer reader against this writer).
 
 Rationale: a breadth demo whose observer is unwired would undercut the
 governance pitch at exactly the moment a skeptical audience hears it. Attestation

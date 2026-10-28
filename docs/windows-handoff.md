@@ -22,7 +22,8 @@ the first endpoint as of 2026-10-28:
 | §4 probe | done; verdict in `docs/pilot-charter.md` |
 | D-01 owner-only checks | done; key, IPC secret and gate state verified by DACL (`docs/deployment-isolation.md`) |
 | D-01 Windows CI job | done; the whole suite runs on `windows-latest` |
-| next | rest of roadmap D-01: the capture frame-hash pin test on Windows |
+| D-01 capture pin test | done; `tests/test_capture_pin.py`, a real grab checked in Windows CI |
+| next | the gatekeeper's bound-target kind for Win32 fields and OCR boxes (`docs/pilot-charter.md`); the rest of D-01 is in the dx repository |
 
 Pick up at the first row not marked done: check it, report in one short
 message, and continue. Stop and ask before anything that is not in this file,
