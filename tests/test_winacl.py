@@ -313,8 +313,56 @@ def _write(directory: Path, name: str, data: bytes) -> None:
 
 
 @windows_only
-def test_current_user_sid_is_a_user_sid():
-    assert winacl.current_user_sid().startswith("S-1-5-")
+def test_current_user_sid_is_the_token_user(vault):
+    # Any SID form: a local or domain account is S-1-5-21-..., an Entra ID
+    # account S-1-12-1-.... Checked against whoami, an independent reader of
+    # the token, and against the owner of a file this process created.
+    import msvcrt
+
+    sid = winacl.current_user_sid()
+    assert sid.startswith("S-1-")
+    line = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert line.rsplit(",", 1)[1].strip('"') == sid
+    _write(vault, "mine", b"x")
+    fd = winacl.open_owner_only_for_read(vault / "mine")
+    try:
+        assert winacl.security_of_handle(msvcrt.get_osfhandle(fd)).owner_sid == sid
+    finally:
+        os.close(fd)
+
+
+@windows_only
+def test_a_null_dacl_is_parsed_as_null_and_refused(vault):
+    # Parser-level control: a real null DACL, not a hand-built SecurityInfo.
+    _set_dacl(vault, "D:NO_ACCESS_CONTROL")
+    _, kernel32, _ = winacl._api()
+    handle = winacl._open_no_follow(kernel32, vault, winacl._READ_CONTROL, 0x7)
+    try:
+        assert winacl.security_of_handle(handle).aces is None
+    finally:
+        kernel32.CloseHandle(handle)
+    with pytest.raises(OwnerOnlyError, match="null DACL"):
+        winacl.check_owner_only_dir(vault)
+    with pytest.raises(OwnerOnlyError, match="null DACL"):
+        winacl.check_trusted_parent(vault)
+
+
+@windows_only
+def test_a_verified_read_is_refused_while_a_writer_is_open(vault):
+    # The reader shares read only, so it never reads a file another handle can
+    # be writing, and no writer can open while it reads.
+    _write(vault, "secret", b"x")
+    with open(vault / "secret", "ab"):
+        with pytest.raises(OwnerOnlyError, match="cannot open"):
+            winacl.open_owner_only_for_read(vault / "secret")
+    fd = winacl.open_owner_only_for_read(vault / "secret")  # the control
+    try:
+        with pytest.raises(PermissionError):
+            open(vault / "secret", "ab")
+    finally:
+        os.close(fd)
 
 
 @windows_only
@@ -884,6 +932,52 @@ def test_unlink_removes_a_symlink_not_its_target(vault):
     with OwnerOnlyDir(vault) as held:
         held.unlink("link")
     assert sorted(p.name for p in vault.iterdir()) == ["secret"]
+
+
+class _Kernel32:
+    """The real kernel32, with FlushFileBuffers and CloseHandle recorded."""
+
+    def __init__(self, real, flush_ok: bool) -> None:
+        self._real, self._flush_ok = real, flush_ok
+        self.flushed: list[int] = []
+        self.closed: list[int] = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def FlushFileBuffers(self, handle):
+        self.flushed.append(handle)
+        if not self._flush_ok:
+            ctypes.set_last_error(5)
+            return 0
+        return self._real.FlushFileBuffers(handle)
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return self._real.CloseHandle(handle)
+
+
+@windows_only
+@pytest.mark.parametrize("flush_ok", [True, False], ids=["flushes", "flush-fails"])
+def test_sync_calls_the_flush_and_closes_its_handle(vault, monkeypatch, flush_ok):
+    # Removing FlushFileBuffers, or ignoring its failure, fails here: the
+    # success path must call it on a handle of its own (not the held one), a
+    # failure must raise, and the flush handle is closed either way.
+    real_api = winacl._api
+    advapi32, kernel32, ntdll = real_api()
+    recorder = _Kernel32(kernel32, flush_ok)
+    with OwnerOnlyDir(vault) as held:
+        monkeypatch.setattr(winacl, "_api", lambda: (advapi32, recorder, ntdll))
+        if flush_ok:
+            held.sync()
+        else:
+            with pytest.raises(OwnerOnlyError, match="flushing"):
+                held.sync()
+        root = held._handle
+        monkeypatch.undo()
+    assert len(recorder.flushed) == 1
+    assert recorder.flushed[0] != root
+    assert recorder.closed == recorder.flushed
 
 
 @windows_only

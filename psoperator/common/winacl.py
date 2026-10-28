@@ -565,7 +565,10 @@ def check_owner_only_dir(path: Path) -> None:
 def open_owner_only_for_read(path: Path) -> int:
     """Open ``path`` without following a reparse point, verify the *opened*
     file is a regular, owner-only file, and return a CRT file descriptor for
-    reading that file. Raises ``FileNotFoundError`` if it does not exist."""
+    reading that file. Raises ``FileNotFoundError`` if it does not exist.
+    The open shares read only, so it is refused while another handle may be
+    writing, deleting or renaming the file, and none can start while it is
+    held."""
     _require_windows()
     import msvcrt
 
@@ -574,7 +577,7 @@ def open_owner_only_for_read(path: Path) -> int:
         kernel32,
         Path(path),
         _GENERIC_READ | _READ_CONTROL | _FILE_READ_ATTRIBUTES,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        _FILE_SHARE_READ,
     )
     try:
         _verify_handle(kernel32, handle, str(path), directory=False)
@@ -590,6 +593,9 @@ def check_trusted_parent(path: Path) -> None:
     ``FileNotFoundError`` if it does not exist."""
     _require_windows()
     _, kernel32, _ = _api()
+    # Metadata only (no data access), so Windows applies no share-mode check
+    # to this open whatever the share flags say; it is a point-in-time policy
+    # check, like the POSIX stat of the ancestor.
     handle = _open_no_follow(
         kernel32,
         Path(path),
