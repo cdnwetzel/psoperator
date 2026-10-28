@@ -53,6 +53,7 @@ paths = [
     "psoperator/common/attestation.py",
     "psoperator/common/ipc.py",
     "psoperator/common/schema.py",
+    "psoperator/common/winacl.py",
     "psoperator/gatekeeper/",
     "psoperator/perception/snapshot.py",
     "psoperator/services/",
@@ -62,6 +63,7 @@ paths = [
     "tests/test_isolation.py",
     "tests/test_integration.py",
     "tests/test_observer.py",
+    "tests/test_winacl.py",
 ]
 ```
 
