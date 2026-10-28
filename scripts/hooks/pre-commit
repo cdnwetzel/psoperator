@@ -1,6 +1,13 @@
 #!/bin/sh
-# Privacy gate on what the commit would record (the staged blobs, not the working
-# tree). Uses the operator's private denylist when present.
+# Privacy gate on what the commit would record: the author and committer
+# identity, then the staged blobs (not the working tree). An email is published
+# with the commit as surely as its files. `git var` reports the identity the
+# commit will carry, from the config or the GIT_AUTHOR_*/GIT_COMMITTER_*
+# environment. Uses the operator's private denylist when present.
 # Enable once per clone: git config core.hooksPath scripts/hooks
-exec python3 "$(git rev-parse --show-toplevel)/scripts/privacy_scan.py" staged \
-    --denylist "${PRIVACY_DENYLIST:-$HOME/.config/pxx/public-denylist}"
+root="$(git rev-parse --show-toplevel)"
+denylist="${PRIVACY_DENYLIST:-$HOME/.config/pxx/public-denylist}"
+{ git var GIT_AUTHOR_IDENT && git var GIT_COMMITTER_IDENT; } \
+    | python3 "$root/scripts/privacy_scan.py" text --name commit-identity --denylist "$denylist" \
+    || exit 1
+exec python3 "$root/scripts/privacy_scan.py" staged --denylist "$denylist"

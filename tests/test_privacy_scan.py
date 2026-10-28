@@ -139,3 +139,83 @@ def test_staged_mode_scans_the_index_not_the_working_tree(tmp_path):
     assert _run("files", "--root", str(tmp_path)).returncode == 0  # the tree alone looks clean
     subprocess.run([*git, "add", "notes.txt"], check=True)
     assert _run("staged", "--root", str(tmp_path)).returncode == 0
+
+
+# --- the pre-commit hook refuses a denylisted identity ----------------------
+# An author or committer email is published with the commit as surely as its
+# files. These run the real hook in a throwaway repository with a fake term.
+
+_TERM = "examplecorp"
+
+
+def _hook_repo(tmp_path):
+    import shutil
+
+    if shutil.which("python3") is None:
+        pytest.skip("the hooks run python3, which is not on PATH")
+    repo = tmp_path / "repo"
+    shutil.copytree(_SCRIPT.parent, repo / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    denylist = tmp_path / "denylist"
+    denylist.write_text(f"{_TERM}\n")
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "config", "core.hooksPath", "scripts/hooks"], check=True)
+    subprocess.run([*git, "config", "user.name", "Someone"], check=True)
+    subprocess.run([*git, "config", "user.email", "someone@users.noreply.github.com"], check=True)
+    (repo / "notes.txt").write_text("nothing here\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    return repo, git, denylist
+
+
+def _commit(git, denylist, *extra, env_extra=None):
+    import os
+
+    env = {**os.environ, "PRIVACY_DENYLIST": str(denylist), **(env_extra or {})}
+    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        if not env_extra or name not in env_extra:
+            env.pop(name, None)
+    return subprocess.run(
+        [*git, "commit", "-q", "-m", "a plain message", *extra],
+        capture_output=True, text=True, env=env,
+    )  # fmt: skip
+
+
+def _committed(git) -> bool:
+    return (
+        subprocess.run(
+            [*git, "rev-parse", "-q", "--verify", "HEAD"], capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+def test_a_clean_identity_commits(tmp_path):
+    repo, git, denylist = _hook_repo(tmp_path)
+    result = _commit(git, denylist)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _committed(git)
+
+
+def test_a_denylisted_configured_email_is_refused(tmp_path):
+    repo, git, denylist = _hook_repo(tmp_path)
+    subprocess.run([*git, "config", "user.email", f"me@{_TERM}.test"], check=True)
+    result = _commit(git, denylist)
+    assert result.returncode != 0
+    assert "commit-identity" in result.stdout + result.stderr
+    assert _TERM not in result.stdout + result.stderr, "the finding echoed the term"
+    assert not _committed(git)
+
+
+@pytest.mark.parametrize("variable", ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"])
+def test_a_denylisted_email_from_the_environment_is_refused(tmp_path, variable):
+    repo, git, denylist = _hook_repo(tmp_path)
+    result = _commit(git, denylist, env_extra={variable: f"me@{_TERM}.test"})
+    assert result.returncode != 0
+    assert not _committed(git)
+
+
+def test_a_denylisted_author_option_is_refused(tmp_path):
+    repo, git, denylist = _hook_repo(tmp_path)
+    result = _commit(git, denylist, f"--author=Someone <me@{_TERM}.test>")
+    assert result.returncode != 0
+    assert not _committed(git)
