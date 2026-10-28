@@ -471,9 +471,9 @@ attestation key, the IPC secret and the gate's state through the file's owner
 and DACL, read from the opened handle, and creates, renames and removes them
 relative to a held, verified directory handle (`psoperator/common/winacl.py`,
 `docs/deployment-isolation.md`). The gate's persistent state now works on
-Windows. Remaining here: a protected Windows CI job, and the capture
-frame-hash pin test on Windows. The `doctor` probe and the cross-repo contract
-test live in the dx repository.
+Windows, and CI runs the whole suite on Windows (Python 3.11 to 3.13).
+Remaining here: the capture frame-hash pin test on Windows. The `doctor`
+probe and the cross-repo contract test live in the dx repository.
 
 Rationale: a breadth demo whose observer is unwired would undercut the
 governance pitch at exactly the moment a skeptical audience hears it. Attestation
