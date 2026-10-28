@@ -419,14 +419,85 @@ def test_a_directory_sync_failure_is_a_persistence_failure(private, monkeypatch)
     state = private.home / "gate_state.json"
     gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
 
-    def _no_durable_dir(directory):
+    def _no_durable_dir(*args):
         raise OSError("directory sync unavailable")
 
-    monkeypatch.setattr(AttestationGate, "_fsync_dir", staticmethod(_no_durable_dir))
+    if os.name == "nt":
+        monkeypatch.setattr(winacl.OwnerOnlyDir, "sync", _no_durable_dir)
+    else:
+        monkeypatch.setattr(AttestationGate, "_fsync_dir", staticmethod(_no_durable_dir))
     with pytest.raises(GateStateError):
         gate.admit(_captured_envelopes(1)[0], now=105.0)
     assert gate._last_frame_id is None, "the watermark advanced on an undurable write"
     assert gate._seen == {}, "a nonce was burned on an undurable write"
+
+
+@_windows_only
+def test_the_directory_that_received_the_rename_is_the_one_flushed(private, monkeypatch):
+    """One held handle does the create, the rename and the flush. Re-opening the
+    directory by path to flush it would prove nothing about the directory the
+    rename went into."""
+    events = []
+    real_replace, real_sync = winacl.OwnerOnlyDir.replace, winacl.OwnerOnlyDir.sync
+    real_init = winacl.OwnerOnlyDir.__init__
+
+    def _replace(self, fd, name):
+        events.append(("replace", id(self), self._handle))
+        return real_replace(self, fd, name)
+
+    def _sync(self):
+        events.append(("sync", id(self), self._handle))
+        return real_sync(self)
+
+    def _init(self, *args, **kwargs):
+        events.append(("open-by-path",))
+        return real_init(self, *args, **kwargs)
+
+    gate = AttestationGate(
+        AttestationKeyring([_key()]),
+        expected_epoch=EPOCH_A,
+        state_path=private.home / "gate_state.json",
+    )
+    monkeypatch.setattr(winacl.OwnerOnlyDir, "replace", _replace)
+    monkeypatch.setattr(winacl.OwnerOnlyDir, "sync", _sync)
+    monkeypatch.setattr(winacl.OwnerOnlyDir, "__init__", _init)
+    gate.admit(_captured_envelopes(1)[0], now=105.0)
+    assert [e[0] for e in events] == ["open-by-path", "replace", "sync"]
+    assert events[1][1:] == events[2][1:] and events[2][2] is not None
+
+
+@pytest.mark.parametrize("chunk", [1, 3], ids=["one-byte", "three-bytes"])
+def test_a_short_write_is_completed_not_persisted_short(private, monkeypatch, chunk):
+    """`os.write` may write less than asked. The gate loops until the whole
+    watermark is written, so a partial write never becomes the durable state."""
+    state = private.home / "gate_state.json"
+    gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+    real_write = os.write
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", lambda fd, data: real_write(fd, bytes(data[:chunk])))
+        gate.admit(_captured_envelopes(1)[0], now=105.0)
+    assert json.loads(state.read_text(encoding="utf-8")) == {
+        "last_frame_id": 1,
+        "last_issued_at": 101.0,
+    }
+
+
+def test_a_write_that_makes_no_progress_fails_closed(private, monkeypatch):
+    """No progress is a failure: nothing is renamed into place, no temp file is
+    left, the watermark does not advance and no nonce is burned."""
+    state = private.write(
+        private.home / "gate_state.json", '{"last_frame_id": 1, "last_issued_at": 101.0}'
+    )
+    gate = AttestationGate(AttestationKeyring([_key()]), expected_epoch=EPOCH_A, state_path=state)
+    envelope = _lifetime_env(2, "2" * 64, 101.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", lambda fd, data: 0)
+        with pytest.raises(GateStateError, match="short write"):
+            gate.admit(envelope, now=105.0)
+    assert gate._last_frame_id == 1 and gate._seen == {}
+    assert json.loads(state.read_text(encoding="utf-8"))["last_frame_id"] == 1
+    assert sorted(p.name for p in private.home.iterdir()) == ["gate_state.json"]
+    assert gate.admit(envelope, now=105.0).nonce == "2" * 64
 
 
 def test_a_symlinked_state_file_is_refused(private):

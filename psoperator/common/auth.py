@@ -56,9 +56,10 @@ def load_or_create_secret(path: Path) -> bytes:
 
 def _load_or_create_secret_windows(target: Path) -> bytes:
     """Read the secret through a handle whose owner and DACL were checked, or
-    create it owner-only in an owner-only directory. Every missing directory is
-    created owner-only; an existing directory must already be owner-only, since
-    the secret is created relative to a verified handle on it."""
+    create it owner-only in an owner-only directory. Missing directories are
+    created owner-only, each relative to a held handle on its parent
+    (``winacl.ensure_owner_only_dir``); an existing directory must already be
+    owner-only, since the secret is created relative to a verified handle on it."""
     from psoperator.common import winacl
 
     try:
@@ -77,8 +78,7 @@ def _load_or_create_secret_windows(target: Path) -> bytes:
         return secret
     secret = secrets.token_bytes(32)
     try:
-        winacl.make_owner_only_dirs(target.parent)
-        with winacl.OwnerOnlyDir(target.parent) as directory:
+        with winacl.ensure_owner_only_dir(target.parent) as directory:
             try:
                 fd = directory.create_file(target.name)
             except FileExistsError:

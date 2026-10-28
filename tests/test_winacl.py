@@ -623,19 +623,97 @@ def test_a_junction_is_not_a_trusted_parent(tmp_path, vault):
 @windows_only
 def test_missing_components_are_created_owner_only(tmp_path):
     target = tmp_path / "a" / "b" / "c"
-    winacl.make_owner_only_dirs(target)
+    with winacl.ensure_owner_only_dir(target) as held:
+        assert held.path == target
+        os.close(held.create_file("x"))
     for part in (tmp_path / "a", tmp_path / "a" / "b", target):
         winacl.check_owner_only_dir(part)
-    winacl.make_owner_only_dirs(target)  # all present: nothing to do
+    with winacl.ensure_owner_only_dir(target) as held:  # all present: just held
+        assert held.path == target
 
 
 @windows_only
-def test_existing_components_are_left_as_they_are(tmp_path):
+def test_an_existing_trusted_parent_is_left_as_it_is(tmp_path):
     (tmp_path / "plain").mkdir()
-    winacl.make_owner_only_dirs(tmp_path / "plain" / "private")
+    with winacl.ensure_owner_only_dir(tmp_path / "plain" / "private"):
+        pass
     winacl.check_owner_only_dir(tmp_path / "plain" / "private")
     with pytest.raises(OwnerOnlyError, match="not owner-only"):
         winacl.check_owner_only_dir(tmp_path / "plain")
+
+
+@windows_only
+def test_nothing_is_created_under_a_parent_others_can_change(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    _icacls_grant(shared, f"*{USERS}:(AD)")
+    with pytest.raises(OwnerOnlyError, match="not a safe parent"):
+        winacl.ensure_owner_only_dir(shared / "a" / "b")
+    assert list(shared.iterdir()) == []
+
+
+@windows_only
+def test_an_existing_target_must_be_owner_only(tmp_path):
+    (tmp_path / "plain").mkdir()
+    with pytest.raises(OwnerOnlyError, match="not owner-only"):
+        winacl.ensure_owner_only_dir(tmp_path / "plain")
+
+
+@windows_only
+def test_a_component_that_appears_meanwhile_must_be_owner_only(tmp_path, monkeypatch):
+    # Someone makes the next component, with an ordinary DACL, between the
+    # check and the create: the create reports it exists and the anchored
+    # open refuses it rather than descending into it.
+    def _raced(self, name):
+        (self.path / name).mkdir()
+        raise FileExistsError(name)
+
+    monkeypatch.setattr(OwnerOnlyDir, "create_dir", _raced)
+    with pytest.raises(OwnerOnlyError, match="not owner-only"):
+        winacl.ensure_owner_only_dir(tmp_path / "a" / "b")
+    assert not (tmp_path / "a" / "b").exists()
+
+
+@windows_only
+def test_creation_is_anchored_to_each_held_parent(tmp_path, monkeypatch):
+    # Deterministic: every missing component is created and then opened
+    # relative to the handle on the component before it, never by path.
+    calls = []
+    real_open = OwnerOnlyDir._nt_open
+
+    def _recording(self, name, access, disposition, options, descriptor, share=None):
+        calls.append((self.path, self._handle, name, disposition))
+        return real_open(self, name, access, disposition, options, descriptor, share)
+
+    def _no_path_create(path):
+        raise AssertionError(f"created by path: {path}")
+
+    monkeypatch.setattr(OwnerOnlyDir, "_nt_open", _recording)
+    monkeypatch.setattr(winacl, "create_owner_only_dir", _no_path_create)
+    with winacl.ensure_owner_only_dir(tmp_path / "a" / "b") as held:
+        final = held.path
+    create, open_ = winacl._FILE_CREATE, winacl._FILE_OPEN
+    assert [(path, name, disposition) for path, _, name, disposition in calls] == [
+        (tmp_path, "a", create),
+        (tmp_path, "a", open_),
+        (tmp_path / "a", "b", create),
+        (tmp_path / "a", "b", open_),
+    ]
+    assert all(handle is not None for _, handle, _, _ in calls)
+    assert calls[0][1] == calls[1][1] and calls[2][1] == calls[3][1] != calls[0][1]
+    assert final == tmp_path / "a" / "b"
+
+
+@windows_only
+def test_open_dir_refuses_what_is_not_owner_only(vault):
+    (vault / "plain").mkdir()
+    with OwnerOnlyDir(vault) as held:
+        with pytest.raises(OwnerOnlyError, match="not owner-only"):
+            held.open_dir("plain")
+        with pytest.raises(FileNotFoundError):
+            held.open_dir("missing")
+        with pytest.raises(OwnerOnlyError, match="refusing name"):
+            held.open_dir("..")
 
 
 def _read(directory: Path, name: str) -> bytes:
@@ -815,3 +893,32 @@ def test_sync_flushes_the_held_directory(vault):
         held.close()
         with pytest.raises(OwnerOnlyError, match="closed"):
             held.sync()
+
+
+@windows_only
+def test_sync_reopens_the_held_handle_itself(vault, monkeypatch):
+    # Deterministic: the flush re-opens the held directory relative to its own
+    # handle (an empty name), never by path.
+    calls = []
+    real_api = winacl._api
+
+    class _NtDll:
+        @staticmethod
+        def NtCreateFile(handle, access, attributes, io_status, *rest):
+            oa = attributes._obj
+            name = oa.ObjectName.contents
+            calls.append((oa.RootDirectory, ctypes.wstring_at(name.Buffer, name.Length // 2)))
+            return ctypes.c_long(0xC0000022 - 2**32).value  # STATUS_ACCESS_DENIED
+
+        @staticmethod
+        def RtlNtStatusToDosError(status):
+            return 5
+
+    with OwnerOnlyDir(vault) as held:
+        advapi32, kernel32, _ = real_api()
+        monkeypatch.setattr(winacl, "_api", lambda: (advapi32, kernel32, _NtDll))
+        with pytest.raises(OwnerOnlyError, match="NtCreateFile"):
+            held.sync()
+        root = held._handle
+        monkeypatch.undo()
+    assert calls == [(root, "")]

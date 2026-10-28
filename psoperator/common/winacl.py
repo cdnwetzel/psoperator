@@ -112,8 +112,9 @@ def owner_only_problem(info: SecurityInfo, user_sid: str) -> str | None:
 
 #: Rights that let an account add, remove or rename a directory's entries, or
 #: give itself those rights: add file, add subdirectory, delete child, delete,
-#: write DAC, write owner, generic write and generic all. Maximum-allowed asks
-#: for whatever the DACL grants, so it counts too.
+#: write DAC, write owner, generic write and generic all. MAXIMUM_ALLOWED is an
+#: access-request selector, not a right an entry grants; an entry carrying it
+#: is malformed or deliberately odd, and is refused conservatively.
 _CHANGES_ENTRIES = (
     0x2 | 0x4 | 0x40 | 0x00010000 | 0x00040000 | 0x00080000 | 0x02000000 | 0x10000000 | 0x40000000
 )
@@ -400,6 +401,10 @@ def _api():
 
 
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
+# A held directory: enough to read its descriptor and work below it. No
+# delete sharing, so it cannot be renamed or removed while held.
+_DIR_ACCESS = _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_TRAVERSE | _SYNCHRONIZE
+_DIR_SHARE = _FILE_SHARE_READ | _FILE_SHARE_WRITE
 
 
 def _error(what: str, code: int) -> OwnerOnlyError:
@@ -592,16 +597,20 @@ def check_trusted_parent(path: Path) -> None:
         _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
     )
     try:
-        attributes = _attributes(kernel32, handle)
-        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise OwnerOnlyError(f"{path} is a symlink or other reparse point")
-        if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
-            raise OwnerOnlyError(f"{path} is not a directory")
-        problem = trusted_parent_problem(security_of_handle(handle), current_user_sid())
-        if problem is not None:
-            raise OwnerOnlyError(f"{path} is not a safe parent: it {problem}")
+        _verify_parent(kernel32, handle, str(path))
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _verify_parent(kernel32, handle: int, where: str) -> None:
+    attributes = _attributes(kernel32, handle)
+    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OwnerOnlyError(f"{where} is a symlink or other reparse point")
+    if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+        raise OwnerOnlyError(f"{where} is not a directory")
+    problem = trusted_parent_problem(security_of_handle(handle), current_user_sid())
+    if problem is not None:
+        raise OwnerOnlyError(f"{where} is not a safe parent: it {problem}")
 
 
 def _owner_only_descriptor(advapi32) -> ctypes.c_void_p:
@@ -636,23 +645,42 @@ def create_owner_only_dir(path: Path) -> None:
         raise _error(f"creating directory {path}", code)
 
 
-def make_owner_only_dirs(path: Path) -> None:
-    """Create every missing component of ``path`` owner-only, by path. Existing
-    components are left as they are; open the result with
-    :class:`OwnerOnlyDir` to verify it."""
+def ensure_owner_only_dir(path: Path) -> "OwnerOnlyDir":
+    """Return ``path`` held as an :class:`OwnerOnlyDir`, creating every missing
+    component owner-only first.
+
+    Creation is anchored: the nearest existing ancestor is held and must be a
+    trusted parent (:func:`trusted_parent_problem`), and each missing component
+    is created and then opened relative to the handle on the one before it, so
+    no component is ever reached by path after its parent was checked. A
+    component that appears meanwhile is opened the same way and must be
+    owner-only. Existing ancestors above the nearest one are not judged, as on
+    POSIX."""
     _require_windows()
-    missing: list[Path] = []
-    current = Path(path)
+    target = Path(path)
+    missing: list[str] = []
+    current = target
     while not os.path.lexists(current):
-        missing.append(current)
         if current.parent == current:
-            break
+            raise FileNotFoundError(f"no existing ancestor of {target}")
+        missing.append(current.name)
         current = current.parent
-    for part in reversed(missing):
-        try:
-            create_owner_only_dir(part)
-        except FileExistsError:
-            pass  # made by someone else meanwhile; OwnerOnlyDir will judge it
+    if not missing:
+        return OwnerOnlyDir(target)
+    held = OwnerOnlyDir(current, _parent=True)
+    try:
+        for name in reversed(missing):
+            try:
+                held.create_dir(name)
+            except FileExistsError:
+                pass  # made meanwhile; open_dir judges it
+            child = held.open_dir(name)
+            held.close()
+            held = child
+    except BaseException:
+        held.close()
+        raise
+    return held
 
 
 def _rename_information(root: int, name: str) -> ctypes.Structure:
@@ -684,18 +712,21 @@ class OwnerOnlyDir:
     held, and every create or open below it is relative to this handle.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, _parent: bool = False) -> None:
         _require_windows()
         self.path = Path(path)
         _, kernel32, _ = _api()
-        self._handle = _open_no_follow(
-            kernel32,
-            self.path,
-            _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_TRAVERSE | _SYNCHRONIZE,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
-        )
+        self._handle = _open_no_follow(kernel32, self.path, _DIR_ACCESS, _DIR_SHARE)
+        self._verify(kernel32, parent=_parent)
+
+    def _verify(self, kernel32, *, parent: bool) -> None:
+        """Verify the held handle, owner-only (or, for the anchor of
+        :func:`ensure_owner_only_dir`, a trusted parent); close it if not."""
         try:
-            _verify_handle(kernel32, self._handle, str(self.path), directory=True)
+            if parent:
+                _verify_parent(kernel32, self._handle, str(self.path))
+            else:
+                _verify_handle(kernel32, self._handle, str(self.path), directory=True)
         except BaseException:
             kernel32.CloseHandle(self._handle)
             self._handle = None
@@ -724,13 +755,18 @@ class OwnerOnlyDir:
             raise OwnerOnlyError(f"refusing name in {self.path}: {problem}")
         return name
 
-    def _nt_create(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
+    def _nt_create(
+        self, name: str, access: int, disposition: int, options: int, descriptor, share=None
+    ) -> int:
         self._checked(name)
-        return self._nt_open(name, access, disposition, options, descriptor)
+        return self._nt_open(name, access, disposition, options, descriptor, share)
 
-    def _nt_open(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
+    def _nt_open(
+        self, name: str, access: int, disposition: int, options: int, descriptor, share=None
+    ) -> int:
         """``NtCreateFile`` relative to the held handle. An empty ``name``
-        opens the held directory itself."""
+        opens the held directory itself. ``share`` defaults to read sharing
+        for an open and none for a create."""
         from ctypes import wintypes
 
         root = self._held()
@@ -755,7 +791,7 @@ class OwnerOnlyDir:
             ctypes.byref(io_status),
             None,
             _FILE_ATTRIBUTE_NORMAL,
-            _FILE_SHARE_READ if disposition == _FILE_OPEN else 0,
+            share if share is not None else (_FILE_SHARE_READ if disposition == _FILE_OPEN else 0),
             disposition,
             options | _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT,
             None,
@@ -809,6 +845,20 @@ class OwnerOnlyDir:
         finally:
             kernel32.LocalFree(descriptor)
         kernel32.CloseHandle(handle)
+
+    def open_dir(self, name: str) -> "OwnerOnlyDir":
+        """Open subdirectory ``name`` relative to this handle, verify it is
+        owner-only, and return it held. Raises ``FileNotFoundError`` if it does
+        not exist."""
+        _, kernel32, _ = _api()
+        handle = self._nt_create(
+            name, _DIR_ACCESS, _FILE_OPEN, _FILE_DIRECTORY_FILE, None, _DIR_SHARE
+        )
+        child = OwnerOnlyDir.__new__(OwnerOnlyDir)
+        child.path = self.path / name
+        child._handle = handle
+        child._verify(kernel32, parent=False)
+        return child
 
     def open_file(self, name: str) -> int:
         """Open ``name`` in this directory for reading, verify the opened file

@@ -62,6 +62,18 @@ from psoperator.common.schema import AttestedSnapshot
 DEFAULT_MAX_NONCES = 4096
 
 
+def _write_fully(fd: int, data: bytes) -> None:
+    """``os.write`` may write less than it was given. A short watermark that
+    was then flushed and renamed into place would be admitted as durable, so
+    loop, and treat no progress as a failure."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while persisting gate state")
+        view = view[written:]
+
+
 class GateStateError(Exception):
     """The persisted gate state could not be read or written.
 
@@ -540,7 +552,7 @@ class AttestationGate:
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(tmp, flags, 0o600)
             try:
-                os.write(fd, payload.encode("utf-8"))
+                _write_fully(fd, payload.encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -554,17 +566,17 @@ class AttestationGate:
             raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
 
     def _write_state_windows(self, path: Path, payload: bytes) -> None:
-        """The same sequence anchored to a held, verified directory handle: the
-        temp file is created exclusively with an owner-only DACL, renamed over
-        the watermark relative to that handle, and the directory is flushed."""
+        """The same sequence anchored to one held, verified directory handle:
+        missing directories are created relative to their parents, the temp
+        file is created exclusively with an owner-only DACL, renamed over the
+        watermark relative to that handle, and the same handle is flushed."""
         tmp = f"{path.name}.{secrets.token_hex(8)}.tmp"
         try:
-            self._mkdir_owner_only(path.parent)
-            with winacl.OwnerOnlyDir(path.parent) as directory:
+            with winacl.ensure_owner_only_dir(path.parent) as directory:
                 fd = directory.create_file(tmp)
                 try:
                     try:
-                        os.write(fd, payload)
+                        _write_fully(fd, payload)
                         os.fsync(fd)
                         directory.replace(fd, path.name)
                     finally:
@@ -575,7 +587,7 @@ class AttestationGate:
                     except (OSError, winacl.OwnerOnlyError):
                         pass  # already renamed, or not removable; never mask the cause
                     raise
-            self._fsync_dir(path.parent)
+                directory.sync()
         except (OSError, winacl.OwnerOnlyError) as exc:
             raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
 
@@ -584,11 +596,7 @@ class AttestationGate:
         """Create every missing component ``0700``. ``mkdir(parents=True)``
         applies the mode to the leaf only, leaving intermediate directories to
         the umask, and a group-writable one lets another account move the state
-        directory below it away and back. On Windows each is created with an
-        owner-only, protected DACL instead."""
-        if os.name == "nt":
-            winacl.make_owner_only_dirs(directory)
-            return
+        directory below it away and back."""
         missing: list[Path] = []
         current = directory
         while not current.exists():
@@ -601,10 +609,6 @@ class AttestationGate:
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:
-        if os.name == "nt":
-            with winacl.OwnerOnlyDir(directory) as held:
-                held.sync()
-            return
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
