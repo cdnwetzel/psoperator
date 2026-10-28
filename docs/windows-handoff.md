@@ -23,7 +23,8 @@ the first endpoint as of 2026-10-28:
 | D-01 owner-only checks | done; key, IPC secret and gate state verified by DACL (`docs/deployment-isolation.md`) |
 | D-01 Windows CI job | done; the whole suite runs on `windows-latest` |
 | D-01 capture pin test | done; `tests/test_capture_pin.py`, a real grab checked in Windows CI |
-| next | the gatekeeper's bound-target kind for Win32 fields and OCR boxes (`docs/pilot-charter.md`); the rest of D-01 is in the dx repository |
+| read-only Win32 field provider | done; `psoperator/perception/win32_fields.py` |
+| next | the gatekeeper's bound-target kind on that identity (`docs/pilot-charter.md`); `WinAutoA11y` scoping deferred, UI Automation being unusable on the application; the rest of D-01 is in the dx repository |
 
 Pick up at the first row not marked done: check it, report in one short
 message, and continue. Stop and ask before anything that is not in this file,
