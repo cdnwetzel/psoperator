@@ -64,7 +64,8 @@ What each window carries:
   drawn label (0 of 64 equal to OCR). The visible labels are painted on the
   background and have no window.
 - **Edits:** Win32 returns no text for any of them, even text the probe had
-  just typed. OCR sees a value in 40 of 64. Values can only be read by OCR.
+  just typed. Neither tested Win32 path (`WM_GETTEXT`, pywinauto's
+  `window_text()`) returned field values; OCR read values in 40 of 64.
 - **Control ids:** negative and allocated at runtime. 0 of 64 matched between
   two openings of the same screen.
 

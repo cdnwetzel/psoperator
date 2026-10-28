@@ -61,8 +61,8 @@ These hold from the start, so they never have to be retrofitted:
    (`docs/windows-probe.md`). UI Automation is too slow on this application
    to use. The native Win32 window tree is complete and fast, and a field is
    identified by the internal name and rectangle of the panel beside it,
-   which held across restarts. Control ids change on every opening. Field
-   values cannot be read through Win32 and are read by OCR. Navigation was
+   which held across restarts. Control ids change on every opening. The
+   tested Win32 paths returned no field values; OCR read them. Navigation was
    driven by keystrokes, each step approved by the operator; the operator's
    manual for those keystroke sequences stays private, like the denylist.
 3. **Windows attestation port** (roadmap D-01, promoted into the pilot): the
@@ -92,8 +92,9 @@ These hold from the start, so they never have to be retrofitted:
   bound field. Some screens move focus when they open, and another window
   covered the application during the probe. This is R-301 on Windows.
 - **The `perception` extra must install `onnxruntime`,** which RapidOCR 2.x
-  needs and does not pull in. That fix comes with the OCR reading path, with
-  tests that do not change when OCR is present.
+  needs and does not pull in. That fix comes with the OCR reading path. The
+  test suite must give the same results with and without the optional OCR
+  packages installed.
 
 ## Open decisions
 

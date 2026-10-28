@@ -210,8 +210,9 @@ not planned.
   displays, and negative monitor origins where applicable.
 
 **Status (2026-10-28):** the Windows probe (`docs/windows-probe.md`) found
-UI Automation too slow on the pilot application. The pilot's provider is the
-Win32 window tree for identity plus OCR for values (charter, "Consequences of
+UI Automation too slow on the pilot application. The selected provider
+approach for the pilot, not yet built, is the Win32 window tree for identity
+plus OCR for values (charter, "Consequences of
 the probe verdict"). Coordinates agree at 96 DPI on one monitor; scaling and
 multiple displays are still to validate. `WinAutoA11y` is to be scoped to the
 target window in its own PR.
