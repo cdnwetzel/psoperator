@@ -136,10 +136,12 @@ def test_a_real_windows_grab_matches_an_independent_reader(monkeypatch):
             self._inner.close()
 
     monkeypatch.setattr(mss, "mss", _Recording)
+    from mss.exception import ScreenShotError
+
     try:
         grabber = MSSCapture(monitor=1)
-    except Exception as exc:  # no interactive desktop
-        pytest.skip(f"no desktop to capture: {type(exc).__name__}")
+    except ScreenShotError:  # mss's own error: no interactive desktop
+        pytest.skip("no desktop to capture")
     try:
         frame = grabber.grab()
     finally:
