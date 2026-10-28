@@ -35,6 +35,7 @@ from psoperator.gatekeeper.bound_target import (
     Code,
     Observation,
     Refusal,
+    audited_hash,
     audited_keys,
     bound_key_problem,
     normalized,
@@ -82,6 +83,11 @@ _KEYBOARD_KINDS = frozenset({ActionKind.TYPE, ActionKind.KEY})
 # Every kind that reaches the input device: what bound_input_only closes.
 _DEVICE_KINDS = _INPUT_KINDS | _SERVICE_REFUSED_KINDS
 _ACTION_KIND_VALUES = frozenset(kind.value for kind in ActionKind)
+# The binding recorded for a decision that never went through the bound gate.
+_UNBOUND = {"kind": "unbound", "verified": False}
+# What the audit records instead of an action that was never read, or was
+# rejected: the original object is not read again.
+_UNREAD, _REJECTED = "<unread>", "<rejected>"
 
 
 def _guarded(read):
@@ -228,6 +234,7 @@ class Gatekeeper:
                 reason="kill switch engaged",
                 frame=frame,
                 binding={"kind": "unread", "verified": False},
+                placeholder=_UNREAD,
             )
         # Reading the request is itself guarded: a malformed or hostile request
         # becomes an audited refusal, never an exception.
@@ -252,6 +259,7 @@ class Gatekeeper:
                 frame=frame,
                 binding=unverified,
                 audit_reason=refusal.code.value,
+                placeholder=None if readable else _REJECTED,
             )
 
         if not readable:
@@ -342,6 +350,7 @@ class Gatekeeper:
                 reason="kill switch engaged",
                 frame=frame,
                 binding=untrusted,
+                placeholder=None if untrusted is None else _REJECTED,
             )
         if untrusted is not None:
             return self._record(
@@ -353,6 +362,7 @@ class Gatekeeper:
                 frame=frame,
                 binding=untrusted,
                 audit_reason=Code.INVALID.value,
+                placeholder=_REJECTED,
             )
         if self._bound_input_only and action.kind in _DEVICE_KINDS:
             return self._record(
@@ -362,6 +372,7 @@ class Gatekeeper:
                 approver="gatekeeper",
                 reason="input must go through the bound-target gate",
                 frame=frame,
+                audit_reason=Code.UNBOUND_INPUT.value,
             )
         return self._decide(
             action, frame, context, snapshot, require_bound_input=require_bound_input
@@ -572,33 +583,42 @@ class Gatekeeper:
                 )
 
         # 6. execute; failures are decisions too and must enter the audit chain.
+        # 7. a bound key: read again right after the executor returns or
+        # raises (an executor can send the key and then fail). A difference is
+        # recorded as an incident, not hidden; a failure keeps its own kind.
+        failure: Exception | None = None
+        outcome = ""
+        incident: str | None = None
         try:
             outcome = self._executor.execute(action)
         except Exception as exc:  # execution boundary must fail closed
+            failure = exc
+        finally:
+            if post_send is not None:
+                incident = post_send()
+        if failure is not None:
+            detail = f"executor failed: {type(failure).__name__}: {failure}"
             return record(
                 DecisionKind.EXECUTION_FAILED,
                 action,
                 risk,
                 approver,
-                f"executor failed: {type(exc).__name__}: {exc}",
+                f"{incident}; {detail}" if incident else detail,
                 frame,
+                audit_reason=incident,
             )
         kind = DecisionKind.DRY_RUN if self._executor.name == "dry-run" else DecisionKind.EXECUTED
-        # 7. a bound key: read again right after the executor returns. The key
-        # has been sent; a difference is recorded as an incident, not hidden.
-        if post_send is not None:
-            incident = post_send()
-            if incident is not None:
-                return record(
-                    kind,
-                    action,
-                    risk,
-                    approver,
-                    incident,
-                    frame,
-                    outcome=outcome,
-                    audit_reason=incident,
-                )
+        if incident is not None:
+            return record(
+                kind,
+                action,
+                risk,
+                approver,
+                incident,
+                frame,
+                outcome=outcome,
+                audit_reason=incident,
+            )
         return record(kind, action, risk, approver, "ok", frame, outcome=outcome)
 
     # --------------------------------------------------------------- internals
@@ -613,33 +633,42 @@ class Gatekeeper:
         outcome: str = "",
         binding: dict | None = None,
         audit_reason: str | None = None,
+        placeholder: str | None = None,
     ) -> Decision:
         d = Decision(
             kind=kind, action=action, risk=risk, approver=approver, reason=reason, outcome=outcome
         )
-        if binding is None:
+        if binding is None and placeholder is None and not self._bound_input_only:
             entry = action.to_dict()
             audited = reason
             frame_id = action.frame_id
+            frame_hash = frame.sha256
         else:
-            # A bound action is recorded by kind, recognised key names and the
-            # binding only, with a fixed reason code: never typed text, never a
-            # caller-supplied string, never an executor message. Safe for a
-            # malformed action.
-            kind_value = _guarded(lambda: action.kind.value)
-            frame_id = _guarded(lambda: action.frame_id)
-            frame_id = frame_id if type(frame_id) is int else -1
-            valid_kind = type(kind_value) is str and kind_value in _ACTION_KIND_VALUES
+            # A bound action, and with bound_input_only every decision, is
+            # recorded by kind, recognised key names and the binding only, with
+            # a fixed reason code: never typed text, never a caller-supplied
+            # string, never an executor message. A rejected or unread action is
+            # recorded by a fixed placeholder and never read again.
+            if placeholder is not None:
+                kind_value, frame_id, keys = placeholder, -1, []
+            else:
+                kind_value = _guarded(lambda: action.kind.value)
+                if type(kind_value) is not str or kind_value not in _ACTION_KIND_VALUES:
+                    kind_value = "<invalid>"
+                frame_id = _guarded(lambda: action.frame_id)
+                frame_id = frame_id if type(frame_id) is int else -1
+                keys = audited_keys(action)
             entry = {
-                "action": kind_value if valid_kind else "<invalid>",
+                "action": kind_value,
                 "frame_id": frame_id,
-                "keys": audited_keys(action),
-                "binding": binding,
+                "keys": keys,
+                "binding": binding if binding is not None else _UNBOUND,
             }
             audited = audit_reason or kind.value
+            frame_hash = _guarded(lambda: audited_hash(frame.sha256)) or "<invalid>"
         self._audit.append(
             frame_id=frame_id,
-            frame_hash=frame.sha256,
+            frame_hash=frame_hash,
             action=entry,
             tier=int(risk.tier) if risk else -1,
             decision=kind.value,

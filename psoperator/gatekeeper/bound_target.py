@@ -66,8 +66,9 @@ _KEYS = frozenset(
 
 def valid_key(key: object) -> bool:
     """A key name the gate recognises: a digit, an upper-case letter or a
-    named key. Anything else is refused and never audited verbatim."""
-    return isinstance(key, str) and (key in _KEYS or re.fullmatch(r"[0-9A-Z]", key) is not None)
+    named key. Anything else is refused and never audited verbatim. Only an
+    exact ``str``: a subclass can compare equal to a name and hold other text."""
+    return type(key) is str and (key in _KEYS or re.fullmatch(r"[0-9A-Z]", key) is not None)
 
 
 class Code(str, Enum):
@@ -99,6 +100,7 @@ class Code(str, Enum):
     INVALID = "invalid-request"
     RECIPIENT_CHANGED = "recipient-changed-before-send"
     SENT_THEN_CHANGED = "recipient-changed-after-send"
+    UNBOUND_INPUT = "input-not-bound"
 
 
 @dataclass(frozen=True)
@@ -466,21 +468,64 @@ class BoundKeyRequest:
 
 _TARGET_TYPES = (Win32Field, FocusedEdit, OcrBox, type(None))
 
+_CLICK_FIELDS = frozenset({"target_element_id", "x", "y", "button"})
+# The optional fields each kind may carry; every other one must hold its default.
+_KIND_FIELDS = {
+    ActionKind.CLICK: _CLICK_FIELDS,
+    ActionKind.RIGHT_CLICK: _CLICK_FIELDS,
+    ActionKind.DOUBLE_CLICK: _CLICK_FIELDS,
+    ActionKind.TYPE: frozenset({"target_element_id", "text"}),
+    ActionKind.KEY: frozenset({"target_element_id", "keys"}),
+    ActionKind.SCROLL: frozenset({"target_element_id", "x", "y", "amount"}),
+    ActionKind.DRAG: frozenset({"target_element_id", "x", "y", "to_x", "to_y"}),
+    ActionKind.WAIT: frozenset({"seconds"}),
+    ActionKind.DONE: frozenset(),
+    ActionKind.FAIL: frozenset({"reason"}),
+}
+# Exact built-in types only: a subclass can hold other text or behave differently.
+_FIELD_TYPES = {
+    "target_element_id": (str,),
+    "x": (int,),
+    "y": (int,),
+    "to_x": (int,),
+    "to_y": (int,),
+    "text": (str,),
+    "amount": (int,),
+    "seconds": (int, float),
+    "button": (str,),
+    "reason": (str,),
+}
+_DEFAULTS = {name: None for name in _FIELD_TYPES} | {"button": "left"}
+
 
 def trusted_action(action: object) -> Action:
     """A private copy of ``action``, which must be exactly an :class:`Action`
     (frozen, so its fields cannot change between reads) with an
-    :class:`ActionKind` and a tuple of key names. Raises ``ValueError``
-    otherwise."""
+    :class:`ActionKind`, a tuple of key names and exact built-in types in every
+    field. Fields its kind does not use are dropped from the copy, so they
+    reach neither risk classification, the executor nor the audit. Raises
+    ``ValueError`` otherwise."""
     if type(action) is not Action:
         raise ValueError("the action must be an Action")
     keys = action.keys
     if type(action.kind) is not ActionKind:
         raise ValueError("the action kind must be an ActionKind")
+    if type(action.frame_id) is not int:
+        raise ValueError("the frame id must be an int")
     if type(keys) is not tuple or not all(type(k) is str for k in keys):
         raise ValueError("the keys must be a tuple of names")
+    used = _KIND_FIELDS[action.kind]
+    dropped = {}
+    for name, types in _FIELD_TYPES.items():
+        value = getattr(action, name)
+        if value is not None and type(value) not in types:
+            raise ValueError("a field has the wrong type")
+        if name not in used:
+            dropped[name] = _DEFAULTS[name]
+    if "keys" not in used:
+        keys = ()
     # Nobody else holds a reference to the copy that is checked and executed.
-    return replace(action, keys=keys)
+    return replace(action, keys=keys, **dropped)
 
 
 def normalized(request: object) -> BoundKeyRequest:
@@ -526,11 +571,17 @@ def _point_in(point: tuple[int, int], rect: Rect) -> bool:
 
 
 def _safe(value: object, pattern: re.Pattern) -> str:
-    return value if isinstance(value, str) and pattern.fullmatch(value) else "<invalid>"
+    return value if type(value) is str and pattern.fullmatch(value) else "<invalid>"
+
+
+def audited_hash(value: object) -> str:
+    """A 64-hex hash for the audit, or ``<invalid>``. Safe for any input."""
+    return _safe(value, _HASH)
 
 
 def _rect_list(value: object) -> list | None:
-    return list(value) if valid_rect(value) else None
+    exact = valid_rect(value) and all(type(v) is int for v in value)
+    return list(value) if exact else None
 
 
 def _verified_target(target: object, obs: Observation) -> tuple[dict | None, Refusal | None]:
@@ -665,6 +716,6 @@ def audited_keys(action: object) -> list[str]:
         keys = action.keys
     except Exception:
         keys = None
-    if not isinstance(keys, tuple):
+    if type(keys) is not tuple:
         return ["<invalid>"]
     return [k if valid_key(k) else "<invalid>" for k in keys][:4]

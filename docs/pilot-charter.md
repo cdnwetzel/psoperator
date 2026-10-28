@@ -123,11 +123,17 @@ These hold from the start, so they never have to be retrofitted:
   step before the executor is called, a fast reading of who would receive the
   key (foreground, focus, menu and capture modes, the window at the focused
   control) must equal the approved observation, or the key is not sent; the
-  same reading right after the executor returns records any difference as an
-  incident. No sequence of readings can see a change made after the last one,
-  so a window remains between the final reading and the key reaching the
-  input queue; it is narrowed to the executor's own call and every change
-  detected after the send is recorded, never hidden. The audited
+  same reading right after the executor returns, or raises, records any
+  difference as an incident. **Known limit:** these are samples, not a lock
+  on the system's input state. A change can begin inside the last reading
+  (focus or a menu can change while its final foreground read runs), so the
+  unobserved window starts inside the reader, before the executor is called,
+  and runs until the key is consumed. A change that happens and reverts
+  between two samples is not seen. A key accepted into the input queue is not
+  proof of where it was delivered. Sampling therefore cannot guarantee the
+  actual recipient or detect every intervening change; it refuses what it
+  sees before the send and records what it sees after. The operator has
+  accepted this residual race for the pilot. The audited
   identity is built from that observation. Refusals are audited with fixed
   codes; with `bound_input_only`, every kind of device input (clicks, typing,
   keys, scrolling, dragging) that bypasses the gate is refused, whatever the
@@ -137,7 +143,11 @@ These hold from the start, so they never have to be retrofitted:
   holds only the mechanism, tested with made-up paths.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
-  values or window text.
+  values or window text. With `bound_input_only`, every decision (refusals,
+  kill switch, done, fail, wait, executor failures) is recorded by action
+  kind, recognised key names, binding and a fixed reason code, never typed
+  text, a caller's reason or an executor message; a rejected request is
+  recorded as a fixed placeholder and not read again.
 - **`WinAutoA11y` must be scoped to the target window.** It walks the whole
   desktop today; one snapshot took 124 s. That fix is its own test-first PR.
 - **Every key is preceded by two checks:** the application is the foreground

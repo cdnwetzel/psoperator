@@ -559,7 +559,7 @@ def _gatekeeper(tmp_path, observer=None, **kwargs):
     )
     freshness = FreshnessTracker()
     freshness.observe(1)
-    recorder = _Recorder()
+    recorder = kwargs.pop("executor", None) or _Recorder()
     observer = observer if observer is not None else Observer()
     last = {}
 
@@ -631,13 +631,21 @@ class _LoggingRecorder(_Recorder):
         return super().execute(action)
 
 
-def _bracketed(tmp_path, log):
+class _SendsThenRaises(_LoggingRecorder):
+    """An executor that sends the key and then fails."""
+
+    def execute(self, action):
+        super().execute(action)
+        raise RuntimeError("secret executor text")
+
+
+def _bracketed(tmp_path, log, executor=_LoggingRecorder):
     config = load_config(
         audit_log_path=tmp_path / "audit.jsonl", kill_switch_path=tmp_path / "STOP"
     )
     freshness = FreshnessTracker()
     freshness.observe(1)
-    recorder = _LoggingRecorder(log)
+    recorder = executor(log)
     gk = Gatekeeper(
         config, freshness, executor=recorder, bound_observer=log.observe, clock=lambda: 100.5,
         bound_allow=ALLOW, bound_app_image="app.exe", bound_window=(MAIN, APP),
@@ -701,6 +709,43 @@ def test_a_failed_reading_after_the_send_is_recorded_as_an_incident(tmp_path):
     decision = gk.request_bound_key(_req(), _frame())
     assert decision.reason == Code.SENT_THEN_CHANGED.value and len(recorder.calls) == 1
     assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "log",
+    [
+        lambda: _Log(after=CHANGED_RECIPIENTS["focus-moved"]),
+        lambda: _Log(after=CHANGED_RECIPIENTS["foreground-switched"]),
+        lambda: _Log(fail={2}),
+    ],
+    ids=["focus-moved", "foreground-switched", "reading-failed"],
+)
+def test_an_executor_that_sends_then_raises_is_still_followed_by_the_reading(tmp_path, log):
+    # The executor may have queued the key before failing: the recipient is
+    # read again, and both the failure and the incident are recorded.
+    log = log()
+    gk, config, recorder = _bracketed(tmp_path, log, _SendsThenRaises)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert log.events == ["observe", "observe", "recipient", "execute", "recipient"]
+    assert decision.kind is DecisionKind.EXECUTION_FAILED and len(recorder.calls) == 1
+    assert decision.reason.startswith(Code.SENT_THEN_CHANGED.value)
+    entry = _audit(config)[-1]
+    assert entry["decision"] == "execution-failed"
+    assert entry["reason"] == Code.SENT_THEN_CHANGED.value
+    assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
+    assert verify(config.audit_log_path).ok
+
+
+def test_an_executor_that_raises_with_the_recipient_unchanged_is_a_plain_failure(tmp_path):
+    # The control: the reading still happens, finds nothing, and the
+    # failure is recorded with its own code only.
+    log = _Log()
+    gk, config, _ = _bracketed(tmp_path, log, _SendsThenRaises)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert log.events == ["observe", "observe", "recipient", "execute", "recipient"]
+    assert decision.kind is DecisionKind.EXECUTION_FAILED
+    assert not decision.reason.startswith(Code.SENT_THEN_CHANGED.value)
+    assert _audit(config)[-1]["reason"] == "execution-failed"
 
 
 class _Shifting:
@@ -937,7 +982,8 @@ def test_an_action_whose_properties_raise_is_refused_and_recorded(tmp_path):
     decision = gk.request_bound_key(_req(action=_HostileAction()), _frame())
     assert decision.kind is DecisionKind.DENIED and recorder.calls == []
     entry = _audit(config)[-1]
-    assert entry["action"]["action"] == "<invalid>" and entry["action"]["keys"] == ["<invalid>"]
+    # A rejected action is recorded by a fixed placeholder, never read again.
+    assert entry["action"]["action"] == "<rejected>" and entry["action"]["keys"] == []
     assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
 
 
@@ -993,10 +1039,11 @@ def test_bound_input_only_closes_the_ordinary_path(tmp_path):
     ids=lambda a: a.kind.value,
 )
 def test_bound_input_only_refuses_every_device_input_kind(tmp_path, action):
-    gk, _, recorder = _gatekeeper(tmp_path, bound_input_only=True)
+    gk, config, recorder = _gatekeeper(tmp_path, bound_input_only=True)
     decision = gk.request_action(action, _frame())
     assert decision.kind is DecisionKind.DENIED and "bound-target gate" in decision.reason
     assert recorder.calls == []
+    assert _audit(config)[-1]["reason"] == Code.UNBOUND_INPUT.value
 
 
 @pytest.mark.parametrize(
@@ -1086,6 +1133,201 @@ def test_without_bound_input_only_the_ordinary_path_is_unchanged(tmp_path):
     assert decision.kind is DecisionKind.EXECUTED
     entry = _audit(config)[-1]
     assert entry["reason"] == "ok" and "binding" not in entry["action"]
+
+
+# --- nothing caller-supplied reaches the audit -----------------------------------------
+
+SENTINEL = "SENTINEL-7f3a-caller-text"
+
+
+class _LooksLikeEnter(str):
+    """A str subclass that compares and hashes like "ENTER" but holds other
+    text: serialised, it would write that text."""
+
+    def __eq__(self, other):
+        return other == "ENTER" or str.__eq__(self, other)
+
+    def __hash__(self):
+        return hash("ENTER")
+
+
+class _RaisesSentinel:
+    name = "raises"
+
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, action):
+        self.calls.append(action)
+        raise RuntimeError(SENTINEL)
+
+
+def _forced(tier):
+    return lambda *a, **k: RiskAssessment(tier, (SENTINEL,))
+
+
+# (how to ask, the decision expected, gatekeeper settings, a forced risk tier)
+_SENTINEL_OUTCOMES = {
+    "typing-denied": (
+        lambda gk: gk.request_action(Action(ActionKind.TYPE, 1, text=SENTINEL), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "element-click-denied": (
+        lambda gk: gk.request_action(
+            Action(ActionKind.CLICK, 1, target_element_id=SENTINEL), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "fail-reason": (
+        lambda gk: gk.request_action(Action(ActionKind.FAIL, 1, reason=SENTINEL), _frame()),
+        DecisionKind.FAILED, {}, None),
+    "done": (
+        lambda gk: gk.request_action(Action(ActionKind.DONE, 1), _frame()),
+        DecisionKind.DONE, {}, None),
+    "wait": (
+        lambda gk: gk.request_action(Action(ActionKind.WAIT, 1, seconds=0.01), _frame()),
+        DecisionKind.EXECUTED, {}, None),
+    "stale": (
+        lambda gk: gk.request_action(Action(ActionKind.FAIL, 99, reason=SENTINEL), _frame()),
+        DecisionKind.REJECTED_STALE, {}, None),
+    "kill-switched": (
+        lambda gk: gk.request_action(Action(ActionKind.TYPE, 1, text=SENTINEL), _frame()),
+        DecisionKind.KILL_SWITCHED, {"stop": True}, None),
+    "wrong-field-type": (
+        lambda gk: gk.request_action(Action(ActionKind.KEY, 1, keys=("ENTER",),
+                                            text=[SENTINEL]), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "str-subclass-key": (
+        lambda gk: gk.request_action(
+            Action(ActionKind.KEY, 1, keys=(_LooksLikeEnter(SENTINEL),)), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "str-subclass-kill-switched": (
+        lambda gk: gk.request_action(
+            Action(ActionKind.KEY, 1, keys=(_LooksLikeEnter(SENTINEL),)), _frame()),
+        DecisionKind.KILL_SWITCHED, {"stop": True}, None),
+    "executor-raises": (
+        lambda gk: gk.request_action(Action(ActionKind.WAIT, 1, seconds=0.01), _frame()),
+        DecisionKind.EXECUTION_FAILED, {"executor": _RaisesSentinel}, None),
+    "t3-blocked": (
+        lambda gk: gk.request_action(Action(ActionKind.WAIT, 1, seconds=0.01), _frame()),
+        DecisionKind.DENIED, {}, RiskTier.T3_DESTRUCTIVE),
+    "frame-hash-text": (
+        lambda gk: gk.request_action(Action(ActionKind.WAIT, 1, seconds=0.01),
+                                     SimpleNamespace(frame_id=1, sha256=SENTINEL)),
+        DecisionKind.EXECUTED, {}, None),
+    "bound-typing": (
+        lambda gk: gk.request_bound_key(
+            _req(action=Action(ActionKind.TYPE, 1, text=SENTINEL)), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "bound-str-subclass-key": (
+        lambda gk: gk.request_bound_key(
+            _req(action=Action(ActionKind.KEY, 1, keys=(_LooksLikeEnter(SENTINEL),))), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "bound-path": (
+        lambda gk: gk.request_bound_key(_req(path=SENTINEL), _frame()),
+        DecisionKind.DENIED, {}, None),
+    "bound-executor-raises": (
+        lambda gk: gk.request_bound_key(_req(), _frame()),
+        DecisionKind.EXECUTION_FAILED, {"executor": _RaisesSentinel}, None),
+    "bound-kill-switched": (
+        lambda gk: gk.request_bound_key(
+            _req(action=Action(ActionKind.KEY, 1, keys=(_LooksLikeEnter(SENTINEL),))), _frame()),
+        DecisionKind.KILL_SWITCHED, {"stop": True}, None),
+}  # fmt: skip
+
+
+def _sentinel_gatekeeper(tmp_path, monkeypatch, settings, tier, bound_only=True):
+    settings = dict(settings)
+    if tier is not None:
+        monkeypatch.setattr(gatekeeper_module, "classify", _forced(tier))
+    executor = settings.pop("executor", None)
+    gk, config, _ = _gatekeeper(
+        tmp_path, bound_input_only=bound_only, executor=executor() if executor else None
+    )
+    if settings.pop("stop", False):
+        config.kill_switch_path.write_text("stop", encoding="utf-8")
+    return gk, config
+
+
+@pytest.mark.parametrize(
+    "ask, kind, settings, tier", list(_SENTINEL_OUTCOMES.values()), ids=list(_SENTINEL_OUTCOMES)
+)
+def test_with_bound_input_only_no_outcome_writes_caller_text(
+    tmp_path, monkeypatch, ask, kind, settings, tier
+):
+    gk, config = _sentinel_gatekeeper(tmp_path, monkeypatch, settings, tier)
+    decision = ask(gk)
+    assert decision.kind is kind
+    raw = config.audit_log_path.read_text(encoding="utf-8")
+    assert SENTINEL not in raw and "SENTINEL" not in raw
+    entry = _audit(config)[-1]
+    assert set(entry["action"]) == {"action", "frame_id", "keys", "binding"}
+    assert verify(config.audit_log_path).ok
+
+
+@pytest.mark.parametrize("name", ["typing-denied", "fail-reason", "stale"])
+def test_the_sentinel_check_can_fail(tmp_path, monkeypatch, name):
+    # The negative control: on the ordinary path the same requests do write
+    # the caller's text, so the check above would see a leak.
+    ask, _, settings, tier = _SENTINEL_OUTCOMES[name]
+    gk, config = _sentinel_gatekeeper(tmp_path, monkeypatch, settings, tier, bound_only=False)
+    ask(gk)
+    assert SENTINEL in config.audit_log_path.read_text(encoding="utf-8")
+
+
+def test_a_rejected_action_is_recorded_by_a_placeholder_and_not_read_again(tmp_path):
+    reads = []
+
+    class _CountingKeys(tuple):
+        def __iter__(self):
+            reads.append("iter")
+            return super().__iter__()
+
+    action = Action(ActionKind.KEY, 1, keys=_CountingKeys(("ENTER",)))
+    gk, config, recorder = _gatekeeper(tmp_path, bound_input_only=True)
+    decision = gk.request_action(action, _frame())
+    assert decision.reason == Code.INVALID.value and recorder.calls == []
+    assert reads == []  # rejected on its type, never iterated, never audited
+    entry = _audit(config)[-1]["action"]
+    assert entry == {"action": "<rejected>", "frame_id": -1, "keys": [],
+                     "binding": {"kind": "invalid", "verified": False}}  # fmt: skip
+
+
+def test_a_str_subclass_is_never_a_recognised_key():
+    sneaky = _LooksLikeEnter(SENTINEL)
+    assert sneaky == "ENTER" and sneaky in {"ENTER"}  # what made it dangerous
+    assert not valid_key(sneaky)
+    assert audited_keys(SimpleNamespace(keys=(sneaky,))) == ["<invalid>"]
+
+
+@pytest.mark.parametrize("bound_only", [True, False], ids=["bound-only", "ordinary"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        Action(ActionKind.KEY, 1, keys=("ENTER",), text=["x"]),
+        Action(ActionKind.DONE, 1, text=["x"]),
+        Action(ActionKind.FAIL, 1, reason=["x"]),
+        Action(ActionKind.WAIT, 1, seconds=0.01, text=["x"]),
+        Action(ActionKind.WAIT, 1, seconds=True),
+        Action(ActionKind.FAIL, 1, target_element_id=b"x"),
+        Action(ActionKind.WAIT, True, seconds=0.01),
+    ],
+    ids=["key-text-list", "done-text-list", "fail-reason-list", "wait-text-list",
+         "wait-seconds-bool", "fail-element-bytes", "wait-frame-bool"],
+)  # fmt: skip
+def test_a_field_of_the_wrong_type_is_an_audited_invalid_refusal(tmp_path, bound_only, action):
+    # Before, risk classification raised AttributeError on these, unaudited.
+    gk, config, recorder = _gatekeeper(tmp_path, bound_input_only=bound_only)
+    decision = gk.request_action(action, _frame())
+    assert decision.kind is DecisionKind.DENIED and decision.reason == Code.INVALID.value
+    assert recorder.calls == []
+    assert _audit(config)[-1]["reason"] == Code.INVALID.value
+
+
+def test_fields_a_kind_does_not_use_are_dropped_from_the_executed_copy(tmp_path):
+    gk, _, recorder = _gatekeeper(tmp_path)
+    action = Action(ActionKind.WAIT, 1, seconds=0.01, x=25, y=30, text="t", keys=("ENTER",))
+    assert gk.request_action(action, _frame()).approved
+    executed = recorder.calls[0]
+    assert (executed.x, executed.y, executed.text, executed.keys) == (None, None, None, ())
+    assert executed.seconds == 0.01
 
 
 # --- live observation (Windows) ------------------------------------------------------------

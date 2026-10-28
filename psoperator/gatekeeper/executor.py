@@ -37,16 +37,34 @@ class DryRunExecutor:
         return f"dry-run: would execute {action.to_text()}"
 
 
+def pynput_key(name: object, key_enum):
+    """The pynput key for a key name: one character as itself, any other name
+    (the gate's ENTER, ESC, TAB, SPACE, BACKSPACE, arrows and F1-F12, or a
+    planner's lower-case ``ctrl``) as the member of ``key_enum`` (pynput's
+    ``Key``) it names. Raises ``ValueError`` for anything else, so an unknown
+    name is never passed on to be typed."""
+    if type(name) is not str or not name:
+        raise ValueError("a key name must be a non-empty string")
+    if len(name) == 1:
+        return name
+    member = key_enum.__members__.get(name.lower())
+    if member is None:
+        raise ValueError("not a key name pynput knows")
+    return member
+
+
 class PynputExecutor:
     """Real input injection via pynput controllers.
 
     This is the single sanctioned input-injection site in the codebase.
     Construct it only from the gatekeeper, only after operator opt-in.
+    ``keyboard`` and ``mouse`` replace the real controllers (tests pass
+    recording ones).
     """
 
     name = "pynput"
 
-    def __init__(self) -> None:
+    def __init__(self, keyboard=None, mouse=None) -> None:
         try:
             from pynput.keyboard import Controller as KbController
             from pynput.keyboard import Key
@@ -54,13 +72,13 @@ class PynputExecutor:
             from pynput.mouse import Controller as MouseController
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("pynput not installed") from e
-        self._mouse = MouseController()
-        self._kb = KbController()
+        self._mouse = mouse if mouse is not None else MouseController()
+        self._kb = keyboard if keyboard is not None else KbController()
         self._Key = Key
         self._Button = Button
 
-    def _key(self, name: str):  # pragma: no cover - needs a display
-        return getattr(self._Key, name, name)
+    def _key(self, name: str):
+        return pynput_key(name, self._Key)
 
     def execute(self, action: Action) -> str:  # pragma: no cover - needs a display
         k = action.kind
@@ -73,11 +91,17 @@ class PynputExecutor:
             self._kb.type(action.text or "")
             return f"typed {len(action.text or '')} chars"
         if k is ActionKind.KEY:
+            # Every name is resolved before anything is pressed; whatever was
+            # pressed is released even if a later press fails.
             keys = [self._key(n) for n in action.keys]
-            for key in keys:
-                self._kb.press(key)
-            for key in reversed(keys):
-                self._kb.release(key)
+            pressed = []
+            try:
+                for key in keys:
+                    self._kb.press(key)
+                    pressed.append(key)
+            finally:
+                for key in reversed(pressed):
+                    self._kb.release(key)
             return f"pressed {'+'.join(action.keys)}"
         if k is ActionKind.SCROLL:
             if action.x is not None:
