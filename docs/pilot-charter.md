@@ -81,7 +81,9 @@ These hold from the start, so they never have to be retrofitted:
   rectangle) or an OCR box, bound to the hash of the frame it was seen in.
   The gatekeeper admits input only against a target bound that way. This is a
   separate, test-first PR after D-01, because the frame hash it binds to is
-  the Windows attestation contract.
+  the Windows attestation contract. The field identity it binds is read by
+  `psoperator/perception/win32_fields.py`: read-only, no window text or
+  field values, the label panel's internal name kept only as a SHA-256.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
   values or window text.
