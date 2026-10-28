@@ -20,7 +20,8 @@ the first endpoint as of 2026-10-28:
 | §2.6 install, §2.7 baseline | done; 489 passed, 19 failed, 14 skipped (`docs/windows-probe.md`) |
 | §2.8 agents | done; Claude Code, Codex and `gh` signed in |
 | §4 probe | done; verdict in `docs/pilot-charter.md` |
-| next | roadmap D-01, the Windows attestation port |
+| D-01 owner-only checks | done; key, IPC secret and gate state verified by DACL (`docs/deployment-isolation.md`) |
+| next | rest of roadmap D-01: Windows CI job, then the capture frame-hash pin test |
 
 Pick up at the first row not marked done: check it, report in one short
 message, and continue. Stop and ask before anything that is not in this file,
@@ -133,6 +134,8 @@ order, so do not mix it in.
    (`psoperator/gatekeeper/attestation_gate.py`, `_read_state_bytes`). Record
    the failing tests as the Windows baseline in the probe PR. Do not weaken a
    refusal to make a test pass; porting those checks is part of roadmap D-01.
+   (Since ported: the gate verifies its state by DACL, and only two invoice
+   fixture tests still fail on Windows.)
 8. **Agents.** Install Claude Code with its native Windows installer, which
    runs in **PowerShell** (the one exception to Git Bash above), and the Codex
    CLI with `npm install -g @openai/codex`. Open a new Git Bash, check

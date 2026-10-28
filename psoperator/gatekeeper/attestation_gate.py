@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from psoperator.common import winacl
 from psoperator.common.attestation import (
     AttestationKeyring,
     UnknownAttestationKey,
@@ -59,6 +60,18 @@ from psoperator.common.schema import AttestedSnapshot
 #: inside its lifetime. Eviction is now driven by expiry, where it is provably
 #: free, and the count only caps memory.
 DEFAULT_MAX_NONCES = 4096
+
+
+def _write_fully(fd: int, data: bytes) -> None:
+    """``os.write`` may write less than it was given. A short watermark that
+    was then flushed and renamed into place would be admitted as durable, so
+    loop, and treat no progress as a failure."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while persisting gate state")
+        view = view[written:]
 
 
 class GateStateError(Exception):
@@ -349,10 +362,7 @@ class AttestationGate:
         traverse a symlink at the final component.
         """
         if os.name == "nt":
-            raise GateStateError(
-                f"gate state ownership cannot be verified on Windows: {path}. Refusing "
-                "to trust an unverified ACL for a file that gates replay rejection."
-            )
+            return self._read_state_bytes_windows(path)
         # Checked whether or not the file exists. Another account that can write
         # the directory can delete the file (a missing file reads as a first
         # start) or swap an older copy of it back in (a lower watermark).
@@ -379,19 +389,51 @@ class AttestationGate:
                     f"(uid {os.geteuid()}). Refusing to trust a watermark another account "
                     "can rewrite."
                 )
-            if info.st_size > self._MAX_STATE_BYTES:
-                raise GateStateError(
-                    f"gate state at {path} is {info.st_size} bytes; not a watermark file"
-                )
-            chunks: list[bytes] = []
-            while True:
-                block = os.read(fd, 65536)
-                if not block:
-                    break
-                chunks.append(block)
-            return b"".join(chunks)
+            return self._read_open_state(fd, path)
         finally:
             os.close(fd)
+
+    def _read_state_bytes_windows(self, path: Path) -> bytes | None:
+        """The Windows counterpart: the directory must be owner-only by its DACL
+        and is held open, and the file is opened relative to that handle and
+        verified owner-only on the opened handle. Ownership and DACL replace the
+        uid and mode checks; the threats they answer are the same."""
+        try:
+            directory = winacl.OwnerOnlyDir(path.parent)
+        except FileNotFoundError:
+            self._check_state_ancestor(path.parent)
+            return None
+        except winacl.OwnerOnlyError as exc:
+            raise GateStateError(
+                f"gate state directory is unsafe: {exc}. Another account that can change "
+                "it could delete the watermark and have the gate take it for a first start."
+            ) from exc
+        with directory:
+            try:
+                fd = directory.open_file(path.name)
+            except FileNotFoundError:
+                return None  # genuine first start
+            except winacl.OwnerOnlyError as exc:
+                raise GateStateError(
+                    f"gate state is unsafe: {exc}. A watermark another account can rewrite "
+                    "can be lowered to re-admit captured frames."
+                ) from exc
+        try:
+            return self._read_open_state(fd, path)
+        finally:
+            os.close(fd)
+
+    def _read_open_state(self, fd: int, path: Path) -> bytes:
+        size = os.fstat(fd).st_size
+        if size > self._MAX_STATE_BYTES:
+            raise GateStateError(f"gate state at {path} is {size} bytes; not a watermark file")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
 
     @staticmethod
     def _check_state_dir(directory: Path) -> None:
@@ -447,6 +489,17 @@ class AttestationGate:
                 ancestor = ancestor.parent
             except OSError as exc:
                 raise GateStateError(f"cannot check {ancestor} for {directory}: {exc}") from exc
+        if os.name == "nt":
+            # Administrators stand where root stands below (winacl's trusted parent).
+            try:
+                winacl.check_trusted_parent(ancestor)
+            except (winacl.OwnerOnlyError, OSError) as exc:
+                raise GateStateError(
+                    f"gate state directory {directory} is missing and its parent is unsafe: "
+                    f"{exc}. Another account could have moved the watermark away. Refusing "
+                    "to take this for a first start."
+                ) from exc
+            return
         owners = {0, os.geteuid()} if hasattr(os, "geteuid") else {info.st_uid}
         if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in owners:
             raise GateStateError(
@@ -489,6 +542,9 @@ class AttestationGate:
         payload = json.dumps(
             {"last_frame_id": frame_id, "last_issued_at": issued_at}, separators=(",", ":")
         )
+        if os.name == "nt":
+            self._write_state_windows(path, payload.encode("utf-8"))
+            return
         tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
         try:
             self._mkdir_owner_only(path.parent)
@@ -496,7 +552,7 @@ class AttestationGate:
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(tmp, flags, 0o600)
             try:
-                os.write(fd, payload.encode("utf-8"))
+                _write_fully(fd, payload.encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -507,6 +563,32 @@ class AttestationGate:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+            raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
+
+    def _write_state_windows(self, path: Path, payload: bytes) -> None:
+        """The same sequence anchored to one held, verified directory handle:
+        missing directories are created relative to their parents, the temp
+        file is created exclusively with an owner-only DACL, renamed over the
+        watermark relative to that handle, and the same handle is flushed."""
+        tmp = f"{path.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            with winacl.ensure_owner_only_dir(path.parent) as directory:
+                fd = directory.create_file(tmp)
+                try:
+                    try:
+                        _write_fully(fd, payload)
+                        os.fsync(fd)
+                        directory.replace(fd, path.name)
+                    finally:
+                        os.close(fd)
+                except BaseException:
+                    try:
+                        directory.unlink(tmp)
+                    except (OSError, winacl.OwnerOnlyError):
+                        pass  # already renamed, or not removable; never mask the cause
+                    raise
+                directory.sync()
+        except (OSError, winacl.OwnerOnlyError) as exc:
             raise GateStateError(f"cannot persist gate state to {path}: {exc}") from exc
 
     @staticmethod

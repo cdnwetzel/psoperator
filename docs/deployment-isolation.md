@@ -82,6 +82,8 @@ observer from gatekeeper would require asymmetric keys — see *Future* below.)
   writable by group or other. If the directory is missing, the nearest existing
   ancestor must be owned by the gate's account or by root and not writable by
   group or other. The gate creates each missing directory with mode `0700`.
+  On Windows the directory must be owner-only by its DACL, and the ancestor
+  rule is the trusted-parent rule in the platform matrix below.
 
   The file is load-bearing for replay rejection, so it is held to the same
   ownership standard as the attestation key and the IPC secret: owner-only
@@ -114,6 +116,13 @@ attestation suite.
    psoperator attestation-keygen --key-id observer-v1 \
      --path ~/.local/state/psoperator/keys/observer.json   # owner-only 0600 key
    export PSOPERATOR_OBSERVER_ATTESTATION_KEY_PATH=~/.local/state/psoperator/keys/observer.json
+   ```
+   On Windows, create the directory owner-only from an unelevated prompt (an
+   elevated one can make Administrators the owner, which the loader refuses):
+   ```powershell
+   New-Item -ItemType Directory "$env:LOCALAPPDATA\psoperator\keys"
+   icacls "$env:LOCALAPPDATA\psoperator\keys" /inheritance:r /grant:r "${env:USERNAME}:(F)" "SYSTEM:(F)"
+   psoperator attestation-keygen --key-id observer-v1 --path "$env:LOCALAPPDATA\psoperator\keys\observer.json"
    ```
    The gatekeeper service **refuses to start without this key** (fail closed).
 3. **Configure the service-manager environment (not just a shell).** The `export`
@@ -164,23 +173,32 @@ attestation suite.
 
 ## Platform support matrix (R-203/R-205)
 
-The isolation guarantees rest on POSIX ownership and mode semantics. The
-supported, verified deployment platforms are POSIX; unclaimed platforms **fail
-closed** rather than run with an unverified boundary.
+On POSIX the isolation guarantees rest on ownership and mode bits. NTFS has no
+mode bits, so on Windows the same guarantees are checked through each file's
+owner and DACL (`psoperator/common/winacl.py`, roadmap D-01). A platform with
+neither is not claimed and **fails closed**.
 
-| platform | attestation key provisioning / loading | status |
+| platform | attestation key, IPC secret and gate state | status |
 | --- | --- | --- |
 | **Linux** | owner-only mode + owner-uid + TOCTOU-safe; verified in CI | **supported** |
 | **macOS** | same POSIX path; verified in CI | **supported** |
-| **Windows** | provisioning and loading **refuse to run** — an unverified NTFS ACL is never trusted | **fail closed; not supported** |
+| **Windows** | owner-only DACL, read from the opened handle; files created relative to a held, verified directory handle | **ported (D-01); Windows CI job to follow** |
 
-Windows support requires implementing and verifying NTFS ACL checks equivalent to
-the POSIX owner-only guarantee. It is deliberately deferred and tracked as the
-Windows attestation/capture port (roadmap D-01): a platform with no host in the
-fleet gets no unverifiable security path — attestation leads, coverage follows.
-That Windows attestation-key provisioning and loading fail closed is itself
-asserted by a test, so the "POSIX-only" claim cannot silently rot into a
-half-implemented Windows path.
+On Windows, "owner-only" means: owned by the running account; a present,
+protected DACL with no inherited entry; and every allow entry naming that
+account or `SYSTEM`. Administrators are refused on the files themselves. Files
+are opened without following a reparse point, and names that would reach an
+alternate data stream are refused. Every create, rename and removal is made
+relative to a held handle on a verified directory, the counterpart of POSIX
+`dir_fd`. The Windows branch never falls back to the POSIX checks; a test
+asserts that a simulated Windows on a POSIX host refuses rather than trusting
+mode bits.
+
+A missing state directory under a parent is the one place Administrators are
+trusted, as root is on POSIX: the parent must be owned by this account,
+`SYSTEM` or Administrators, and only those may hold a right that adds, removes
+or renames its entries. Profile and project folders pass; a drive root, where
+any signed-in user may add a folder, does not.
 
 ## Future — asymmetric attestation (option C, out of scope for R-205)
 

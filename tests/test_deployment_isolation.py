@@ -85,10 +85,12 @@ def test_the_key_directory_must_be_owner_only(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="simulates Windows from a POSIX host")
-def test_unclaimed_platform_windows_fails_closed(tmp_path, monkeypatch):
-    # A3 / the support matrix: the isolation rests on POSIX semantics, so an
-    # unclaimed platform (Windows) must REFUSE to provision or load a key rather
-    # than trust an unverified NTFS ACL. Simulate os.name == "nt" from POSIX.
+def test_the_windows_path_never_falls_back_to_posix_checks(tmp_path, monkeypatch):
+    # A3 / the support matrix: on Windows the key is judged by its DACL
+    # (psoperator.common.winacl), never by mode bits that NTFS does not have.
+    # Simulate os.name == "nt" from POSIX: the Windows branch must still refuse
+    # here, because the DACL checks exist only on Windows, rather than quietly
+    # reusing the POSIX ones.
     key = tmp_path / "observer-key.json"
     provision_attestation_key(key, "observer-v1")  # POSIX provisioning works
 
@@ -102,7 +104,9 @@ def test_unclaimed_platform_windows_fails_closed(tmp_path, monkeypatch):
             return getattr(os, attr)
 
     monkeypatch.setattr(attestation, "os", _WindowsOs())
-    with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
+    only_on_windows = "Windows ACL verification is only available on Windows"
+    with pytest.raises(AttestationKeyError, match=only_on_windows):
         provision_attestation_key(tmp_path / "other.json", "observer-v2")
-    with pytest.raises(AttestationKeyError, match="Windows.*not implemented"):
+    with pytest.raises(AttestationKeyError, match=only_on_windows):
         load_attestation_key(key)
+    assert not (tmp_path / "other.json").exists()
