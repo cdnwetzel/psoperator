@@ -233,17 +233,25 @@ def test_a_failed_fstat_closes_the_record_and_raises(tmp_path, monkeypatch):
     from psoperator.fixtures.invoice import RecordError, SubmissionRecord
 
     closed: list[int] = []
-    real_close = inv_mod.os.close
+    real_os = inv_mod.os
 
-    def _fstat(_fd):
-        raise OSError("injected")
+    # Replace os inside the module only: pytest's own output capture calls
+    # os.fstat during the test (pytest >= 9.2), so patching the shared module
+    # would inject the failure into pytest instead of the code under test.
+    class _Os:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
 
-    def _close(fd):
-        closed.append(fd)
-        real_close(fd)
+        @staticmethod
+        def fstat(_fd):
+            raise OSError("injected")
 
-    monkeypatch.setattr(inv_mod.os, "fstat", _fstat)
-    monkeypatch.setattr(inv_mod.os, "close", _close)
+        @staticmethod
+        def close(fd):
+            closed.append(fd)
+            real_os.close(fd)
+
+    monkeypatch.setattr(inv_mod, "os", _Os())
     with pytest.raises(RecordError, match="cannot create"):
         SubmissionRecord(tmp_path / "run.jsonl")
     assert len(closed) == 1
