@@ -179,10 +179,23 @@ def test_only_the_label_class_counts_as_a_label():
     assert len(_scan(_form(other, _edit(75, 10)), label_class="Static").fields) == 1
 
 
-@pytest.mark.parametrize("cls", ["Edit", PANEL])
-def test_the_root_must_be_a_container(cls):
+def test_an_edit_cannot_be_the_root():
     with pytest.raises(Win32FieldError, match="must be a container"):
-        _scan(WindowNode(cls, (0, 0, 100, 20)))
+        _scan(WindowNode("Edit", (0, 0, 100, 20)))
+
+
+def test_a_root_of_the_label_class_is_a_container_never_a_label():
+    # The application's own top-level window has the label panels' class
+    # (observed 2026-10-28). It must be accepted as the container and never
+    # chosen as a label, even with a name and a rectangle a label would have.
+    root = WindowNode(
+        PANEL, (0, 0, 70, 20), name_hash=name_hash("the-window"),
+        children=(_panel(10, 40, name="a"), _edit(75, 40), _edit(75, 0)),
+    )  # fmt: skip
+    scan = _scan(root)
+    assert [f.label_hash for f in scan.fields] == [name_hash("a")]
+    assert scan.unpaired == 1  # the Edit beside the root's own rectangle
+    assert scan.fields[0].class_path == (PANEL, "Edit")
 
 
 def test_fields_come_in_reading_order():

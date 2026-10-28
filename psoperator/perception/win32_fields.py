@@ -161,8 +161,10 @@ def pair_fields(
     max_depth: int = MAX_DEPTH,
 ) -> FieldScan:
     """Pair each visible Edit below ``root`` with its label panel. The root is
-    the container: it is never itself a field or a label."""
-    if root.class_name in (edit_class, label_class):
+    the container: it is never itself a field or a label, even when it has the
+    label class (the application's top-level window does). Only its
+    descendants are candidates, so the root's own name is never used."""
+    if root.class_name == edit_class:
         raise Win32FieldError(f"the root must be a container, not {root.class_name!r}")
     edits: list[tuple[WindowNode, tuple[str, ...]]] = []
     panels: list[WindowNode] = []
