@@ -64,6 +64,12 @@ environment variables or a local `.env`, never through the repository.
   be added to any repository. Findings name the denylist entry by number, never
   the term.
 
+  The pre-commit hook also scans the author and committer identity the commit
+  will carry (from the config, `--author`, or the `GIT_AUTHOR_*` and
+  `GIT_COMMITTER_*` environment), because an email is published with the
+  commit. Commit as your GitHub noreply address
+  (`<user>@users.noreply.github.com`).
+
 A test that needs a generic private address, such as one a bind check must
 refuse, marks its line with `# privacy: example`. A real address is never
 marked.
