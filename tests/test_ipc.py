@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import subprocess
 import threading
 import time
 
@@ -82,6 +83,56 @@ def test_a_group_or_world_readable_ipc_secret_is_refused(tmp_path):
             load_or_create_secret(path)
     path.chmod(0o600)
     assert load_or_create_secret(path) == secret  # restored -> loads again
+
+
+_windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")
+
+
+def _icacls(path, *args: str) -> None:
+    subprocess.run(["icacls", str(path), *args], check=True, capture_output=True)
+
+
+@_windows_only
+def test_the_ipc_secret_is_created_owner_only_and_reloaded_windows(tmp_path, private):
+    path = tmp_path / ".psoperator" / "ipc.secret"
+    secret = load_or_create_secret(path)
+    assert len(secret) >= 32
+    assert private.is_owner_only(path.parent) and private.is_owner_only(path)
+    assert load_or_create_secret(path) == secret
+
+
+@_windows_only
+@pytest.mark.parametrize("grant", ["(R)", "(M)"], ids=["everyone-reads", "everyone-modifies"])
+def test_an_ipc_secret_others_can_read_or_write_is_refused_windows(private, grant):
+    path = private.home / "ipc.secret"
+    load_or_create_secret(path)
+    _icacls(path, "/grant", f"*S-1-1-0:{grant}")
+    with pytest.raises(PermissionError, match="not owner-only.*S-1-1-0"):
+        load_or_create_secret(path)
+
+
+@_windows_only
+def test_a_normally_created_ipc_secret_is_refused_windows(tmp_path):
+    path = tmp_path / "ipc.secret"
+    path.write_bytes(b"s" * 32)
+    with pytest.raises(PermissionError, match="not owner-only"):
+        load_or_create_secret(path)
+
+
+@_windows_only
+def test_a_secret_is_not_created_in_a_directory_that_is_not_owner_only_windows(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    with pytest.raises(PermissionError, match="cannot create an owner-only IPC secret"):
+        load_or_create_secret(shared / "ipc.secret")
+    assert not (shared / "ipc.secret").exists()
+
+
+@_windows_only
+def test_a_short_ipc_secret_is_refused_windows(private):
+    path = private.write(private.home / "ipc.secret", b"short")
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        load_or_create_secret(path)
 
 
 # --- loopback binds IPv6 as well as IPv4 ------------------------------------

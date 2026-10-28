@@ -104,16 +104,15 @@ def provision_attestation_key(
     clock: Callable[[], float] = time.time,
 ) -> AttestationKey:
     """Create one owner-only key file without ever replacing an existing path."""
-    if os.name == "nt":
-        raise AttestationKeyError(
-            "secure Windows attestation-key ACL provisioning is not implemented"
-        )
     key = AttestationKey(key_id, secrets.token_bytes(ATTESTATION_KEY_BYTES), clock())
     target = Path(path)
     encoded = (
         json.dumps(_key_file(key).model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
         + "\n"
     ).encode("utf-8")
+    if os.name == "nt":
+        _provision_windows(target, encoded)
+        return key
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -129,13 +128,7 @@ def provision_attestation_key(
                 f"refusing to overwrite attestation key file: {target}"
             ) from exc
         try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("short write while provisioning attestation key")
-                view = view[written:]
-            os.fsync(fd)
+            _write_all(fd, encoded)
         except Exception:
             os.close(fd)
             os.unlink(target.name, dir_fd=dir_fd)
@@ -145,6 +138,49 @@ def provision_attestation_key(
     finally:
         os.close(dir_fd)
     return key
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while provisioning attestation key")
+        view = view[written:]
+    os.fsync(fd)
+
+
+def _provision_windows(target: Path, encoded: bytes) -> None:
+    """The Windows counterpart: the directory is verified owner-only through its
+    DACL and held open, and the key is created relative to that handle with an
+    owner-only, protected DACL applied at creation."""
+    from psoperator.common import winacl
+
+    try:
+        directory = winacl.OwnerOnlyDir(target.parent)
+    except FileNotFoundError as exc:
+        raise AttestationKeyError(
+            f"attestation key directory must be pre-provisioned owner-only: {target.parent}"
+        ) from exc
+    except winacl.OwnerOnlyError as exc:
+        raise AttestationKeyError(f"unsafe attestation key directory: {exc}") from exc
+    with directory:
+        try:
+            fd = directory.create_file(target.name)
+        except FileExistsError as exc:
+            raise AttestationKeyError(
+                f"refusing to overwrite attestation key file: {target}"
+            ) from exc
+        except winacl.OwnerOnlyError as exc:
+            raise AttestationKeyError(f"cannot create attestation key file: {exc}") from exc
+        try:
+            _write_all(fd, encoded)
+        except Exception:
+            os.close(fd)
+            directory.unlink(target.name)
+            raise
+        else:
+            os.close(fd)
 
 
 def _open_owner_only_dir(path: Path) -> int:
@@ -189,9 +225,7 @@ def _open_owner_only_dir(path: Path) -> int:
 
 def _read_owner_only_file(path: Path) -> bytes:
     if os.name == "nt":
-        raise AttestationKeyError(
-            "secure Windows attestation-key ACL verification is not implemented"
-        )
+        return _read_owner_only_file_windows(Path(path))
     target = Path(path)
     try:
         before = target.lstat()
@@ -222,6 +256,26 @@ def _read_owner_only_file(path: Path) -> bytes:
             raise AttestationKeyError(
                 f"attestation key file must be owned by this account: {target}"
             )
+        data = os.read(fd, MAX_ATTESTATION_KEY_FILE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_ATTESTATION_KEY_FILE_BYTES:
+        raise AttestationKeyError(f"attestation key file exceeds size limit: {target}")
+    return data
+
+
+def _read_owner_only_file_windows(target: Path) -> bytes:
+    """Open without following a reparse point and check the owner and DACL of
+    the opened file, the Windows counterpart of the fstat checks above."""
+    from psoperator.common import winacl
+
+    try:
+        fd = winacl.open_owner_only_for_read(target)
+    except FileNotFoundError as exc:
+        raise AttestationKeyError(f"attestation key file does not exist: {target}") from exc
+    except winacl.OwnerOnlyError as exc:
+        raise AttestationKeyError(f"unsafe attestation key file: {exc}") from exc
+    try:
         data = os.read(fd, MAX_ATTESTATION_KEY_FILE_BYTES + 1)
     finally:
         os.close(fd)

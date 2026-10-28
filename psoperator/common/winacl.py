@@ -24,6 +24,15 @@ that the DACL is irrelevant to it. An administrator who elevates can take
 ownership of any file; this boundary assumes the planner account cannot
 elevate.
 
+A directory that is about to receive a first private directory is held to a
+weaker rule, :func:`trusted_parent_problem`, the counterpart of the POSIX
+"owned by this account or root, not writable by group or other". Profile and
+project folders inherit entries for ``SYSTEM`` and Administrators, so the
+strict rule would refuse every ordinary location. Here Administrators play
+the part root plays on POSIX: the parent may be owned by the user, ``SYSTEM``
+or Administrators, and only those (and ``OWNER RIGHTS``, which stands for the
+owner) may hold a right that adds, removes or renames its entries.
+
 Creation is anchored like the POSIX ``dir_fd`` path: :class:`OwnerOnlyDir`
 holds a verified directory handle, and files and subdirectories are created
 relative to that handle (``NtCreateFile`` with ``RootDirectory`` and
@@ -44,10 +53,13 @@ from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 SYSTEM_SID = "S-1-5-18"
+ADMINISTRATORS_SID = "S-1-5-32-544"
+OWNER_RIGHTS_SID = "S-1-3-4"
 _MAX_COMPONENT_UTF16 = 255
 
 _ACCESS_ALLOWED_ACE_TYPE = 0x0
 _ACCESS_DENIED_ACE_TYPE = 0x1
+_INHERIT_ONLY_ACE = 0x08
 _INHERITED_ACE = 0x10
 _SE_DACL_PRESENT = 0x0004
 _SE_DACL_PROTECTED = 0x1000
@@ -65,6 +77,8 @@ class Ace:
     sid: str
     inherited: bool
     ace_type: int = 0
+    mask: int = 0
+    inherit_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +107,36 @@ def owner_only_problem(info: SecurityInfo, user_sid: str) -> str | None:
             return f"carries an entry of unsupported type 0x{ace.ace_type:02x} for {ace.sid}"
         if ace.kind == "allow" and ace.sid not in allowed:
             return f"grants access to {ace.sid}"
+    return None
+
+
+#: Rights that let an account add, remove or rename a directory's entries, or
+#: give itself those rights: add file, add subdirectory, delete child, delete,
+#: write DAC, write owner, generic write and generic all. Maximum-allowed asks
+#: for whatever the DACL grants, so it counts too.
+_CHANGES_ENTRIES = (
+    0x2 | 0x4 | 0x40 | 0x00010000 | 0x00040000 | 0x00080000 | 0x02000000 | 0x10000000 | 0x40000000
+)
+
+
+def trusted_parent_problem(info: SecurityInfo, user_sid: str) -> str | None:
+    """Return why the directory described by ``info`` is not a safe parent for
+    a new private directory, or ``None``. An account that can change its
+    entries could move a private directory away, or put another in its place.
+    An inherit-only entry is skipped: it applies only to children, and the
+    children made here get an explicit, protected DACL."""
+    trusted = {user_sid, SYSTEM_SID, ADMINISTRATORS_SID}
+    if info.owner_sid not in trusted:
+        return f"owned by {info.owner_sid}, not this account, SYSTEM or Administrators"
+    if info.aces is None:
+        return "has a null DACL, which grants every account full access"
+    for ace in info.aces:
+        if ace.inherit_only or ace.kind == "deny":
+            continue
+        if ace.kind == "other":
+            return f"carries an entry of unsupported type 0x{ace.ace_type:02x} for {ace.sid}"
+        if ace.mask & _CHANGES_ENTRIES and ace.sid not in trusted | {OWNER_RIGHTS_SID}:
+            return f"lets {ace.sid} change its entries (access 0x{ace.mask:08x})"
     return None
 
 
@@ -146,6 +190,8 @@ _SYNCHRONIZE = 0x00100000
 _READ_CONTROL = 0x00020000
 _FILE_READ_ATTRIBUTES = 0x0080
 _FILE_TRAVERSE = 0x0020
+_FILE_ADD_FILE = 0x0002
+_DELETE = 0x00010000
 _FILE_SHARE_READ = 0x1
 _FILE_SHARE_WRITE = 0x2
 _FILE_SHARE_DELETE = 0x4
@@ -162,6 +208,8 @@ _FILE_CREATE = 2
 _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
 _FILE_NON_DIRECTORY_FILE = 0x00000040
+_FILE_DELETE_ON_CLOSE = 0x00001000
+_FILE_RENAME_INFORMATION_CLASS = 10
 _FILE_OPEN_REPARSE_POINT = 0x00200000
 _OBJ_CASE_INSENSITIVE = 0x00000040
 _OBJ_DONT_REPARSE = 0x00001000
@@ -336,8 +384,18 @@ def _api():
         wintypes.ULONG,
     ]
     ntdll.NtCreateFile.restype = ctypes.c_long
+    ntdll.NtSetInformationFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.c_int,
+    ]
+    ntdll.NtSetInformationFile.restype = ctypes.c_long
     ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
     ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
     return advapi32, kernel32, ntdll
 
 
@@ -432,15 +490,18 @@ def security_of_handle(handle: int) -> SecurityInfo:
                 raise _error("GetAce", ctypes.get_last_error())
             header = _ACE_HEADER.from_address(entry.value)
             inherited = bool(header.AceFlags & _INHERITED_ACE)
+            inherit_only = bool(header.AceFlags & _INHERIT_ONLY_ACE)
+            mask = 0
             if header.AceType in (_ACCESS_ALLOWED_ACE_TYPE, _ACCESS_DENIED_ACE_TYPE):
                 # ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header, mask, then the SID.
+                mask = ctypes.c_uint32.from_address(entry.value + 4).value
                 sid = _sid_string(advapi32, kernel32, entry.value + 8)
                 kind: Literal["allow", "deny", "other"] = (
                     "allow" if header.AceType == _ACCESS_ALLOWED_ACE_TYPE else "deny"
                 )
             else:
                 sid, kind = "?", "other"
-            aces.append(Ace(kind, sid, inherited, header.AceType))
+            aces.append(Ace(kind, sid, inherited, header.AceType, mask, inherit_only))
         return SecurityInfo(owner_sid, protected, tuple(aces))
     finally:
         kernel32.LocalFree(descriptor)
@@ -518,6 +579,31 @@ def open_owner_only_for_read(path: Path) -> int:
         raise
 
 
+def check_trusted_parent(path: Path) -> None:
+    """Raise unless ``path`` is a real directory that is a safe parent for a
+    new private directory (:func:`trusted_parent_problem`). Raises
+    ``FileNotFoundError`` if it does not exist."""
+    _require_windows()
+    _, kernel32, _ = _api()
+    handle = _open_no_follow(
+        kernel32,
+        Path(path),
+        _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+    )
+    try:
+        attributes = _attributes(kernel32, handle)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OwnerOnlyError(f"{path} is a symlink or other reparse point")
+        if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OwnerOnlyError(f"{path} is not a directory")
+        problem = trusted_parent_problem(security_of_handle(handle), current_user_sid())
+        if problem is not None:
+            raise OwnerOnlyError(f"{path} is not a safe parent: it {problem}")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _owner_only_descriptor(advapi32) -> ctypes.c_void_p:
     descriptor = ctypes.c_void_p()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -548,6 +634,46 @@ def create_owner_only_dir(path: Path) -> None:
         if code == 183:  # ERROR_ALREADY_EXISTS
             raise FileExistsError(str(path))
         raise _error(f"creating directory {path}", code)
+
+
+def make_owner_only_dirs(path: Path) -> None:
+    """Create every missing component of ``path`` owner-only, by path. Existing
+    components are left as they are; open the result with
+    :class:`OwnerOnlyDir` to verify it."""
+    _require_windows()
+    missing: list[Path] = []
+    current = Path(path)
+    while not os.path.lexists(current):
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for part in reversed(missing):
+        try:
+            create_owner_only_dir(part)
+        except FileExistsError:
+            pass  # made by someone else meanwhile; OwnerOnlyDir will judge it
+
+
+def _rename_information(root: int, name: str) -> ctypes.Structure:
+    """FILE_RENAME_INFORMATION for ``name`` relative to ``root``, replacing."""
+    from ctypes import wintypes
+
+    # Sized in UTF-16 units, not code points: a character outside the BMP is
+    # two units, and FileNameLength must not run past the array.
+    encoded = name.encode("utf-16-le")
+
+    class _FILE_RENAME_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.ULONG),
+            ("FileName", ctypes.c_ubyte * len(encoded)),
+        ]
+
+    information = _FILE_RENAME_INFORMATION(1, root, len(encoded))
+    ctypes.memmove(information.FileName, encoded, len(encoded))
+    return information
 
 
 class OwnerOnlyDir:
@@ -587,21 +713,34 @@ class OwnerOnlyDir:
             kernel32.CloseHandle(self._handle)
             self._handle = None
 
-    def _nt_create(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
-        from ctypes import wintypes
-
+    def _held(self) -> int:
         if self._handle is None:
             raise OwnerOnlyError(f"{self.path} is closed")
+        return self._handle
+
+    def _checked(self, name: str) -> str:
         problem = component_problem(name)
         if problem is not None:
             raise OwnerOnlyError(f"refusing name in {self.path}: {problem}")
+        return name
+
+    def _nt_create(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
+        self._checked(name)
+        return self._nt_open(name, access, disposition, options, descriptor)
+
+    def _nt_open(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
+        """``NtCreateFile`` relative to the held handle. An empty ``name``
+        opens the held directory itself."""
+        from ctypes import wintypes
+
+        root = self._held()
         _, _, ntdll = _api()
         buffer = ctypes.create_unicode_buffer(name)
         length = len(name.encode("utf-16-le"))
         unicode_name = _UNICODE_STRING(length, length, ctypes.addressof(buffer))
         attributes = _OBJECT_ATTRIBUTES(
             ctypes.sizeof(_OBJECT_ATTRIBUTES),
-            self._handle,
+            root,
             ctypes.pointer(unicode_name),
             _OBJ_CASE_INSENSITIVE | _OBJ_DONT_REPARSE,
             descriptor,
@@ -636,7 +775,8 @@ class OwnerOnlyDir:
     def create_file(self, name: str) -> int:
         """Create ``name`` in this directory exclusively, owner-only, and
         return a CRT file descriptor for writing. The descriptor is applied
-        at creation. Raises ``FileExistsError`` if it exists."""
+        at creation. The handle may delete, so :meth:`replace` can rename it.
+        Raises ``FileExistsError`` if it exists."""
         import msvcrt
 
         advapi32, kernel32, _ = _api()
@@ -644,7 +784,7 @@ class OwnerOnlyDir:
         try:
             handle = self._nt_create(
                 name,
-                _GENERIC_WRITE | _READ_CONTROL,
+                _GENERIC_WRITE | _READ_CONTROL | _DELETE,
                 _FILE_CREATE,
                 _FILE_NON_DIRECTORY_FILE,
                 descriptor,
@@ -690,3 +830,44 @@ class OwnerOnlyDir:
         except BaseException:
             kernel32.CloseHandle(handle)
             raise
+
+    def replace(self, fd: int, name: str) -> None:
+        """Rename the file open as ``fd`` (from :meth:`create_file`) to
+        ``name`` in this directory, replacing any file of that name. The
+        target is resolved relative to the held handle, like creation. It
+        fails while any handle holds the old file open, so a reader never has
+        its file replaced underneath it."""
+        import msvcrt
+
+        root = self._held()
+        _, _, ntdll = _api()
+        information = _rename_information(root, self._checked(name))
+        io_status = _IO_STATUS_BLOCK()
+        status = ntdll.NtSetInformationFile(
+            msvcrt.get_osfhandle(fd),
+            ctypes.byref(io_status),
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            _FILE_RENAME_INFORMATION_CLASS,
+        )
+        if status < 0:
+            raise _error(f"renaming to {self.path / name}", ntdll.RtlNtStatusToDosError(status))
+
+    def unlink(self, name: str) -> None:
+        """Remove file ``name`` from this directory (a symlink itself, never
+        its target). Raises ``FileNotFoundError`` if it does not exist."""
+        _, kernel32, _ = _api()
+        handle = self._nt_create(
+            name, _DELETE, _FILE_OPEN, _FILE_NON_DIRECTORY_FILE | _FILE_DELETE_ON_CLOSE, None
+        )
+        kernel32.CloseHandle(handle)
+
+    def sync(self) -> None:
+        """Flush this directory, so a rename into it is durable."""
+        _, kernel32, _ = _api()
+        handle = self._nt_open("", _FILE_ADD_FILE, _FILE_OPEN, _FILE_DIRECTORY_FILE, None)
+        try:
+            if not kernel32.FlushFileBuffers(handle):
+                raise _error(f"flushing {self.path}", ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(handle)

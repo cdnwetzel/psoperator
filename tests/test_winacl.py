@@ -97,6 +97,101 @@ def test_the_created_descriptor_names_only_the_user_and_system():
     assert owner_only_sddl(USER) == f"O:{USER}D:P(A;;FA;;;{USER})(A;;FA;;;SY)"
 
 
+# --- trusted-parent policy ------------------------------------------------------
+
+FULL = 0x001F01FF  # FILE_ALL_ACCESS
+READ_EXECUTE = 0x001200A9
+USERS = "S-1-5-32-545"
+AUTHENTICATED_USERS = "S-1-5-11"
+TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+
+def _grant_ace(sid: str, mask: int, *, inherited: bool = False, inherit_only: bool = False) -> Ace:
+    return Ace("allow", sid, inherited, 0, mask, inherit_only)
+
+
+def _profile_like(*extra: Ace, owner: str = USER) -> SecurityInfo:
+    """A profile or project folder: inherited full control for SYSTEM,
+    Administrators and the user, unprotected."""
+    aces = tuple(_grant_ace(s, FULL, inherited=True) for s in (SYSTEM_SID, ADMINISTRATORS, USER))
+    return SecurityInfo(owner, False, aces + extra)
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        _profile_like(),
+        _profile_like(owner=SYSTEM_SID),
+        _profile_like(owner=ADMINISTRATORS),
+        _profile_like(_grant_ace(OWNER_RIGHTS, FULL)),
+        _profile_like(_grant_ace(EVERYONE, READ_EXECUTE)),
+        _profile_like(_grant_ace(AUTHENTICATED_USERS, FULL, inherit_only=True)),
+        _profile_like(Ace("deny", EVERYONE, False, 1, FULL)),
+        _profile_like(Ace("other", "?", False, 0x9, FULL, True)),
+        _info(_allow(USER), _allow(SYSTEM_SID)),
+    ],
+    ids=[
+        "profile",
+        "owned-by-system",
+        "owned-by-admins",
+        "owner-rights",
+        "everyone-reads",
+        "inherit-only-write",
+        "deny",
+        "inherit-only-unsupported",
+        "owner-only",
+    ],
+)
+def test_a_parent_only_trusted_accounts_can_change_is_trusted(info):
+    assert winacl.trusted_parent_problem(info, USER) is None
+
+
+@pytest.mark.parametrize(
+    "bit",
+    [0x2, 0x4, 0x40, 0x00010000, 0x00040000, 0x00080000, 0x02000000, 0x10000000, 0x40000000],
+    ids=[
+        "add-file",
+        "add-subdirectory",
+        "delete-child",
+        "delete",
+        "write-dac",
+        "write-owner",
+        "maximum-allowed",
+        "generic-all",
+        "generic-write",
+    ],
+)
+def test_each_right_that_changes_entries_makes_a_parent_untrusted(bit):
+    problem = winacl.trusted_parent_problem(_profile_like(_grant_ace(USERS, bit)), USER)
+    assert problem is not None and f"lets {USERS} change its entries" in problem
+
+
+@pytest.mark.parametrize(
+    "info, expected",
+    [
+        (_profile_like(owner=TRUSTED_INSTALLER), "owned by"),
+        (_profile_like(owner=EVERYONE), "owned by"),
+        (SecurityInfo(USER, False, None), "null DACL"),
+        (_profile_like(_grant_ace(AUTHENTICATED_USERS, 0x4)), "change its entries"),
+        (_profile_like(_grant_ace(EVERYONE, FULL, inherited=True)), "change its entries"),
+        (_profile_like(_grant_ace(CREATOR_OWNER, FULL)), "change its entries"),
+        (_profile_like(Ace("other", "?", False, 0x5, FULL)), "unsupported type 0x05"),
+    ],
+    ids=[
+        "trusted-installer",
+        "everyone-owns",
+        "null-dacl",
+        "drive-root-style",
+        "inherited-everyone",
+        "creator-owner-applies",
+        "object-ace",
+    ],
+)
+def test_each_trusted_parent_rule_refuses(info, expected):
+    problem = winacl.trusted_parent_problem(info, USER)
+    assert problem is not None and expected in problem
+
+
 # --- names and paths ----------------------------------------------------------
 
 
@@ -457,3 +552,266 @@ def test_a_symlink_to_an_owner_only_file_is_refused(vault):
         pytest.skip("creating symlinks needs Developer Mode or the privilege")
     with pytest.raises(OwnerOnlyError, match="reparse point"):
         winacl.open_owner_only_for_read(link)
+
+
+# --- parents, replacement and removal (Windows) --------------------------------
+
+
+def _icacls_grant(path, grant: str) -> None:
+    subprocess.run(["icacls", str(path), "/grant", grant], check=True, capture_output=True)
+
+
+@windows_only
+def test_ace_masks_and_inherit_only_flags_are_read(vault):
+    user = winacl.current_user_sid()
+    _set_dacl(vault, f"D:P(A;;FA;;;{user})(A;;0x4;;;WD)(A;OICIIO;GA;;;AU)")
+    _, kernel32, _ = winacl._api()
+    handle = winacl._open_no_follow(kernel32, vault, winacl._READ_CONTROL, 0x7)
+    try:
+        info = winacl.security_of_handle(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+    entries = {(a.sid, a.mask, a.inherit_only) for a in info.aces}
+    assert (EVERYONE, 0x4, False) in entries
+    assert (AUTHENTICATED_USERS, 0x10000000, True) in entries
+    assert (user, FULL, False) in entries
+
+
+@windows_only
+def test_the_temp_folder_and_an_owner_only_directory_are_trusted_parents(tmp_path, vault):
+    winacl.check_trusted_parent(tmp_path)
+    winacl.check_trusted_parent(vault)
+
+
+@windows_only
+def test_a_parent_others_can_add_to_is_not_trusted(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    winacl.check_trusted_parent(shared)  # the control: inherited entries only
+    _icacls_grant(shared, f"*{USERS}:(AD)")
+    with pytest.raises(OwnerOnlyError, match=f"lets {USERS} change its entries"):
+        winacl.check_trusted_parent(shared)
+
+
+@windows_only
+def test_a_parent_others_can_only_read_is_trusted(tmp_path):
+    readable = tmp_path / "readable"
+    readable.mkdir()
+    _icacls_grant(readable, f"*{USERS}:(RX)")
+    winacl.check_trusted_parent(readable)
+
+
+@windows_only
+def test_a_trusted_parent_must_be_an_existing_directory(tmp_path):
+    (tmp_path / "file").write_bytes(b"x")
+    with pytest.raises(OwnerOnlyError, match="not a directory"):
+        winacl.check_trusted_parent(tmp_path / "file")
+    with pytest.raises(FileNotFoundError):
+        winacl.check_trusted_parent(tmp_path / "missing")
+
+
+@windows_only
+def test_a_junction_is_not_a_trusted_parent(tmp_path, vault):
+    junction = tmp_path / "junction"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(vault)], check=True, capture_output=True
+    )
+    with pytest.raises(OwnerOnlyError, match="reparse point"):
+        winacl.check_trusted_parent(junction)
+
+
+@windows_only
+def test_missing_components_are_created_owner_only(tmp_path):
+    target = tmp_path / "a" / "b" / "c"
+    winacl.make_owner_only_dirs(target)
+    for part in (tmp_path / "a", tmp_path / "a" / "b", target):
+        winacl.check_owner_only_dir(part)
+    winacl.make_owner_only_dirs(target)  # all present: nothing to do
+
+
+@windows_only
+def test_existing_components_are_left_as_they_are(tmp_path):
+    (tmp_path / "plain").mkdir()
+    winacl.make_owner_only_dirs(tmp_path / "plain" / "private")
+    winacl.check_owner_only_dir(tmp_path / "plain" / "private")
+    with pytest.raises(OwnerOnlyError, match="not owner-only"):
+        winacl.check_owner_only_dir(tmp_path / "plain")
+
+
+def _read(directory: Path, name: str) -> bytes:
+    with OwnerOnlyDir(directory) as held:
+        fd = held.open_file(name)
+    try:
+        return os.read(fd, 100)
+    finally:
+        os.close(fd)
+
+
+def _replace(directory: Path, name: str, data: bytes) -> None:
+    with OwnerOnlyDir(directory) as held:
+        fd = held.create_file(f"{name}.tmp")
+        try:
+            os.write(fd, data)
+            held.replace(fd, name)
+        finally:
+            os.close(fd)
+
+
+@windows_only
+def test_replace_renames_over_the_old_file_and_stays_owner_only(vault):
+    _write(vault, "state", b"old")
+    _replace(vault, "state", b"new")
+    assert _read(vault, "state") == b"new"
+    assert sorted(p.name for p in vault.iterdir()) == ["state"]
+    _replace(vault, "fresh", b"first")  # and with no file to replace
+    assert _read(vault, "fresh") == b"first"
+
+
+@windows_only
+@pytest.mark.parametrize("name", ["state", "état", "a\U0001f600b"], ids=["ascii", "bmp", "astral"])
+def test_the_rename_buffer_holds_the_whole_utf16_name(vault, name):
+    # The name is passed as UTF-16 with an explicit byte length. Sizing the
+    # buffer by code points left an astral name short of its length.
+    information = winacl._rename_information(0, name)
+    raw = bytes(information.FileName)
+    assert information.FileNameLength == len(raw) == len(name.encode("utf-16-le"))
+    assert raw.decode("utf-16-le") == name
+    _replace(vault, name, b"x")
+    assert sorted(p.name for p in vault.iterdir()) == [name]
+
+
+@windows_only
+@pytest.mark.parametrize("name", ["..", "sub\\x", "sub/x", "", "state:stream"])
+def test_replace_takes_one_component_only(vault, name):
+    with OwnerOnlyDir(vault) as held:
+        fd = held.create_file("new.tmp")
+        try:
+            with pytest.raises(OwnerOnlyError, match="refusing name"):
+                held.replace(fd, name)
+        finally:
+            os.close(fd)
+
+
+@windows_only
+def test_replace_passes_the_held_handle_as_root(vault, monkeypatch):
+    # Deterministic, like the creation test: the rename target must be
+    # resolved relative to the held handle, never by path.
+    calls = []
+    real_api = winacl._api
+
+    class _NtDll:
+        @staticmethod
+        def NtSetInformationFile(handle, io_status, information, length, klass):
+            info = information._obj
+            name = bytes(info.FileName)[: info.FileNameLength].decode("utf-16-le")
+            calls.append((info.RootDirectory, info.ReplaceIfExists, name, klass))
+            return ctypes.c_long(0xC0000022 - 2**32).value  # STATUS_ACCESS_DENIED
+
+        @staticmethod
+        def RtlNtStatusToDosError(status):
+            return 5
+
+    with OwnerOnlyDir(vault) as held:
+        fd = held.create_file("new.tmp")
+        try:
+            advapi32, kernel32, _ = real_api()
+            monkeypatch.setattr(winacl, "_api", lambda: (advapi32, kernel32, _NtDll))
+            with pytest.raises(OwnerOnlyError, match="renaming"):
+                held.replace(fd, "state")
+            root = held._handle
+        finally:
+            monkeypatch.undo()
+            os.close(fd)
+    assert calls == [(root, 1, "state", 10)]
+
+
+def _open_by_path(vault: Path) -> int:
+    return winacl.open_owner_only_for_read(vault / "state")
+
+
+def _open_anchored(vault: Path) -> int:
+    with OwnerOnlyDir(vault) as held:
+        return held.open_file("state")
+
+
+@windows_only
+@pytest.mark.parametrize("opener", [_open_by_path, _open_anchored], ids=["by-path", "anchored"])
+def test_replace_fails_closed_while_a_handle_is_retained_on_the_old_file(vault, opener):
+    # Renaming over an open file is refused, even when the reader shares
+    # delete, so a retained handle never sees its file swapped underneath it:
+    # the replace fails, the old file and the retained read are untouched,
+    # and the same replace succeeds once the handle is closed.
+    _write(vault, "state", b"old")
+    retained = opener(vault)
+    try:
+        with OwnerOnlyDir(vault) as held:
+            fd = held.create_file("state.tmp")
+            try:
+                os.write(fd, b"new")
+                with pytest.raises(OwnerOnlyError, match="renaming"):
+                    held.replace(fd, "state")
+                assert os.read(retained, 100) == b"old"
+                os.close(retained)
+                retained = None
+                held.replace(fd, "state")
+            finally:
+                os.close(fd)
+    finally:
+        if retained is not None:
+            os.close(retained)
+    assert _read(vault, "state") == b"new"
+
+
+@windows_only
+def test_a_hard_link_carries_the_file_descriptor_not_its_own(tmp_path, vault):
+    # The descriptor belongs to the file, so a second name cannot widen or
+    # narrow it: a link to an owner-only file reads as owner-only from
+    # anywhere, and a link in the vault to a loose file is refused.
+    _write(vault, "secret", b"x")
+    os.link(vault / "secret", tmp_path / "elsewhere")
+    fd = winacl.open_owner_only_for_read(tmp_path / "elsewhere")
+    os.close(fd)
+
+    loose = tmp_path / "loose"
+    loose.write_bytes(b"planted")
+    os.link(loose, vault / "planted")
+    with pytest.raises(OwnerOnlyError, match="not owner-only"):
+        winacl.open_owner_only_for_read(vault / "planted")
+    with OwnerOnlyDir(vault) as held, pytest.raises(OwnerOnlyError, match="not owner-only"):
+        held.open_file("planted")
+
+
+@windows_only
+def test_unlink_removes_one_file(vault):
+    _write(vault, "junk", b"x")
+    with OwnerOnlyDir(vault) as held:
+        held.unlink("junk")
+        with pytest.raises(FileNotFoundError):
+            held.unlink("junk")
+        held.create_dir("sub")
+        with pytest.raises(OwnerOnlyError):
+            held.unlink("sub")
+        with pytest.raises(OwnerOnlyError, match="refusing name"):
+            held.unlink("..")
+    assert sorted(p.name for p in vault.iterdir()) == ["sub"]
+
+
+@windows_only
+def test_unlink_removes_a_symlink_not_its_target(vault):
+    _write(vault, "secret", b"x")
+    try:
+        os.symlink(vault / "secret", vault / "link")
+    except OSError:
+        pytest.skip("creating symlinks needs Developer Mode or the privilege")
+    with OwnerOnlyDir(vault) as held:
+        held.unlink("link")
+    assert sorted(p.name for p in vault.iterdir()) == ["secret"]
+
+
+@windows_only
+def test_sync_flushes_the_held_directory(vault):
+    with OwnerOnlyDir(vault) as held:
+        held.sync()
+        held.close()
+        with pytest.raises(OwnerOnlyError, match="closed"):
+            held.sync()

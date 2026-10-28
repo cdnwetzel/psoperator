@@ -466,6 +466,15 @@ contract *before* the reference task, not after:
   Windows capture pipeline fails in CI rather than at an operator's desk.
 - Only then build the reference task (Win32 binding plus OCR reading).
 
+Progress (2026-10-28): the owner-only checks are ported. Windows verifies the
+attestation key, the IPC secret and the gate's state through the file's owner
+and DACL, read from the opened handle, and creates, renames and removes them
+relative to a held, verified directory handle (`psoperator/common/winacl.py`,
+`docs/deployment-isolation.md`). The gate's persistent state now works on
+Windows. Remaining here: a protected Windows CI job, and the capture
+frame-hash pin test on Windows. The `doctor` probe and the cross-repo contract
+test live in the dx repository.
+
 Rationale: a breadth demo whose observer is unwired would undercut the
 governance pitch at exactly the moment a skeptical audience hears it. Attestation
 leads; coverage follows — the same sequencing rule that puts the proven loop
