@@ -262,6 +262,27 @@ def test_an_identity_that_cannot_be_resolved_is_refused_without_git_s_message(ho
     assert passed.returncode == 0, passed.stdout + passed.stderr  # the control
 
 
+def test_a_committer_that_cannot_be_resolved_is_refused(hook_repo):
+    # The second lookup on its own: the author resolves from the environment,
+    # the committer has no email, and the hook still refuses.
+    import shutil
+
+    sh = shutil.which("sh")
+    if sh is None:
+        pytest.skip("no POSIX sh on PATH to run the hook directly")
+    hook_repo.git("config", "--unset", "user.email")
+    hook_repo.git("config", "user.useConfigOnly", "true")
+    result = subprocess.run(
+        [sh, "scripts/hooks/pre-commit"],
+        cwd=hook_repo.repo, capture_output=True, text=True,
+        env={**hook_repo.env, "GIT_AUTHOR_EMAIL": "someone@users.noreply.github.com"},
+    )  # fmt: skip
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "commit-identity: the committer identity could not be resolved" in output, output
+    assert "auto-detection" not in output
+
+
 def test_without_a_denylist_only_the_built_in_patterns_apply(hook_repo):
     # The control for the denylist itself: with no denylist file the same
     # identity commits, so the refusals above come from the denylist.
