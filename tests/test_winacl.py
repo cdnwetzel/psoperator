@@ -144,7 +144,8 @@ def test_the_nt_structures_have_the_native_layout():
     # UNICODE_STRING: two USHORTs, then a pointer aligned to pointer size.
     assert ctypes.sizeof(winacl._UNICODE_STRING) == (16 if pointer == 8 else 8)
     assert winacl._UNICODE_STRING.Buffer.offset == pointer
-    # OBJECT_ATTRIBUTES: ULONG Length, then five pointers and a ULONG.
+    # OBJECT_ATTRIBUTES: ULONG Length; RootDirectory, ObjectName; ULONG Attributes;
+    # SecurityDescriptor, SecurityQualityOfService (four pointers, two ULONGs).
     assert ctypes.sizeof(winacl._OBJECT_ATTRIBUTES) == (48 if pointer == 8 else 24)
     assert winacl._OBJECT_ATTRIBUTES.RootDirectory.offset == pointer
     assert winacl._OBJECT_ATTRIBUTES.Attributes.offset == 3 * pointer
