@@ -41,8 +41,9 @@ These hold from the start, so they never have to be retrofitted:
   what needs approval, never removing the gate.
 - **The audit log carries no record data.** Today a decision records the target
   element's label. On a real form that label can be a person's name. Before any
-  real data, the audit must record control identity (role, automation id)
-  rather than on-screen text. Synthetic data makes the test phase safe, not the
+  real data, the audit must record control identity (for this application,
+  the field identity in the probe consequences below) rather than on-screen
+  text. Synthetic data makes the test phase safe, not the
   design.
 - **Isolation is checked, not assumed.** Before the first real input, confirm
   that the endpoint cannot reach production systems through the network, shared
@@ -54,10 +55,16 @@ These hold from the start, so they never have to be retrofitted:
 
 1. **Endpoint setup.** Tools are installed over SSH; per-user setup and the
    clone happen in the desktop session (`docs/windows-handoff.md`).
-2. **Read-only UI Automation probe** of the real application with a test
-   record open. It answers whether fields and buttons have usable names and
-   automation ids. No input is sent. If the tree is poor, the next step is OCR
-   or a fixture, decided from the evidence.
+2. **UI Automation probe** of the real application with a test record open.
+   It answers whether fields and buttons have usable names and automation ids.
+   **Done 2026-10-28; verdict: go with Win32 binding plus OCR reading**
+   (`docs/windows-probe.md`). UI Automation is too slow on this application
+   to use. The native Win32 window tree is complete and fast, and a field is
+   identified by the internal name and rectangle of the panel beside it,
+   which held across restarts. Control ids change on every opening. The
+   tested Win32 paths returned no field values; OCR read them. Navigation was
+   driven by keystrokes, each step approved by the operator; the operator's
+   manual for those keystroke sequences stays private, like the denylist.
 3. **Windows attestation port** (roadmap D-01, promoted into the pilot): the
    observer, attestation key and frame-hash contract on the Windows capture
    path.
@@ -66,6 +73,28 @@ These hold from the start, so they never have to be retrofitted:
 5. **A reference task on the real application**, with exact pass and fail from
    attested evidence, first read-only, then with supervised real input.
 6. Approval path with an attested preview, then commit-like actions.
+
+## Consequences of the probe verdict
+
+- **A new bound-target kind in the gatekeeper.** A target is a Win32 field
+  (process, window class path, the internal name of its label panel, and its
+  rectangle) or an OCR box, bound to the hash of the frame it was seen in.
+  The gatekeeper admits input only against a target bound that way. This is a
+  separate, test-first PR after D-01, because the frame hash it binds to is
+  the Windows attestation contract.
+- **The audit logs identity, never text:** the field's identity and
+  rectangle, the OCR box and the frame hash. It never logs OCR text, field
+  values or window text.
+- **`WinAutoA11y` must be scoped to the target window.** It walks the whole
+  desktop today; one snapshot took 124 s. That fix is its own test-first PR.
+- **Every key is preceded by two checks:** the application is the foreground
+  window and is on top at the target point, and keyboard focus is on the
+  bound field. Some screens move focus when they open, and another window
+  covered the application during the probe. This is R-301 on Windows.
+- **The `perception` extra must install `onnxruntime`,** which RapidOCR 2.x
+  needs and does not pull in. That fix comes with the OCR reading path. The
+  test suite must give the same results with and without the optional OCR
+  packages installed.
 
 ## Open decisions
 

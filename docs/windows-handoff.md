@@ -7,23 +7,25 @@ only this repository, so everything it must know is here or linked from here.
 ## 0. Start here (agent on the first endpoint)
 
 Read `docs/pilot-charter.md`, then this file, then `CONTRIBUTING.md`. State on
-the first endpoint as of 2026-10-27:
+the first endpoint as of 2026-10-28:
 
 | step | state |
 | --- | --- |
 | §1 machine tools: Git, Python 3.13.17, GitHub CLI, Node | done, verified |
 | §2.1 `python3` shim pinned to the all-users 3.13.17 | done, verified |
 | §2.2 GitHub SSH keys for both accounts | done, both authenticate |
-| §2.3 clone, hooks, identity, both push remotes | **check**, including the line-ending check |
-| §2.4 private denylist | **ask the operator**; it never comes through git |
-| §2.5 hook negative controls | next |
-| §2.6 install, §2.7 baseline | next |
-| §2.8 agents | Claude Code done (you are it); Codex installed; check sign-ins |
-| §4 read-only probe | after the baseline |
+| §2.3 clone, hooks, identity, both push remotes | done; whole tree checked out LF |
+| §2.4 private denylist | done |
+| §2.5 hook negative controls | done, both refused by the hook |
+| §2.6 install, §2.7 baseline | done; 489 passed, 19 failed, 14 skipped (`docs/windows-probe.md`) |
+| §2.8 agents | done; Claude Code, Codex and `gh` signed in |
+| §4 probe | done; verdict in `docs/pilot-charter.md` |
+| next | roadmap D-01, the Windows attestation port |
 
 Pick up at the first row not marked done: check it, report in one short
 message, and continue. Stop and ask before anything that is not in this file,
-and before any input to the application.
+and before any input to the application. Never push `main`; feature branches
+only.
 
 ## 1. Machine setup (from the management host, over SSH)
 
@@ -221,3 +223,18 @@ With a test record open, from the desktop session:
 automation ids exist, coordinate agreement, timing, and any backend fix. No
 on-screen text. Then update `docs/pilot-charter.md` with the verdict: go, go
 with OCR, or a fixture first.
+
+**Done 2026-10-28** (`docs/windows-probe.md`). Lessons for the next session on
+the endpoint:
+
+- Read the application through `Desktop(backend="win32")` or
+  `EnumChildWindows`: milliseconds, against minutes for UI Automation here.
+- Before any capture or key, check that the application is the foreground
+  window **and** on top at the target point (`WindowFromPoint`). The agent's
+  own terminal can come to the front between steps.
+- Before every key, check that focus is on the intended control. Some screens
+  move focus when they open.
+- Find the application by process and window class, and check the process
+  start time: titles change and Windows reuses process ids.
+- Each input step needs the operator's approval for that step. The keystroke
+  sequences come from the operator's navigation manual, which stays private.
