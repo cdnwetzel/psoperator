@@ -4,8 +4,8 @@ POSIX code proves a secret is private with ``fstat``: owner uid and mode
 ``0600``. Windows has no mode bits; who can read a file is its DACL. This
 module is the Windows counterpart. It reads the owner and DACL from an *open
 handle*, never from a path checked first and opened later, and it creates
-files and directories with an explicit, protected DACL so nothing is
-inherited from the parent.
+files and directories with an explicit, protected DACL applied at creation,
+so nothing is inherited from the parent.
 
 The policy is :func:`owner_only_problem`, a pure function over the parsed
 descriptor, so it is tested on every platform. A descriptor is owner-only when:
@@ -15,13 +15,24 @@ descriptor, so it is tested on every platform. A descriptor is owner-only when:
 - the DACL is protected and carries no inherited entry, so a later change to a
   parent directory cannot widen it;
 - every allow entry, including inherit-only ones on a directory, names the
-  current user or ``SYSTEM`` (which can read any file regardless);
-- no entry is of a type this module does not understand.
+  current user or ``SYSTEM``;
+- no entry is of a type this module does not parse.
 
-Deny entries are always acceptable: they only ever narrow access.
+Deny entries are always acceptable: they only ever narrow access. Allowing
+``SYSTEM`` is a policy choice (services and the OS run as it), not a claim
+that the DACL is irrelevant to it. An administrator who elevates can take
+ownership of any file; this boundary assumes the planner account cannot
+elevate.
 
-Everything that touches Win32 is ``ctypes`` against ``advapi32`` and
-``kernel32``, so no third-party package is needed.
+Creation is anchored like the POSIX ``dir_fd`` path: :class:`OwnerOnlyDir`
+holds a verified directory handle, and files and subdirectories are created
+relative to that handle (``NtCreateFile`` with ``RootDirectory`` and
+``OBJ_DONT_REPARSE``), so swapping an ancestor for a junction after the check
+cannot redirect them. Names are single path components; a colon, which would
+name an alternate data stream sharing another file's descriptor, is refused.
+
+Everything that touches Win32 is ``ctypes`` against ``advapi32``,
+``kernel32`` and ``ntdll``, so no third-party package is needed.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ from __future__ import annotations
 import ctypes
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 SYSTEM_SID = "S-1-5-18"
@@ -90,6 +101,30 @@ def owner_only_sddl(user_sid: str) -> str:
     return f"O:{user_sid}D:P(A;;FA;;;{user_sid})(A;;FA;;;SY)"
 
 
+def component_problem(name: str) -> str | None:
+    """Why ``name`` is not one plain path component, or ``None``. A colon
+    would name an alternate data stream of another file."""
+    if not name or name in (".", ".."):
+        return f"{name!r} is not a file name"
+    for bad in ("\\", "/", ":", "\x00"):
+        if bad in name:
+            return f"{name!r} contains {bad!r}"
+    return None
+
+
+def path_problem(path: Path) -> str | None:
+    """Why ``path`` may not be opened by path, or ``None``: every component
+    after the drive or share must be a plain name, so no component can name
+    an alternate data stream."""
+    parts = PureWindowsPath(str(path)).parts
+    anchor = PureWindowsPath(str(path)).anchor
+    for part in parts[1:] if anchor else parts:
+        problem = component_problem(part)
+        if problem is not None and part not in (".", ".."):
+            return problem
+    return None
+
+
 # --- Win32 ------------------------------------------------------------------
 
 _SE_FILE_OBJECT = 1
@@ -102,18 +137,32 @@ _SDDL_REVISION_1 = 1
 
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
+_SYNCHRONIZE = 0x00100000
 _READ_CONTROL = 0x00020000
 _FILE_READ_ATTRIBUTES = 0x0080
+_FILE_TRAVERSE = 0x0020
 _FILE_SHARE_READ = 0x1
 _FILE_SHARE_WRITE = 0x2
 _FILE_SHARE_DELETE = 0x4
-_CREATE_NEW = 1
 _OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x80
 _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+# NtCreateFile
+_FILE_OPEN = 1
+_FILE_CREATE = 2
+_FILE_DIRECTORY_FILE = 0x00000001
+_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_FILE_NON_DIRECTORY_FILE = 0x00000040
+_FILE_OPEN_REPARSE_POINT = 0x00200000
+_OBJ_CASE_INSENSITIVE = 0x00000040
+_OBJ_DONT_REPARSE = 0x00001000
+_STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+_STATUS_OBJECT_NAME_COLLISION = 0xC0000035
+_STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A
 
 
 def _require_windows() -> None:
@@ -145,12 +194,16 @@ class _SECURITY_ATTRIBUTES(ctypes.Structure):
     ]
 
 
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+
 class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
     _fields_ = [
         ("dwFileAttributes", ctypes.c_uint32),
-        ("ftCreationTime", ctypes.c_uint64),
-        ("ftLastAccessTime", ctypes.c_uint64),
-        ("ftLastWriteTime", ctypes.c_uint64),
+        ("ftCreationTime", _FILETIME),
+        ("ftLastAccessTime", _FILETIME),
+        ("ftLastWriteTime", _FILETIME),
         ("dwVolumeSerialNumber", ctypes.c_uint32),
         ("nFileSizeHigh", ctypes.c_uint32),
         ("nFileSizeLow", ctypes.c_uint32),
@@ -160,11 +213,35 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
     ]
 
 
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_void_p),
+    ]
+
+
+class _OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("RootDirectory", ctypes.c_void_p),
+        ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+        ("Attributes", ctypes.c_ulong),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_void_p)]
+
+
 def _api():
     from ctypes import wintypes
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
 
     advapi32.GetSecurityInfo.argtypes = [
         wintypes.HANDLE,
@@ -239,14 +316,30 @@ def _api():
     kernel32.CreateDirectoryW.restype = wintypes.BOOL
     kernel32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
     kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
-    return advapi32, kernel32
+
+    ntdll.NtCreateFile.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.ULONG,
+        ctypes.POINTER(_OBJECT_ATTRIBUTES),
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+    ]
+    ntdll.NtCreateFile.restype = ctypes.c_long
+    ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
+    ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+    return advapi32, kernel32, ntdll
 
 
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 
-def _winerror(what: str) -> OwnerOnlyError:
-    code = ctypes.get_last_error()
+def _error(what: str, code: int) -> OwnerOnlyError:
     return OwnerOnlyError(f"{what} failed: {ctypes.FormatError(code).strip()} ({code})")
 
 
@@ -255,7 +348,7 @@ def _sid_string(advapi32, kernel32, psid: int) -> str:
 
     text = wintypes.LPWSTR()
     if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(text)):
-        raise _winerror("ConvertSidToStringSidW")
+        raise _error("ConvertSidToStringSidW", ctypes.get_last_error())
     try:
         return str(text.value)
     finally:
@@ -268,12 +361,12 @@ def current_user_sid() -> str:
     _require_windows()
     from ctypes import wintypes
 
-    advapi32, kernel32 = _api()
+    advapi32, kernel32, _ = _api()
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(
         kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
     ):
-        raise _winerror("OpenProcessToken")
+        raise _error("OpenProcessToken", ctypes.get_last_error())
     try:
         needed = wintypes.DWORD()
         advapi32.GetTokenInformation(token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(needed))
@@ -281,7 +374,7 @@ def current_user_sid() -> str:
         if not advapi32.GetTokenInformation(
             token, _TOKEN_USER_CLASS, buf, needed, ctypes.byref(needed)
         ):
-            raise _winerror("GetTokenInformation")
+            raise _error("GetTokenInformation", ctypes.get_last_error())
         psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
         return _sid_string(advapi32, kernel32, psid)
     finally:
@@ -293,7 +386,7 @@ def security_of_handle(handle: int) -> SecurityInfo:
     _require_windows()
     from ctypes import wintypes
 
-    advapi32, kernel32 = _api()
+    advapi32, kernel32, _ = _api()
     owner = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
@@ -308,7 +401,7 @@ def security_of_handle(handle: int) -> SecurityInfo:
         ctypes.byref(descriptor),
     )
     if status != 0:
-        raise OwnerOnlyError(f"GetSecurityInfo failed: {ctypes.FormatError(status).strip()}")
+        raise _error("GetSecurityInfo", status)
     try:
         if not owner.value:
             raise OwnerOnlyError("the security descriptor has no owner")
@@ -317,7 +410,7 @@ def security_of_handle(handle: int) -> SecurityInfo:
         if not advapi32.GetSecurityDescriptorControl(
             descriptor, ctypes.byref(control), ctypes.byref(revision)
         ):
-            raise _winerror("GetSecurityDescriptorControl")
+            raise _error("GetSecurityDescriptorControl", ctypes.get_last_error())
         owner_sid = _sid_string(advapi32, kernel32, owner.value)
         protected = bool(control.value & _SE_DACL_PROTECTED)
         if not (control.value & _SE_DACL_PRESENT) or not dacl.value:
@@ -326,12 +419,12 @@ def security_of_handle(handle: int) -> SecurityInfo:
         if not advapi32.GetAclInformation(
             dacl, ctypes.byref(size), ctypes.sizeof(size), _ACL_SIZE_INFORMATION_CLASS
         ):
-            raise _winerror("GetAclInformation")
+            raise _error("GetAclInformation", ctypes.get_last_error())
         aces: list[Ace] = []
         for index in range(size.AceCount):
             entry = ctypes.c_void_p()
             if not advapi32.GetAce(dacl, index, ctypes.byref(entry)):
-                raise _winerror("GetAce")
+                raise _error("GetAce", ctypes.get_last_error())
             header = _ACE_HEADER.from_address(entry.value)
             inherited = bool(header.AceFlags & _INHERITED_ACE)
             if header.AceType in (_ACCESS_ALLOWED_ACE_TYPE, _ACCESS_DENIED_ACE_TYPE):
@@ -351,15 +444,33 @@ def security_of_handle(handle: int) -> SecurityInfo:
 def _attributes(kernel32, handle: int) -> int:
     info = _BY_HANDLE_FILE_INFORMATION()
     if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
-        raise _winerror("GetFileInformationByHandle")
+        raise _error("GetFileInformationByHandle", ctypes.get_last_error())
     return info.dwFileAttributes
 
 
-def _open_no_follow(kernel32, path: Path, access: int) -> int:
+def _verify_handle(kernel32, handle: int, where: str, *, directory: bool) -> None:
+    attributes = _attributes(kernel32, handle)
+    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OwnerOnlyError(f"{where} is a symlink or other reparse point")
+    if bool(attributes & _FILE_ATTRIBUTE_DIRECTORY) != directory:
+        raise OwnerOnlyError(f"{where} is not a {'directory' if directory else 'regular file'}")
+    problem = owner_only_problem(security_of_handle(handle), current_user_sid())
+    if problem is not None:
+        raise OwnerOnlyError(f"{where} is not owner-only: it {problem}")
+
+
+def _check_path(path: Path) -> None:
+    problem = path_problem(path)
+    if problem is not None:
+        raise OwnerOnlyError(f"refusing path {path}: {problem}")
+
+
+def _open_no_follow(kernel32, path: Path, access: int, share: int) -> int:
+    _check_path(path)
     handle = kernel32.CreateFileW(
         str(path),
         access,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        share,
         None,
         _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
@@ -373,106 +484,204 @@ def _open_no_follow(kernel32, path: Path, access: int) -> int:
     return handle
 
 
-def _verify_handle(kernel32, handle: int, path: Path, *, directory: bool) -> None:
-    attributes = _attributes(kernel32, handle)
-    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-        raise OwnerOnlyError(f"{path} is a symlink or other reparse point")
-    if bool(attributes & _FILE_ATTRIBUTE_DIRECTORY) != directory:
-        raise OwnerOnlyError(f"{path} is not a {'directory' if directory else 'regular file'}")
-    problem = owner_only_problem(security_of_handle(handle), current_user_sid())
-    if problem is not None:
-        raise OwnerOnlyError(f"{path} is not owner-only: it {problem}")
-
-
 def check_owner_only_dir(path: Path) -> None:
     """Raise unless ``path`` is a real directory that is owner-only.
     Raises ``FileNotFoundError`` if it does not exist."""
-    _require_windows()
-    _, kernel32 = _api()
-    handle = _open_no_follow(kernel32, Path(path), _READ_CONTROL | _FILE_READ_ATTRIBUTES)
-    try:
-        _verify_handle(kernel32, handle, Path(path), directory=True)
-    finally:
-        kernel32.CloseHandle(handle)
+    with OwnerOnlyDir(path):
+        pass
 
 
 def open_owner_only_for_read(path: Path) -> int:
     """Open ``path`` without following a reparse point, verify the *opened*
     file is a regular, owner-only file, and return a CRT file descriptor for
-    reading. Raises ``FileNotFoundError`` if it does not exist."""
+    reading that file. Raises ``FileNotFoundError`` if it does not exist."""
     _require_windows()
     import msvcrt
 
-    _, kernel32 = _api()
+    _, kernel32, _ = _api()
     handle = _open_no_follow(
-        kernel32, Path(path), _GENERIC_READ | _READ_CONTROL | _FILE_READ_ATTRIBUTES
+        kernel32,
+        Path(path),
+        _GENERIC_READ | _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
     )
     try:
-        _verify_handle(kernel32, handle, Path(path), directory=False)
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        _verify_handle(kernel32, handle, str(path), directory=False)
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
     except BaseException:
         kernel32.CloseHandle(handle)
         raise
-    return fd
 
 
-def _owner_only_attributes(advapi32):
+def _owner_only_descriptor(advapi32) -> ctypes.c_void_p:
     descriptor = ctypes.c_void_p()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
         owner_only_sddl(current_user_sid()), _SDDL_REVISION_1, ctypes.byref(descriptor), None
     ):
-        raise _winerror("ConvertStringSecurityDescriptorToSecurityDescriptorW")
-    attributes = _SECURITY_ATTRIBUTES(ctypes.sizeof(_SECURITY_ATTRIBUTES), descriptor, 0)
-    return attributes, descriptor
-
-
-def create_owner_only_file(path: Path) -> int:
-    """Create ``path`` exclusively with an owner-only, protected DACL and
-    return a CRT file descriptor for writing. Raises ``FileExistsError`` if
-    the path exists. The descriptor is applied at creation, so the file is
-    never observable with a wider one."""
-    _require_windows()
-    import msvcrt
-
-    advapi32, kernel32 = _api()
-    attributes, descriptor = _owner_only_attributes(advapi32)
-    try:
-        handle = kernel32.CreateFileW(
-            str(path),
-            _GENERIC_WRITE | _READ_CONTROL,
-            0,
-            ctypes.byref(attributes),
-            _CREATE_NEW,
-            _FILE_ATTRIBUTE_NORMAL,
-            None,
+        raise _error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW", ctypes.get_last_error()
         )
-    finally:
-        kernel32.LocalFree(descriptor)
-    if handle in (None, _INVALID_HANDLE):
-        code = ctypes.get_last_error()
-        if code in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
-            raise FileExistsError(str(path))
-        raise OwnerOnlyError(f"cannot create {path}: {ctypes.FormatError(code).strip()} ({code})")
-    try:
-        return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
-    except BaseException:
-        kernel32.CloseHandle(handle)
-        raise
+    return descriptor
 
 
 def create_owner_only_dir(path: Path) -> None:
-    """Create one directory with an owner-only, protected DACL. Raises
-    ``FileExistsError`` if it exists; the parent must already exist."""
+    """Create one directory by path with an owner-only, protected DACL. For a
+    directory whose parent is not itself owner-only (the first private
+    directory under a profile). Below a verified directory, use
+    :meth:`OwnerOnlyDir.create_dir`. Raises ``FileExistsError`` if it exists."""
     _require_windows()
-    advapi32, kernel32 = _api()
-    attributes, descriptor = _owner_only_attributes(advapi32)
+    _check_path(Path(path))
+    advapi32, kernel32, _ = _api()
+    descriptor = _owner_only_descriptor(advapi32)
+    attributes = _SECURITY_ATTRIBUTES(ctypes.sizeof(_SECURITY_ATTRIBUTES), descriptor, 0)
     try:
-        if not kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes)):
-            code = ctypes.get_last_error()
-            if code == 183:  # ERROR_ALREADY_EXISTS
-                raise FileExistsError(str(path))
-            raise OwnerOnlyError(
-                f"cannot create directory {path}: {ctypes.FormatError(code).strip()} ({code})"
-            )
+        created = kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes))
+        code = ctypes.get_last_error()
     finally:
         kernel32.LocalFree(descriptor)
+    if not created:
+        if code == 183:  # ERROR_ALREADY_EXISTS
+            raise FileExistsError(str(path))
+        raise _error(f"creating directory {path}", code)
+
+
+class OwnerOnlyDir:
+    """A verified owner-only directory, held open for anchored operations.
+
+    The handle is opened without following a reparse point and without
+    ``FILE_SHARE_DELETE``, so the directory cannot be renamed or removed while
+    held, and every create or open below it is relative to this handle.
+    """
+
+    def __init__(self, path: Path) -> None:
+        _require_windows()
+        self.path = Path(path)
+        _, kernel32, _ = _api()
+        self._handle = _open_no_follow(
+            kernel32,
+            self.path,
+            _READ_CONTROL | _FILE_READ_ATTRIBUTES | _FILE_TRAVERSE | _SYNCHRONIZE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        )
+        try:
+            _verify_handle(kernel32, self._handle, str(self.path), directory=True)
+        except BaseException:
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            raise
+
+    def __enter__(self) -> "OwnerOnlyDir":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._handle is not None:
+            _, kernel32, _ = _api()
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+    def _nt_create(self, name: str, access: int, disposition: int, options: int, descriptor) -> int:
+        from ctypes import wintypes
+
+        if self._handle is None:
+            raise OwnerOnlyError(f"{self.path} is closed")
+        problem = component_problem(name)
+        if problem is not None:
+            raise OwnerOnlyError(f"refusing name in {self.path}: {problem}")
+        _, _, ntdll = _api()
+        buffer = ctypes.create_unicode_buffer(name)
+        length = len(name.encode("utf-16-le"))
+        unicode_name = _UNICODE_STRING(length, length, ctypes.addressof(buffer))
+        attributes = _OBJECT_ATTRIBUTES(
+            ctypes.sizeof(_OBJECT_ATTRIBUTES),
+            self._handle,
+            ctypes.pointer(unicode_name),
+            _OBJ_CASE_INSENSITIVE | _OBJ_DONT_REPARSE,
+            descriptor,
+            None,
+        )
+        handle = wintypes.HANDLE()
+        io_status = _IO_STATUS_BLOCK()
+        status = ntdll.NtCreateFile(
+            ctypes.byref(handle),
+            access | _SYNCHRONIZE,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            _FILE_ATTRIBUTE_NORMAL,
+            _FILE_SHARE_READ if disposition == _FILE_OPEN else 0,
+            disposition,
+            options | _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT,
+            None,
+            0,
+        )
+        unsigned = status & 0xFFFFFFFF
+        if unsigned == _STATUS_OBJECT_NAME_COLLISION:
+            raise FileExistsError(str(self.path / name))
+        if unsigned in (_STATUS_OBJECT_NAME_NOT_FOUND, _STATUS_OBJECT_PATH_NOT_FOUND):
+            raise FileNotFoundError(str(self.path / name))
+        if status < 0:
+            raise _error(
+                f"NtCreateFile for {self.path / name}", ntdll.RtlNtStatusToDosError(status)
+            )
+        return handle.value
+
+    def create_file(self, name: str) -> int:
+        """Create ``name`` in this directory exclusively, owner-only, and
+        return a CRT file descriptor for writing. The descriptor is applied
+        at creation. Raises ``FileExistsError`` if it exists."""
+        import msvcrt
+
+        advapi32, kernel32, _ = _api()
+        descriptor = _owner_only_descriptor(advapi32)
+        try:
+            handle = self._nt_create(
+                name,
+                _GENERIC_WRITE | _READ_CONTROL,
+                _FILE_CREATE,
+                _FILE_NON_DIRECTORY_FILE,
+                descriptor,
+            )
+        finally:
+            kernel32.LocalFree(descriptor)
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+
+    def create_dir(self, name: str) -> None:
+        """Create subdirectory ``name`` owner-only. Raises ``FileExistsError``
+        if it exists."""
+        advapi32, kernel32, _ = _api()
+        descriptor = _owner_only_descriptor(advapi32)
+        try:
+            handle = self._nt_create(
+                name, _READ_CONTROL, _FILE_CREATE, _FILE_DIRECTORY_FILE, descriptor
+            )
+        finally:
+            kernel32.LocalFree(descriptor)
+        kernel32.CloseHandle(handle)
+
+    def open_file(self, name: str) -> int:
+        """Open ``name`` in this directory for reading, verify the opened file
+        is a regular owner-only file, and return a CRT file descriptor.
+        Raises ``FileNotFoundError`` if it does not exist."""
+        import msvcrt
+
+        _, kernel32, _ = _api()
+        handle = self._nt_create(
+            name,
+            _GENERIC_READ | _READ_CONTROL | _FILE_READ_ATTRIBUTES,
+            _FILE_OPEN,
+            _FILE_NON_DIRECTORY_FILE,
+            None,
+        )
+        try:
+            _verify_handle(kernel32, handle, str(self.path / name), directory=False)
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
