@@ -81,7 +81,25 @@ These hold from the start, so they never have to be retrofitted:
   rectangle) or an OCR box, bound to the hash of the frame it was seen in.
   The gatekeeper admits input only against a target bound that way. This is a
   separate, test-first PR after D-01, because the frame hash it binds to is
-  the Windows attestation contract.
+  the Windows attestation contract. The field identity it binds is read by
+  `psoperator/perception/win32_fields.py`: read-only, no window text or
+  field values, the label panel's internal name kept only as a SHA-256. The
+  bound-target PR's tests must hold it to these requirements:
+  1. **Before any capture or input**, the application is the foreground
+     window **and** owns the topmost window at the target point
+     (`WindowFromPoint`); otherwise refuse, naming the blocking process.
+     Negative control: a test window on top.
+  2. **Identity uses window-relative rectangles** (relative to the
+     top-level window). Screen rectangles are used only for acting, so
+     moving or restoring the window does not break identity. (Done in the
+     provider.)
+  3. **A field is a valid target only if its rectangle lies inside the
+     visible client area of its scrolling parent**: a scrolled-out Edit
+     still reports itself visible.
+  4. **Process identity includes the process start time**, not only the
+     image name and pid, since Windows reuses pids. (Done in the provider.)
+  5. **The audit records identity, the frame hash and the rectangles**,
+     never text.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
   values or window text.
