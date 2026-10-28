@@ -11,6 +11,7 @@ preview lists. The GTK UI itself is validated live on the AT-SPI host.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -119,6 +120,7 @@ def test_record_round_trips_submissions_in_field_order(tmp_path):
     assert subs[0]["Vendor"] == DEMO_INVOICE.vendor
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to remove an open file; see below")
 def test_record_refuses_a_removed_or_replaced_file(tmp_path):
     from psoperator.fixtures.invoice import RecordError, SubmissionRecord
 
@@ -131,6 +133,62 @@ def test_record_refuses_a_removed_or_replaced_file(tmp_path):
     with pytest.raises(RecordError, match="replaced"):
         record.append(field_rows(DEMO_INVOICE))
     record.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing")
+def test_an_open_record_cannot_be_removed_or_replaced_on_windows(tmp_path):
+    """The record is held open without delete sharing, so Windows refuses to
+    remove it or rename another file over it, and appends carry on."""
+    from psoperator.fixtures.invoice import SubmissionRecord, read_submissions
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    with pytest.raises(PermissionError):
+        path.unlink()
+    other = tmp_path / "other.jsonl"
+    other.write_text("")
+    with pytest.raises(PermissionError):
+        os.replace(other, path)
+    record.append(field_rows(DEMO_INVOICE))
+    record.close()
+    assert len(read_submissions(path)) == 1
+
+
+def test_record_detects_a_removed_or_replaced_path(tmp_path, monkeypatch):
+    """The detection itself, on every platform: the path is re-checked against
+    the open file before each append. Removal and replacement are simulated
+    through the module's stat, since Windows will not perform them."""
+    import psoperator.fixtures.invoice as inv_mod
+    from psoperator.fixtures.invoice import RecordError, SubmissionRecord, read_submissions
+
+    path = tmp_path / "run.jsonl"
+    record = SubmissionRecord(path)
+    other = tmp_path / "other.jsonl"
+    other.write_text("")
+    real_os = inv_mod.os
+    target: list = [None]  # the file the path names now, or None when gone
+
+    class _Os:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def stat(p, *args, **kwargs):
+            if target[0] is None:
+                raise FileNotFoundError(p)
+            return real_os.stat(target[0], *args, **kwargs)
+
+    monkeypatch.setattr(inv_mod, "os", _Os())
+    with pytest.raises(RecordError, match="is gone"):
+        record.append(field_rows(DEMO_INVOICE))
+    target[0] = other  # a different file at the same path
+    with pytest.raises(RecordError, match="replaced"):
+        record.append(field_rows(DEMO_INVOICE))
+    target[0] = path  # the control: the same file appends
+    record.append(field_rows(DEMO_INVOICE))
+    monkeypatch.undo()
+    record.close()
+    assert len(read_submissions(path)) == 1
 
 
 def test_record_failures_are_errors_not_empty(tmp_path):
@@ -220,7 +278,16 @@ def test_record_with_an_invalid_path_is_an_error(tmp_path, name):
         read_submissions(tmp_path / name)
 
 
-@pytest.mark.parametrize("name", ["bad\x00.jsonl", "bad\ud800.jsonl"])
+# NTFS names are UTF-16 and accept an unpaired surrogate, and POSIX names
+# accept "<" and "?", so each platform gets the names it actually refuses.
+_INVALID_NAMES = (
+    ["bad\x00.jsonl", "bad<.jsonl", "bad?.jsonl"]
+    if os.name == "nt"
+    else ["bad\x00.jsonl", "bad\ud800.jsonl"]
+)
+
+
+@pytest.mark.parametrize("name", _INVALID_NAMES)
 def test_creating_a_record_at_an_invalid_path_is_an_error(tmp_path, name):
     from psoperator.fixtures.invoice import RecordError, SubmissionRecord
 
