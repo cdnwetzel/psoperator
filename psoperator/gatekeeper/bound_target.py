@@ -3,85 +3,257 @@
 The pilot application is driven by keystrokes through menu path codes, and one
 wrong digit selects a different screen: a read-only report and a function that
 processes data can sit one digit apart. So the gate is an allow-list, not a
-deny-list. A key is admitted only when every one of these holds:
+deny-list, and it trusts no caller-supplied picture of the screen: the
+gatekeeper observes the screen itself (an injected observer), immediately
+before checking and again immediately before the key is sent.
 
-1. it is a single key, not typed text or a chord;
-2. the application's bound process instance (pid and start time; Windows reuses
-   pids) is the foreground window and owns the topmost window at the target
-   point, otherwise the refusal names the process in the way;
-3. the menu path is on the allow-list, the key is the one allowed at this step,
-   and the screen's window-tree signature matches the step's expected one;
-4. a bound Win32 field belongs to the bound instance and lies inside the
-   visible client area of every ancestor (a scrolled-out Edit still reports
-   itself visible).
+A key is admitted only when every one of these holds:
 
-Anything else is refused, and the refusal is audited like a decision. The audit
-records the target's identity, the frame hash and rectangles, never text.
+1. it is one recognised key, not typed text or a chord;
+2. the observation is fresh, of the bound main window of the bound process
+   instance (pid and start time; Windows reuses pids);
+3. that main window is the foreground window and the topmost window at the
+   target point (an owned dialog or popup of the same process fails this);
+4. the menu path is on the allow-list, the key is the one allowed at this
+   step, and the screen's complete signature (every visible Edit's position,
+   the hash of every label-class caption on screen, every labelled field's
+   label hash and position, dialogs, focus) equals the step's expected one and
+   none of the step's recorded neighbouring screens;
+5. the target is a Win32 field of that instance that has keyboard focus, is
+   the node the tree holds at that handle and geometry, contains the point,
+   and is visible: every node on its path is visible and it lies inside the
+   client area of every ancestor (a scrolled-out Edit still reports itself
+   visible);
+6. immediately before sending, a second observation shows the same windows,
+   focus and screen.
 
-The allow-list itself is private configuration (:meth:`AllowList.load`), and
-an empty allow-list refuses everything.
+Anything else is refused and audited with a fixed reason code. The audit keeps
+validated identity, the frame hash, rectangles and recognised key names;
+never text, and never a caller-supplied string verbatim.
+
+The allow-list is private configuration (:meth:`AllowList.load`), validated
+strictly; an empty allow-list refuses everything.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
-from psoperator.perception.win32_fields import Rect, Win32Field, WindowNode
+from psoperator.perception.win32_fields import (
+    LABEL_CLASS,
+    Rect,
+    Win32Field,
+    WindowNode,
+    pair_fields,
+)
 from psoperator.runtime.actions import Action, ActionKind
+
+_HASH = re.compile(r"[0-9a-f]{64}")
+_NAME = re.compile(r"[A-Za-z0-9_.#:-]{1,64}")
+_PATH = re.compile(r"[0-9A-Za-z-]{1,32}")
+_KEYS = frozenset(
+    {"ENTER", "ESC", "TAB", "SPACE", "BACKSPACE", "UP", "DOWN", "LEFT", "RIGHT"}
+    | {f"F{i}" for i in range(1, 13)}
+)
+
+
+def valid_key(key: object) -> bool:
+    """A key name the gate recognises: a digit, an upper-case letter or a
+    named key. Anything else is refused and never audited verbatim."""
+    return isinstance(key, str) and (key in _KEYS or re.fullmatch(r"[0-9A-Z]", key) is not None)
+
+
+class Code(str, Enum):
+    """Fixed reason codes: the audit records these, never free text."""
+
+    NOT_KEY = "not-a-key-action"
+    CHORD = "not-one-key"
+    BAD_KEY = "key-not-recognised"
+    STALE = "observation-stale"
+    OBSERVE_FAILED = "observation-failed"
+    INSTANCE = "wrong-instance"
+    COVERED = "target-point-covered"
+    NOT_FOREGROUND = "not-foreground"
+    NO_PATH = "path-not-allowed"
+    NO_STEP = "no-such-step"
+    WRONG_KEY = "key-not-allowed-at-step"
+    SCREEN = "screen-mismatch"
+    NO_TARGET = "no-target"
+    UNSUPPORTED = "unsupported-target"
+    NOT_FOCUSED = "target-not-focused"
+    TARGET_MISMATCH = "target-mismatch"
+    HIDDEN = "target-hidden"
+    CLIPPED = "target-clipped"
+    GEOMETRY = "bad-geometry"
+    CHANGED = "screen-changed"
+    INVALID = "invalid-request"
+
+
+@dataclass(frozen=True)
+class Refusal:
+    code: Code
+    detail: str = ""  # for the caller; never audited
 
 
 class AllowListError(Exception):
-    """The allow-list file cannot be read or is malformed; nothing is allowed."""
+    """The allow-list cannot be read or is malformed; nothing is allowed."""
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid_rect(rect: object) -> bool:
+    return (
+        isinstance(rect, tuple)
+        and len(rect) == 4
+        and all(_is_int(v) for v in rect)
+        and rect[2] > 0
+        and rect[3] > 0
+    )
 
 
 @dataclass(frozen=True)
 class ScreenSignature:
-    """What a screen looks like as structure, never text.
+    """A screen as structure, never text. Rectangles are relative to the main
+    window. ``edit_rects`` holds every visible Edit; ``captions`` the hash of
+    every visible label-class caption on screen (screen-wide, so screens
+    without fields, such as menus, are still told apart); ``labelled`` every
+    paired field as (label hash, Edit rectangle). All are kept sorted, so
+    positions and multiplicity count, not only sets."""
 
-    ``paired`` and ``label_hashes`` (hashes of the label panels' internal
-    names) are None until recorded for a step; the counts and the focus are
-    always compared. Rectangles are relative to the top-level window."""
-
-    visible_edits: int
     owned_windows: int
-    focus_class: str | None
-    focus_rect: Rect | None
-    paired: int | None = None
-    label_hashes: frozenset[str] | None = None
+    focus_class: str
+    focus_rect: Rect
+    edit_rects: tuple[Rect, ...]
+    captions: tuple[str, ...]
+    labelled: tuple[tuple[str, Rect], ...]
+
+    def __post_init__(self) -> None:
+        if not _is_int(self.owned_windows) or self.owned_windows < 0:
+            raise ValueError("owned_windows must be a non-negative integer")
+        if not isinstance(self.focus_class, str) or not _NAME.fullmatch(self.focus_class):
+            raise ValueError("focus_class must be a window class name")
+        if not valid_rect(self.focus_rect):
+            raise ValueError("focus_rect must be four integers with positive size")
+        if not isinstance(self.edit_rects, tuple) or not all(map(valid_rect, self.edit_rects)):
+            raise ValueError("edit_rects must be a tuple of valid rectangles")
+        if not isinstance(self.captions, tuple) or not all(
+            isinstance(h, str) and _HASH.fullmatch(h) for h in self.captions
+        ):
+            raise ValueError("captions must be a tuple of 64-hex caption hashes")
+        if not isinstance(self.labelled, tuple) or not all(
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and _HASH.fullmatch(item[0])
+            and valid_rect(item[1])
+            for item in self.labelled
+        ):
+            raise ValueError("labelled must be a tuple of (64-hex label hash, rectangle)")
+        object.__setattr__(self, "edit_rects", tuple(sorted(self.edit_rects)))
+        object.__setattr__(self, "captions", tuple(sorted(self.captions)))
+        object.__setattr__(self, "labelled", tuple(sorted(self.labelled)))
 
 
 def signature_problem(expected: ScreenSignature, observed: ScreenSignature) -> str | None:
-    """Why ``observed`` is not the expected screen, or None."""
-    if observed.visible_edits != expected.visible_edits:
-        return f"{observed.visible_edits} visible Edits, expected {expected.visible_edits}"
+    """Which part of the screen differs, or None."""
     if observed.owned_windows != expected.owned_windows:
-        return (
-            f"{observed.owned_windows} dialog or owned windows open, "
-            f"expected {expected.owned_windows}"
-        )
+        return "dialogs"
     if (observed.focus_class, observed.focus_rect) != (expected.focus_class, expected.focus_rect):
-        return (
-            f"focus is {observed.focus_class} at {observed.focus_rect}, "
-            f"expected {expected.focus_class} at {expected.focus_rect}"
-        )
-    if expected.paired is not None and observed.paired != expected.paired:
-        return f"{observed.paired} paired fields, expected {expected.paired}"
-    if expected.label_hashes is not None and observed.label_hashes != expected.label_hashes:
-        seen = observed.label_hashes or frozenset()
-        return (
-            f"field label hashes differ ({len(seen - expected.label_hashes)} unexpected, "
-            f"{len(expected.label_hashes - seen)} missing)"
-        )
+        return "focus"
+    if observed.edit_rects != expected.edit_rects:
+        return "edits"
+    if observed.captions != expected.captions:
+        return "captions"
+    if observed.labelled != expected.labelled:
+        return "labels"
     return None
+
+
+def _relative(rect: Rect, origin: tuple[int, int]) -> Rect:
+    return (rect[0] - origin[0], rect[1] - origin[1], rect[2], rect[3])
+
+
+def _visible_nodes(root: WindowNode):
+    """Visible descendants of ``root`` (a hidden window hides its subtree)."""
+    stack = list(reversed(root.children))
+    while stack:
+        node = stack.pop()
+        if node.visible:
+            yield node
+            stack.extend(reversed(node.children))
+
+
+def signature_of(
+    tree: WindowNode,
+    focus_hwnd: int,
+    owned_windows: int,
+    *,
+    pid: int,
+    process_started: int,
+    process_image: str,
+    label_class: str | None = None,
+) -> ScreenSignature:
+    """The signature of an observed main-window tree. Raises if the focus is
+    not a visible control inside the tree."""
+    origin = (tree.rect[0], tree.rect[1])
+    focus = next((n for n in _visible_nodes(tree) if n.hwnd == focus_hwnd), None)
+    if focus is None:
+        raise ValueError("keyboard focus is not on a visible control of the main window")
+    edits = tuple(_relative(n.rect, origin) for n in _visible_nodes(tree) if n.class_name == "Edit")
+    wanted = label_class or LABEL_CLASS
+    captions = tuple(
+        n.name_hash
+        for n in _visible_nodes(tree)
+        if n.class_name == wanted and n.name_hash is not None
+    )
+    kwargs = {"label_class": label_class} if label_class else {}
+    scan = pair_fields(
+        tree, pid=pid, process_started=process_started, process_image=process_image, **kwargs
+    )
+    return ScreenSignature(
+        owned_windows=owned_windows,
+        focus_class=focus.class_name,
+        focus_rect=_relative(focus.rect, origin),
+        edit_rects=edits,
+        captions=captions,
+        labelled=tuple((f.label_hash, f.rect) for f in scan.fields),
+    )
 
 
 @dataclass(frozen=True)
 class AllowedStep:
+    """One step: the screen it must be on, the one key it allows, and the
+    recorded signatures of neighbouring screens it must be told apart from
+    (e.g. the screen one wrong digit away)."""
+
     expected: ScreenSignature
     key: str
+    neighbours: tuple[ScreenSignature, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expected, ScreenSignature):
+            raise AllowListError("a step needs a complete expected screen signature")
+        if not self.expected.captions:
+            raise AllowListError(
+                "a step's expected screen needs screen-specific caption hashes; "
+                "counts and focus alone cannot tell screens apart"
+            )
+        if not valid_key(self.key):
+            raise AllowListError("a step needs a recognised key")
+        if not isinstance(self.neighbours, tuple) or not all(
+            isinstance(n, ScreenSignature) for n in self.neighbours
+        ):
+            raise AllowListError("neighbours must be a tuple of screen signatures")
+        for neighbour in self.neighbours:
+            if signature_problem(self.expected, neighbour) is None:
+                raise AllowListError("a recorded neighbouring screen equals the expected one")
 
 
 @dataclass(frozen=True)
@@ -89,29 +261,58 @@ class AllowedPath:
     path: str
     steps: tuple[AllowedStep, ...]
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not _PATH.fullmatch(self.path):
+            raise AllowListError("a path needs a menu path code")
+        if not isinstance(self.steps, tuple) or not self.steps:
+            raise AllowListError(f"path {self.path!r} has no steps")
+        if not all(isinstance(s, AllowedStep) for s in self.steps):
+            raise AllowListError(f"path {self.path!r} has a step that is not an AllowedStep")
 
-_SIGNATURE_FIELDS = {f.name for f in fields(ScreenSignature)}
+
+def _no_duplicates(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise AllowListError(f"allow-list repeats the member {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _exact(obj: object, keys: set[str], where: str) -> dict:
+    if not isinstance(obj, dict) or set(obj) != keys:
+        raise AllowListError(f"{where} must have exactly the fields {sorted(keys)}")
+    return obj
+
+
+def _rect_from(value: object, where: str) -> Rect:
+    rect = tuple(value) if isinstance(value, list) else None
+    if rect is None or not valid_rect(rect):
+        raise AllowListError(f"{where}: a rectangle must be four integers with positive size")
+    return rect
 
 
 def _signature_from(data: object, where: str) -> ScreenSignature:
-    if not isinstance(data, dict):
-        raise AllowListError(f"{where}: expected must be an object")
-    unknown = set(data) - _SIGNATURE_FIELDS
-    if unknown:
-        raise AllowListError(f"{where}: expected has unknown fields {sorted(unknown)}")
+    fields = {"owned_windows", "focus_class", "focus_rect", "edit_rects", "captions", "labelled"}
+    data = _exact(data, fields, f"{where} expected")
+    if not all(isinstance(data[k], list) for k in ("edit_rects", "captions", "labelled")):
+        raise AllowListError(f"{where} expected: edit_rects, captions and labelled must be lists")
+    labelled = []
+    for item in data["labelled"]:
+        if not isinstance(item, list) or len(item) != 2:
+            raise AllowListError(f"{where} expected: labelled items are [hash, rectangle]")
+        labelled.append((item[0], _rect_from(item[1], where)))
     try:
-        focus = data.get("focus_rect")
-        hashes = data.get("label_hashes")
         return ScreenSignature(
-            visible_edits=int(data["visible_edits"]),
-            owned_windows=int(data["owned_windows"]),
-            focus_class=data.get("focus_class"),
-            focus_rect=tuple(int(v) for v in focus) if focus is not None else None,
-            paired=int(data["paired"]) if data.get("paired") is not None else None,
-            label_hashes=frozenset(str(h) for h in hashes) if hashes is not None else None,
+            owned_windows=data["owned_windows"],
+            focus_class=data["focus_class"],
+            focus_rect=_rect_from(data["focus_rect"], where),
+            edit_rects=tuple(_rect_from(r, where) for r in data["edit_rects"]),
+            captions=tuple(data["captions"]),
+            labelled=tuple(labelled),
         )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise AllowListError(f"{where}: expected is malformed: {exc}") from exc
+    except ValueError as exc:
+        raise AllowListError(f"{where} expected: {exc}") from exc
 
 
 class AllowList:
@@ -119,85 +320,112 @@ class AllowList:
 
     def __init__(self, paths: Iterable[AllowedPath]) -> None:
         self._paths: dict[str, AllowedPath] = {}
+        seen: list[ScreenSignature] = []
         for entry in paths:
+            if not isinstance(entry, AllowedPath):
+                raise AllowListError("allow-list entries must be AllowedPath")
             if entry.path in self._paths:
                 raise AllowListError(f"path {entry.path!r} is listed twice")
-            if not entry.steps:
-                raise AllowListError(f"path {entry.path!r} has no steps")
+            for step in entry.steps:
+                if step.expected in seen:
+                    raise AllowListError(
+                        "two steps expect the same screen signature; the gate could "
+                        "not tell them apart"
+                    )
+                seen.append(step.expected)
             self._paths[entry.path] = entry
 
     @classmethod
     def load(cls, path: Path | str) -> "AllowList":
         """Load the private allow-list JSON. Any doubt about it refuses to load."""
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
             raise AllowListError(f"allow-list {path} is unreadable: {exc}") from exc
-        if not isinstance(data, dict) or not isinstance(data.get("paths"), list):
-            raise AllowListError("allow-list must be an object with a list of paths")
+        try:
+            data = json.loads(text, object_pairs_hook=_no_duplicates)
+        except ValueError as exc:
+            raise AllowListError(f"allow-list {path} is unreadable: {exc}") from exc
+        data = _exact(data, {"paths"}, "the allow-list")
+        if not isinstance(data["paths"], list):
+            raise AllowListError("the allow-list paths must be a list")
         entries = []
         for item in data["paths"]:
-            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-                raise AllowListError("each entry needs a path string")
-            name = item["path"]
-            steps = item.get("steps")
-            if not isinstance(steps, list) or not steps:
-                raise AllowListError(f"path {name!r} has no steps")
-            parsed = []
-            for i, step in enumerate(steps):
-                where = f"path {name!r} step {i}"
-                if not isinstance(step, dict) or "expected" not in step:
-                    raise AllowListError(f"{where}: needs an expected screen")
-                key = step.get("key")
-                if not isinstance(key, str) or not key:
-                    raise AllowListError(f"{where}: needs a key")
-                parsed.append(AllowedStep(_signature_from(step["expected"], where), key))
-            entries.append(AllowedPath(name, tuple(parsed)))
+            item = _exact(item, {"path", "steps"}, "a path entry")
+            if not isinstance(item["steps"], list) or not item["steps"]:
+                raise AllowListError(f"path {item['path']!r} has no steps")
+            steps = []
+            for i, step in enumerate(item["steps"]):
+                where = f"path {item['path']!r} step {i}"
+                keys = (
+                    {"key", "expected", "neighbours"}
+                    if "neighbours" in step
+                    else {"key", "expected"}
+                )
+                step = _exact(step, keys, where)
+                neighbours = step.get("neighbours", [])
+                if not isinstance(neighbours, list):
+                    raise AllowListError(f"{where}: neighbours must be a list")
+                steps.append(
+                    AllowedStep(
+                        _signature_from(step["expected"], where),
+                        step["key"],
+                        tuple(_signature_from(n, f"{where} neighbour") for n in neighbours),
+                    )
+                )
+            entries.append(AllowedPath(item["path"], tuple(steps)))
         return cls(entries)
 
-    def problem(self, path: str, step: int, key: str, observed: ScreenSignature) -> str | None:
-        """Why ``key`` may not be sent at ``step`` of ``path``, or None."""
+    def problem(self, path: str, step: int, key: str, observed: ScreenSignature) -> Refusal | None:
         entry = self._paths.get(path)
         if entry is None:
-            return f"menu path {path!r} is not on the allow-list"
-        if not 0 <= step < len(entry.steps):
-            return f"path {path!r} has no step {step}"
+            return Refusal(Code.NO_PATH)
+        if not _is_int(step) or not 0 <= step < len(entry.steps):
+            return Refusal(Code.NO_STEP)
         allowed = entry.steps[step]
         if key != allowed.key:
-            return f"step {step} of {path!r} allows only {allowed.key!r}, not {key!r}"
+            return Refusal(Code.WRONG_KEY, f"step {step} allows only {allowed.key}")
+        if any(signature_problem(n, observed) is None for n in allowed.neighbours):
+            return Refusal(Code.SCREEN, "a recorded neighbouring screen")
         mismatch = signature_problem(allowed.expected, observed)
         if mismatch is not None:
-            return f"the screen does not match step {step} of {path!r}: {mismatch}"
+            return Refusal(Code.SCREEN, mismatch)
         return None
 
 
 @dataclass(frozen=True)
-class ForegroundObservation:
-    """Who is in front, and who owns the topmost window at the target point.
-    Instances are (pid, process start time)."""
+class Observation:
+    """What the gatekeeper's own observer saw, and when (monotonic seconds).
+    ``topmost_hwnd`` is the top-level window at ``point``; an owned popup is
+    its own top-level window, so it never equals the main window."""
 
-    foreground_instance: tuple[int, int]
-    foreground_image: str
-    topmost_instance: tuple[int, int]
-    topmost_image: str
+    at: float
+    main_hwnd: int
+    instance: tuple[int, int]
+    foreground_hwnd: int
+    topmost_hwnd: int
+    focus_hwnd: int
+    point: tuple[int, int]
+    signature: ScreenSignature
+    tree: WindowNode
 
 
-def foreground_problem(bound: tuple[int, int], observed: ForegroundObservation) -> str | None:
-    """Why the bound instance is not safely in front at the point, or None."""
-    checks = (
-        (observed.foreground_instance, observed.foreground_image, "is the foreground window"),
-        (observed.topmost_instance, observed.topmost_image, "covers the target point"),
-    )
-    for instance, image, what in checks:
-        if instance == bound:
-            continue
-        if instance[0] == bound[0]:
-            return (
-                f"process {instance[0]} {what} but has another start time: "
-                "not the bound instance (restarted, or the pid was reused)"
-            )
-        return f"{image} (pid {instance[0]}) {what}, not the application"
-    return None
+@dataclass(frozen=True)
+class OcrBox:
+    """A target read by OCR: a rectangle in the frame it was seen in. Not a
+    valid key target: keys go to the focused control."""
+
+    rect: Rect
+
+
+@dataclass(frozen=True)
+class BoundKeyRequest:
+    action: Action
+    path: str
+    step: int
+    app_instance: tuple[int, int]
+    main_hwnd: int
+    target: Win32Field | OcrBox | None
 
 
 def _path_to(root: WindowNode, hwnd: int) -> list[WindowNode] | None:
@@ -219,82 +447,136 @@ def _inside(inner: Rect, outer: Rect) -> bool:
     )
 
 
-def clipping_problem(tree: WindowNode, hwnd: int) -> str | None:
-    """Why the field ``hwnd`` is not fully inside the visible client area of
-    every ancestor, or None. Unknown client areas fail closed."""
-    path = _path_to(tree, hwnd)
-    if path is None:
-        return "the target field is not in the window tree"
-    field_rect = path[-1].rect
+def _point_in(point: tuple[int, int], rect: Rect) -> bool:
+    return rect[0] <= point[0] < rect[0] + rect[2] and rect[1] <= point[1] < rect[1] + rect[3]
+
+
+def _valid_field(field: Win32Field) -> bool:
+    return (
+        all(_is_int(v) for v in (field.pid, field.process_started, field.hwnd))
+        and isinstance(field.process_image, str)
+        and _NAME.fullmatch(field.process_image) is not None
+        and isinstance(field.class_path, tuple)
+        and 0 < len(field.class_path) <= 16
+        and all(isinstance(c, str) and _NAME.fullmatch(c) for c in field.class_path)
+        and isinstance(field.label_hash, str)
+        and _HASH.fullmatch(field.label_hash) is not None
+        and all(map(valid_rect, (field.rect, field.label_rect, field.screen_rect)))
+    )
+
+
+def target_problem(target: object, request: BoundKeyRequest, obs: Observation) -> Refusal | None:
+    """Whether the target is the focused, visible field it claims to be."""
+    if target is None:
+        return Refusal(Code.NO_TARGET)
+    if not isinstance(target, Win32Field):
+        return Refusal(Code.UNSUPPORTED)
+    if not _valid_field(target):
+        return Refusal(Code.INVALID, "the target's identity is malformed")
+    if target.instance != request.app_instance:
+        return Refusal(Code.INSTANCE)
+    if target.hwnd != obs.focus_hwnd:
+        return Refusal(Code.NOT_FOCUSED)
+    path = _path_to(obs.tree, target.hwnd)
+    if path is None or len(path) < 2:
+        return Refusal(Code.TARGET_MISMATCH, "not a control of the main window")
+    node = path[-1]
+    if node.class_name != "Edit" or node.rect != target.screen_rect:
+        return Refusal(Code.TARGET_MISMATCH, "class or geometry differs")
+    if not _point_in(obs.point, node.rect):
+        return Refusal(Code.TARGET_MISMATCH, "the checked point is outside the field")
+    if not all(n.visible for n in path):
+        return Refusal(Code.HIDDEN)
     for ancestor in path[:-1]:
-        if ancestor.client_rect is None:
-            return "the client area of an ancestor is unknown; cannot verify the field is visible"
-        if not _inside(field_rect, ancestor.client_rect):
-            return (
-                f"the field lies outside the visible client area of its "
-                f"{ancestor.class_name} ancestor (scrolled out or clipped)"
-            )
+        if ancestor.client_rect is None or not valid_rect(ancestor.client_rect):
+            return Refusal(Code.GEOMETRY, "an ancestor's client area is unknown or invalid")
+        if not valid_rect(node.rect) or not _inside(node.rect, ancestor.client_rect):
+            return Refusal(Code.CLIPPED)
     return None
 
 
-@dataclass(frozen=True)
-class OcrBox:
-    """A target read by OCR: a rectangle in the frame it was seen in."""
+def bound_key_problem(
+    request: BoundKeyRequest,
+    allow: AllowList,
+    obs: Observation,
+    *,
+    now: float,
+    max_age_s: float,
+) -> Refusal | None:
+    """Why the key may not be sent on this observation, or None."""
+    action = request.action
+    if action.kind is not ActionKind.KEY:
+        return Refusal(Code.NOT_KEY)
+    if len(action.keys) != 1:
+        return Refusal(Code.CHORD)
+    key = action.keys[0]
+    if not valid_key(key):
+        return Refusal(Code.BAD_KEY)
+    if not 0 <= now - obs.at <= max_age_s:
+        return Refusal(Code.STALE)
+    if obs.main_hwnd != request.main_hwnd or obs.instance != request.app_instance:
+        return Refusal(Code.INSTANCE)
+    if obs.topmost_hwnd != obs.main_hwnd:
+        return Refusal(Code.COVERED)
+    if obs.foreground_hwnd != obs.main_hwnd:
+        return Refusal(Code.NOT_FOREGROUND)
+    refusal = allow.problem(request.path, request.step, key, obs.signature)
+    if refusal is not None:
+        return refusal
+    return target_problem(request.target, request, obs)
 
-    rect: Rect
+
+def unchanged(first: Observation, second: Observation) -> bool:
+    """Whether a second observation shows the same windows, focus and screen."""
+    return (
+        second.main_hwnd,
+        second.instance,
+        second.foreground_hwnd,
+        second.topmost_hwnd,
+        second.focus_hwnd,
+        second.point,
+        second.signature,
+    ) == (
+        first.main_hwnd,
+        first.instance,
+        first.foreground_hwnd,
+        first.topmost_hwnd,
+        first.focus_hwnd,
+        first.point,
+        first.signature,
+    )
 
 
-def audit_record(target: Win32Field | OcrBox, frame_hash: str) -> dict:
-    """What the audit keeps about a target: identity, frame hash and
-    rectangles. Never a label, a value or any other text."""
+def _safe(value: object, pattern: re.Pattern) -> str:
+    return value if isinstance(value, str) and pattern.fullmatch(value) else "<invalid>"
+
+
+def _rect_list(value: object) -> list | None:
+    return list(value) if valid_rect(value) else None
+
+
+def audit_record(target: object, frame_hash: str) -> dict:
+    """What the audit keeps about a target: validated identity, the frame hash
+    and rectangles. Never a label, a value, or any unvalidated string."""
+    frame = _safe(frame_hash, _HASH)
     if isinstance(target, OcrBox):
-        return {"kind": "ocr-box", "frame_hash": frame_hash, "rect": list(target.rect)}
+        return {"kind": "ocr-box", "frame_hash": frame, "rect": _rect_list(target.rect)}
+    if not isinstance(target, Win32Field):
+        return {"kind": "none", "frame_hash": frame}
+    instance = target.instance
     return {
         "kind": "win32-field",
-        "frame_hash": frame_hash,
-        "process_image": target.process_image,
-        "instance": list(target.instance),
-        "class_path": list(target.class_path),
-        "label_hash": target.label_hash,
-        "rect": list(target.rect),
-        "label_rect": list(target.label_rect),
-        "screen_rect": list(target.screen_rect),
+        "frame_hash": frame,
+        "process_image": _safe(target.process_image, _NAME),
+        "instance": list(instance) if all(_is_int(v) for v in instance) else None,
+        "class_path": [_safe(c, _NAME) for c in target.class_path][:16],
+        "label_hash": _safe(target.label_hash, _HASH),
+        "rect": _rect_list(target.rect),
+        "label_rect": _rect_list(target.label_rect),
+        "screen_rect": _rect_list(target.screen_rect),
     }
 
 
-@dataclass(frozen=True)
-class BoundKeyRequest:
-    """One key for the application, with everything the gate checks it against."""
-
-    action: Action
-    path: str
-    step: int
-    app_instance: tuple[int, int]
-    signature: ScreenSignature
-    foreground: ForegroundObservation
-    target: Win32Field | OcrBox | None = None
-    tree: WindowNode | None = None
-
-
-def bound_key_problem(request: BoundKeyRequest, allow: AllowList) -> str | None:
-    """Why the key may not be sent, or None. Checked in this order: the
-    action's shape, the foreground, the allow-list and screen, the target."""
-    action = request.action
-    if action.kind is not ActionKind.KEY:
-        return f"bound input accepts only key actions, not {action.kind.value}"
-    if len(action.keys) != 1:
-        return f"a bound key action sends exactly one key, not {len(action.keys)}"
-    problem = foreground_problem(request.app_instance, request.foreground)
-    if problem is not None:
-        return problem
-    problem = allow.problem(request.path, request.step, action.keys[0], request.signature)
-    if problem is not None:
-        return problem
-    target = request.target
-    if isinstance(target, Win32Field):
-        if target.instance != request.app_instance:
-            return "the target field belongs to another process instance"
-        if request.tree is None:
-            return "a Win32 field target needs the window tree to check it is visible"
-        return clipping_problem(request.tree, target.hwnd)
-    return None
+def audited_keys(action: Action) -> list[str]:
+    """Key names for the audit: recognised names only."""
+    return [k if valid_key(k) else "<invalid>" for k in action.keys][:4]

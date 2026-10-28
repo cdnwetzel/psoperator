@@ -264,6 +264,12 @@ def _user32():
     return user32
 
 
+def user32_api():
+    """The ``user32`` binding with the message-free calls this module uses
+    declared. Raises :class:`Win32FieldError` off Windows."""
+    return _user32()
+
+
 def _class_name(user32, hwnd: int) -> str:
     import ctypes
 

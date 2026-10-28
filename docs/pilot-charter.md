@@ -103,14 +103,24 @@ These hold from the start, so they never have to be retrofitted:
 
   The gate (`psoperator/gatekeeper/bound_target.py`, entry point
   `Gatekeeper.request_bound_key`) meets all five and adds an **allow-list**:
-  a key is admitted only on a menu path explicitly listed as read-only,
-  only the key listed for that step, and only when the screen's window-tree
-  signature (Edit and dialog counts, focus, paired-field label hashes; no
-  text) matches the step's expected one, since one wrong digit in a path is
-  a different screen. An empty allow-list refuses everything. The real
-  allow-list, the application map and its dangerous paths are private
-  configuration, never in this repository; the repository holds only the
-  mechanism, tested with made-up paths.
+  a key is admitted only on a menu path explicitly listed as read-only, only
+  the key listed for that step, and only when the screen's complete
+  signature matches the step's expected one and none of its recorded
+  neighbouring screens, since one wrong digit in a path is a different
+  screen. The signature is structure, never text: every visible Edit's
+  position, the hash of every label-class caption on screen (so menus
+  without fields are told apart), every labelled field's label hash and
+  position, dialogs and focus. A step without screen-specific captions, or
+  two steps with the same signature, refuse to load. The gatekeeper does
+  not take the screen from the caller: it observes it itself (the
+  foreground window, the top-level window at the point, keyboard focus,
+  dialogs, the window tree) before checking and again immediately before
+  sending, and any change refuses. Refusals are audited with fixed codes;
+  with `bound_input_only`, ordinary input that bypasses the gate is refused.
+  An empty allow-list refuses everything. The real allow-list, the
+  application map and its dangerous paths are private configuration, never
+  in this repository; the repository holds only the mechanism, tested with
+  made-up paths.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
   values or window text.
