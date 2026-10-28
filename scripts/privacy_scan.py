@@ -56,11 +56,20 @@ def load_denylist(path: str | None) -> list[str]:
 def scan_lines(name: str, lines: Iterable[str], denylist: list[str]) -> list[str]:
     findings = []
     lowered = [t.lower() for t in denylist]
+
+    def _shown(value: str, redacted: str) -> str:
+        # A finding never echoes a denylist term, even inside a matched path or
+        # a file name: the denylist itself is private.
+        return redacted if any(low in value.lower() for low in lowered) else value
+
+    name = _shown(name, "<name redacted>")
     for number, line in enumerate(lines, 1):
         if ALLOW not in line:  # the marker exempts sample values, never the denylist
             for rule, pattern in PATTERNS.items():
                 for match in pattern.finditer(line):
-                    findings.append(f"{name}:{number}: {rule}: {match.group(0)}")
+                    findings.append(
+                        f"{name}:{number}: {rule}: {_shown(match.group(0), '<redacted>')}"
+                    )
         text = line.lower()
         for term, low in zip(denylist, lowered, strict=True):
             if low in text:

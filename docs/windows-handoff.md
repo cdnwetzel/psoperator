@@ -88,7 +88,7 @@ order, so do not mix it in.
    cd psoperator
    git config core.hooksPath scripts/hooks
    git config user.name "<name>"
-   git config user.email "<email>"
+   git config user.email "<user>@users.noreply.github.com"   # never a work address
    git remote set-url --add --push origin git@github.com:<owner>/psoperator.git
    git remote set-url --add --push origin <private-mirror-remote>
    git remote -v         # one fetch URL, two push URLs
@@ -108,17 +108,18 @@ order, so do not mix it in.
 4. **Private denylist.** Copy it from the operator to
    `~/.config/pxx/public-denylist` by hand. It never goes through git. Without it
    the hooks catch private addresses but not real names.
-5. **Prove the hooks fire** (negative controls; neither commit may succeed):
+5. **Prove the hooks fire** (negative controls; no commit may succeed):
 
    ```
    git commit --allow-empty -m "probe $(printf '10.%s.%s.%s' 0 1 5)"   # private address
    git commit --allow-empty -m "probe $(grep -v -e '^#' -e '^$' ~/.config/pxx/public-denylist | head -1)"
+   git -c user.email="probe@$(grep -v -e '^#' -e '^$' ~/.config/pxx/public-denylist | head -1).test"        commit --allow-empty -m "probe"                                 # identity
    ```
 
-   Both must be refused **by the privacy hook**: the output must name the
-   rule, `private-lan-address` for the first and `denylist term` for the
-   second. A refusal without that line (for example, a missing Git identity)
-   proves nothing. If either commit succeeds or fails for another reason, stop;
+   Each must be refused **by the privacy hook**: the output must name the
+   rule, `private-lan-address` for the first, `denylist term` for the
+   second, and `commit-identity` with `denylist term` for the third. A refusal without that line (for example, a missing Git identity)
+   proves nothing. If any commit succeeds or fails for another reason, stop;
    the privacy gate is not working on this machine.
 6. **Install:**
 
