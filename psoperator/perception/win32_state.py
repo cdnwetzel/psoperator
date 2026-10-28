@@ -132,10 +132,12 @@ def _recipient(user32, info_type, main_hwnd: int) -> tuple:
         raise Win32FieldError("the main window's thread has no keyboard focus")
     point = _centre(user32, focus)
     top = topmost_at(point)
-    # Focus, input modes and the foreground are sampled on both sides of the
-    # other reads: a change in between is an inconsistent recipient.
+    # Focus, input modes and the foreground are sampled again after the other
+    # reads, the foreground on both sides of the thread state: a change in
+    # between, including during either final read, is an inconsistent recipient.
     if (
-        _thread_state(user32, info_type, main_hwnd) != thread
+        int(user32.GetForegroundWindow() or 0) != foreground
+        or _thread_state(user32, info_type, main_hwnd) != thread
         or int(user32.GetForegroundWindow() or 0) != foreground
     ):
         raise Win32FieldError("the recipient changed while it was being read")

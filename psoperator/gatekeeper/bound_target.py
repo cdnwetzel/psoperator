@@ -465,20 +465,30 @@ class BoundKeyRequest:
 _TARGET_TYPES = (Win32Field, FocusedEdit, OcrBox, type(None))
 
 
+def trusted_action(action: object) -> Action:
+    """A private copy of ``action``, which must be exactly an :class:`Action`
+    (frozen, so its fields cannot change between reads) with an
+    :class:`ActionKind` and a tuple of key names. Raises ``ValueError``
+    otherwise."""
+    if type(action) is not Action:
+        raise ValueError("the action must be an Action")
+    keys = action.keys
+    if type(action.kind) is not ActionKind:
+        raise ValueError("the action kind must be an ActionKind")
+    if type(keys) is not tuple or not all(type(k) is str for k in keys):
+        raise ValueError("the keys must be a tuple of names")
+    # Nobody else holds a reference to the copy that is checked and executed.
+    return replace(action, keys=keys)
+
+
 def normalized(request: object) -> BoundKeyRequest:
     """Read each field of ``request`` exactly once into a fresh, immutable
     request, so the values checked are the values executed. Raises
     ``ValueError`` for anything that is not plainly a key request."""
     action, path, step, target = request.action, request.path, request.step, request.target
-    if type(action) is not Action:
-        raise ValueError("the action must be an Action")
-    keys = action.keys
-    if type(keys) is not tuple or not all(type(k) is str for k in keys):
-        raise ValueError("the keys must be a tuple of names")
+    action = trusted_action(action)
     if type(path) is not str or not _is_int(step) or type(target) not in _TARGET_TYPES:
         raise ValueError("the path, step or target is malformed")
-    # A private copy: nobody else holds a reference to the action executed.
-    action = replace(action, keys=keys)
     return BoundKeyRequest(action=action, path=path, step=step, target=target)
 
 

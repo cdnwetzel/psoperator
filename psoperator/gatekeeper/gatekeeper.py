@@ -38,6 +38,7 @@ from psoperator.gatekeeper.bound_target import (
     audited_keys,
     bound_key_problem,
     normalized,
+    trusted_action,
     unchanged,
     unverified_record,
 )
@@ -299,9 +300,18 @@ class Gatekeeper:
         *,
         require_bound_input: bool = False,
     ) -> Decision:
-        # The kill switch wins and is recorded as such. Otherwise, with
-        # bound_input_only, unbound input never reaches the device: that denial
-        # does not depend on the switch, which may change between two reads.
+        # The action is read once into a private copy: the kind checked here
+        # is the kind the pipeline checks and executes. Anything else is
+        # recorded through the guarded path, which is safe for a hostile object.
+        try:
+            action = trusted_action(action)
+            untrusted = None
+        except Exception:
+            untrusted = {"kind": "invalid", "verified": False}
+        # The kill switch wins and is recorded as such. Otherwise an invalid
+        # action is refused, and with bound_input_only unbound input never
+        # reaches the device: neither denial depends on the switch, which may
+        # change between two reads.
         if killswitch.is_engaged(self._config.kill_switch_path):
             return self._record(
                 DecisionKind.KILL_SWITCHED,
@@ -310,6 +320,18 @@ class Gatekeeper:
                 approver="gatekeeper",
                 reason="kill switch engaged",
                 frame=frame,
+                binding=untrusted,
+            )
+        if untrusted is not None:
+            return self._record(
+                DecisionKind.DENIED,
+                action,
+                None,
+                approver="gatekeeper",
+                reason=Code.INVALID.value,
+                frame=frame,
+                binding=untrusted,
+                audit_reason=Code.INVALID.value,
             )
         if self._bound_input_only and action.kind in _DEVICE_KINDS:
             return self._record(

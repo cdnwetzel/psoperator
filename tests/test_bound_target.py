@@ -135,6 +135,11 @@ MENU_STEP = AllowedStep(MENU, "9", (SUBMENU,))
 MENU_STEP_8 = AllowedStep(MENU, "8", (SUBMENU,))
 
 
+def _code(refusal):
+    """The refusal's code, or None when nothing was refused."""
+    return None if refusal is None else refusal.code
+
+
 def _check(req=None, obs=None, now=100.5, allow=ALLOW):
     return bound_key_problem(
         req or _req(), allow, obs or _obs(), now=now, max_age_s=1.0, app_image="app.exe",
@@ -238,7 +243,7 @@ def test_menu_screens_without_fields_are_told_apart_by_their_captions():
     assert signature_problem(MENU, SUBMENU) == "captions"
     menus = AllowList([AllowedPath("9-9", (AllowedStep(MENU, "9", (SUBMENU,)),))])
     assert menus.problem("9-9", 0, "9", MENU) is None
-    assert menus.problem("9-9", 0, "9", SUBMENU).code is Code.SCREEN
+    assert _code(menus.problem("9-9", 0, "9", SUBMENU)) is Code.SCREEN
 
 
 @pytest.mark.parametrize(
@@ -290,12 +295,12 @@ def test_each_step_admits_only_its_key_on_its_screen():
          "console-key", "recorded-neighbour", "caption-moved", "wrong-screen"],
 )  # fmt: skip
 def test_everything_else_is_refused(args, code):
-    assert ALLOW.problem(*args).code is code
+    assert _code(ALLOW.problem(*args)) is code
 
 
 def test_a_recorded_neighbour_is_named():
     refusal = ALLOW.problem("9-9", 1, "ENTER", NEIGHBOUR)
-    assert refusal.code is Code.SCREEN and "neighbouring" in refusal.detail
+    assert _code(refusal) is Code.SCREEN and "neighbouring" in refusal.detail
 
 
 def _screen(sig):
@@ -329,7 +334,7 @@ def test_the_allow_list_loads_from_private_json(tmp_path):
     file.write_text(_doc(), encoding="utf-8")
     loaded = AllowList.load(file)
     assert loaded.problem("9-9", 0, "ENTER", REPORT) is None
-    assert loaded.problem("9-9", 0, "ENTER", NEIGHBOUR).code is Code.SCREEN
+    assert _code(loaded.problem("9-9", 0, "ENTER", NEIGHBOUR)) is Code.SCREEN
 
 
 def _screen_with(**change):
@@ -395,7 +400,7 @@ def test_a_focused_edit_target_is_admitted_and_must_be_where_focus_is():
     identity, refusal = _check(_req(target=FocusedEdit((40, 30, 200, 24))))
     assert refusal is None and identity["kind"] == "focused-edit"
     _, refusal = _check(_req(target=FocusedEdit((40, 31, 200, 24))))
-    assert refusal.code is Code.NOT_FOCUSED
+    assert _code(refusal) is Code.NOT_FOCUSED
 
 
 FOCUSED = FocusedEdit((40, 30, 200, 24))
@@ -898,6 +903,63 @@ def test_a_flipping_kill_switch_never_lets_unbound_input_through(
     assert decision.kind is kind and recorder.calls == []
 
 
+class _ShiftingKind:
+    """An action-like object that reports WAIT once, then KEY ENTER forever."""
+
+    def __init__(self):
+        self.reads = 0
+        self.frame_id, self.keys, self.text = 1, ("ENTER",), None
+        self.target_element_id = self.x = self.y = None
+
+    @property
+    def kind(self):
+        self.reads += 1
+        return ActionKind.WAIT if self.reads == 1 else ActionKind.KEY
+
+    def to_dict(self):
+        return {"action": "key", "frame_id": 1, "keys": ["ENTER"]}
+
+
+class _ActionSubclass(Action):
+    pass
+
+
+@pytest.mark.parametrize("bound_only", [True, False], ids=["bound-only", "ordinary"])
+@pytest.mark.parametrize(
+    "make",
+    [
+        _ShiftingKind,
+        lambda: _ActionSubclass(ActionKind.KEY, 1, keys=("ENTER",)),
+        lambda: Action(ActionKind.KEY, 1, keys=["ENTER"]),
+    ],
+    ids=["kind-alternates", "action-subclass", "keys-list"],
+)
+def test_request_action_refuses_an_action_that_is_not_plainly_an_action(tmp_path, bound_only, make):
+    gk, config, recorder = _gatekeeper(tmp_path, bound_input_only=bound_only)
+    decision = gk.request_action(make(), _frame())
+    assert decision.kind is DecisionKind.DENIED and decision.reason == Code.INVALID.value
+    assert recorder.calls == []
+    assert verify(config.audit_log_path).ok
+
+
+@pytest.mark.parametrize("bound_only", [True, False], ids=["bound-only", "ordinary"])
+def test_request_action_refuses_an_action_whose_kind_is_not_an_action_kind(tmp_path, bound_only):
+    # A frozen Action whose kind was swapped after validation for a plain
+    # string that compares and hashes like ActionKind.KEY.
+    action = Action(ActionKind.KEY, 1, keys=("ENTER",))
+    object.__setattr__(action, "kind", "key")
+    gk, _, recorder = _gatekeeper(tmp_path, bound_input_only=bound_only)
+    decision = gk.request_action(action, _frame())
+    assert decision.reason == Code.INVALID.value and recorder.calls == []
+
+
+def test_request_action_executes_a_private_copy(tmp_path):
+    gk, _, recorder = _gatekeeper(tmp_path)
+    action = Action(ActionKind.KEY, 1, keys=("ENTER",))
+    assert gk.request_action(action, _frame()).kind is DecisionKind.EXECUTED
+    assert recorder.calls == [action] and recorder.calls[0] is not action
+
+
 def test_without_bound_input_only_the_ordinary_path_is_unchanged(tmp_path):
     gk, config, recorder = _gatekeeper(tmp_path)
     decision = gk.request_action(Action(ActionKind.KEY, 1, keys=("ENTER",)), _frame())
@@ -1204,3 +1266,54 @@ def test_a_failed_window_enumeration_is_not_zero_dialogs():
     failing = _EnumUser32({}, ok=False)
     with pytest.raises(Win32FieldError, match="enumerate"):
         win32_state._owned_visible(failing, MAIN)
+
+
+def _interleaved(monkeypatch, change_on):
+    """_recipient with live-looking state: the foreground and the thread state
+    are read from ``state``; ``change_on`` maps a (read name, call number) to a
+    change made to ``state`` during that read (after its value is taken)."""
+    from psoperator.perception import win32_state
+
+    state = {"foreground": MAIN, "thread": (EDIT, True)}
+    calls = {"foreground": 0, "thread": 0}
+
+    def read(name):
+        calls[name] += 1
+        value = state[name]
+        for key, change in change_on.get((name, calls[name]), {}).items():
+            state[key] = change
+        return value
+
+    class _User32:
+        def GetForegroundWindow(self):
+            return read("foreground")
+
+    monkeypatch.setattr(win32_state, "_thread_state", lambda u, i, hwnd: read("thread"))
+    monkeypatch.setattr(win32_state, "_centre", lambda u, hwnd: (240, 142))
+    monkeypatch.setattr(win32_state, "topmost_at", lambda point: MAIN)
+    return win32_state, _User32()
+
+
+def test_an_unchanged_recipient_reads_consistently(monkeypatch):
+    win32_state, user32 = _interleaved(monkeypatch, {})
+    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN)
+
+
+@pytest.mark.parametrize(
+    "change_on",
+    [
+        # focus moves, or a menu opens, during the second foreground read
+        {("foreground", 2): {"thread": (OTHER, True)}},
+        {("foreground", 2): {"thread": (EDIT, False)}},
+        # the foreground switches during the second thread-state read
+        {("thread", 2): {"foreground": OTHER}},
+    ],
+    ids=["focus-during-foreground-read", "menu-during-foreground-read",
+         "foreground-during-thread-read"],
+)  # fmt: skip
+def test_a_change_during_a_final_recipient_read_is_refused(monkeypatch, change_on):
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    win32_state, user32 = _interleaved(monkeypatch, change_on)
+    with pytest.raises(Win32FieldError, match="while it was being read"):
+        win32_state._recipient(user32, None, MAIN)
