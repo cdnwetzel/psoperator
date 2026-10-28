@@ -34,6 +34,7 @@ from psoperator.gatekeeper.bound_target import (
     audited_keys,
     bound_key_problem,
     observed_fields,
+    recipient_of,
     signature_of,
     signature_problem,
     unchanged,
@@ -131,8 +132,12 @@ def _tgt(**change) -> BoundKeyRequest:
 
 TYPING = _req(action=Action(ActionKind.TYPE, 1, text="secret value"))
 BROKEN = _req(action=SimpleNamespace(kind=ActionKind.KEY, keys=None))
-MENU_STEP = AllowedStep(MENU, "9", (SUBMENU,))
-MENU_STEP_8 = AllowedStep(MENU, "8", (SUBMENU,))
+
+
+def _menu_step(key="9"):
+    # Built inside each test, not at import: a broken signature comparison
+    # must fail a test, not the collection of the whole module.
+    return AllowedStep(MENU, key, (SUBMENU,))
 
 
 def _code(refusal):
@@ -259,8 +264,8 @@ def test_menu_screens_without_fields_are_told_apart_by_their_captions():
         (lambda: AllowedPath("9 9; anything", (AllowedStep(MENU, "9", (SUBMENU,)),)), "path code"),
         (lambda: AllowedPath("9-9", [AllowedStep(MENU, "9", (SUBMENU,))]), "no steps"),
         (lambda: AllowList(["9-9"]), "AllowedPath"),
-        (lambda: AllowList([AllowedPath("9-9", (MENU_STEP,))] * 2), "twice"),
-        (lambda: AllowList([AllowedPath("9-9", (MENU_STEP, MENU_STEP_8))]),
+        (lambda: AllowList([AllowedPath("9-9", (_menu_step(),))] * 2), "twice"),
+        (lambda: AllowList([AllowedPath("9-9", (_menu_step(), _menu_step("8")))]),
          "same screen"),
     ],
     ids=["no-captions", "no-neighbours", "neighbours-list", "neighbour-equals", "bad-key",
@@ -555,9 +560,18 @@ def _gatekeeper(tmp_path, observer=None, **kwargs):
     freshness = FreshnessTracker()
     freshness.observe(1)
     recorder = _Recorder()
+    observer = observer if observer is not None else Observer()
+    last = {}
+
+    def remembering(main_hwnd):
+        last["obs"] = observer(main_hwnd)
+        return last["obs"]
+
     settings = dict(
-        bound_observer=observer if observer is not None else Observer(), clock=lambda: 100.5,
+        bound_observer=remembering, clock=lambda: 100.5,
         bound_allow=ALLOW, bound_app_image="app.exe", bound_window=(MAIN, APP),
+        # By default nobody else moves: the recipient is as last observed.
+        bound_recipient=lambda main_hwnd: recipient_of(last["obs"]),
     )  # fmt: skip
     settings.update(kwargs)
     gk = Gatekeeper(config, freshness, executor=recorder, **settings)
@@ -582,6 +596,111 @@ def test_an_admitted_key_is_observed_twice_executed_once_and_audited(tmp_path):
     assert entry["action"]["keys"] == ["ENTER"] and entry["reason"] == "executed"
     assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
     assert verify(config.audit_log_path).ok
+
+
+RECIPIENT_NOW = recipient_of(_obs())
+
+
+class _Log:
+    """One ordered log of observations, recipient readings and sends."""
+
+    def __init__(self, before=RECIPIENT_NOW, after=RECIPIENT_NOW, fail=()):
+        self.events, self.readings = [], [before, after]
+        self.fail = set(fail)
+        self.observer = Observer()
+
+    def observe(self, main_hwnd):
+        self.events.append("observe")
+        return self.observer(main_hwnd)
+
+    def recipient(self, main_hwnd):
+        self.events.append("recipient")
+        n = self.events.count("recipient")
+        if n in self.fail:
+            raise RuntimeError("secret recipient text")
+        return self.readings[min(n, 2) - 1]
+
+
+class _LoggingRecorder(_Recorder):
+    def __init__(self, log):
+        super().__init__()
+        self.log = log
+
+    def execute(self, action):
+        self.log.events.append("execute")
+        return super().execute(action)
+
+
+def _bracketed(tmp_path, log):
+    config = load_config(
+        audit_log_path=tmp_path / "audit.jsonl", kill_switch_path=tmp_path / "STOP"
+    )
+    freshness = FreshnessTracker()
+    freshness.observe(1)
+    recorder = _LoggingRecorder(log)
+    gk = Gatekeeper(
+        config, freshness, executor=recorder, bound_observer=log.observe, clock=lambda: 100.5,
+        bound_allow=ALLOW, bound_app_image="app.exe", bound_window=(MAIN, APP),
+        bound_recipient=log.recipient,
+    )  # fmt: skip
+    return gk, config, recorder
+
+
+def test_the_recipient_is_read_immediately_before_and_after_the_send(tmp_path):
+    log = _Log()
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.EXECUTED and len(recorder.calls) == 1
+    assert log.events == ["observe", "observe", "recipient", "execute", "recipient"]
+    assert _audit(config)[-1]["reason"] == "executed"
+
+
+CHANGED_RECIPIENTS = {
+    "focus-moved": (MAIN, OTHER, True, (240, 142), MAIN),
+    "menu-opened": (MAIN, EDIT, False, (240, 142), MAIN),
+    "foreground-switched": (OTHER, EDIT, True, (240, 142), MAIN),
+    "covered": (MAIN, EDIT, True, (240, 142), OTHER),
+}
+
+
+@pytest.mark.parametrize("changed", list(CHANGED_RECIPIENTS.values()), ids=list(CHANGED_RECIPIENTS))
+def test_a_recipient_changed_just_before_the_send_stops_the_key(tmp_path, changed):
+    log = _Log(before=changed)
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.DENIED and recorder.calls == []
+    assert decision.reason == Code.RECIPIENT_CHANGED.value
+    assert log.events == ["observe", "observe", "recipient"]
+    assert _audit(config)[-1]["reason"] == Code.RECIPIENT_CHANGED.value
+
+
+def test_a_failed_reading_just_before_the_send_stops_the_key(tmp_path):
+    log = _Log(fail={1})
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.reason == Code.RECIPIENT_CHANGED.value and recorder.calls == []
+    assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("changed", list(CHANGED_RECIPIENTS.values()), ids=list(CHANGED_RECIPIENTS))
+def test_a_recipient_changed_during_the_send_is_recorded_as_an_incident(tmp_path, changed):
+    # The key has gone: it is not hidden, it is recorded with its own code.
+    log = _Log(after=changed)
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.EXECUTED and len(recorder.calls) == 1
+    assert decision.reason == Code.SENT_THEN_CHANGED.value
+    entry = _audit(config)[-1]
+    assert entry["reason"] == Code.SENT_THEN_CHANGED.value and entry["decision"] == "executed"
+    assert verify(config.audit_log_path).ok
+
+
+def test_a_failed_reading_after_the_send_is_recorded_as_an_incident(tmp_path):
+    log = _Log(fail={2})
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.reason == Code.SENT_THEN_CHANGED.value and len(recorder.calls) == 1
+    assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
 
 
 class _Shifting:
@@ -662,7 +781,8 @@ def test_the_window_and_instance_are_fixed_at_construction(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "missing", ["bound_observer", "bound_allow", "bound_app_image", "bound_window"]
+    "missing",
+    ["bound_observer", "bound_allow", "bound_app_image", "bound_window", "bound_recipient"],
 )
 def test_without_full_configuration_nothing_is_admitted(tmp_path, missing):
     gk, _, recorder = _gatekeeper(tmp_path, **{missing: None})
@@ -1317,3 +1437,26 @@ def test_a_change_during_a_final_recipient_read_is_refused(monkeypatch, change_o
     win32_state, user32 = _interleaved(monkeypatch, change_on)
     with pytest.raises(Win32FieldError, match="while it was being read"):
         win32_state._recipient(user32, None, MAIN)
+
+
+def test_the_live_recipient_reader_refuses_a_window_that_is_gone(monkeypatch):
+    from psoperator.perception import win32_state
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    class _Gone:
+        def IsWindow(self, hwnd):
+            return False
+
+    monkeypatch.setattr(win32_state, "_api", lambda: (_Gone(), None))
+    # Were the window not checked, this reading would be returned.
+    monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: RECIPIENT)
+    with pytest.raises(Win32FieldError, match="no longer exists"):
+        win32_state.recipient(MAIN)
+
+
+def test_the_live_recipient_reader_reads_the_same_tuple_as_an_observation(monkeypatch):
+    from psoperator.perception import win32_state
+
+    monkeypatch.setattr(win32_state, "_api", lambda: (_FakeUser32(), None))
+    monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: RECIPIENT)
+    assert win32_state.recipient(MAIN) == RECIPIENT == recipient_of(_obs())

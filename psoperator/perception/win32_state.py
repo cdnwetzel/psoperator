@@ -144,6 +144,16 @@ def _recipient(user32, info_type, main_hwnd: int) -> tuple:
     return (foreground, focus, clear, point, top)
 
 
+def recipient(main_hwnd: int) -> tuple:
+    """Who would receive a key now, read alone (fast): the gate reads this
+    immediately before and after handing a key to the executor. Raises if the
+    window is gone or the reading is inconsistent."""
+    user32, info_type = _api()
+    if not user32.IsWindow(main_hwnd):
+        raise Win32FieldError("the main window no longer exists")
+    return _recipient(user32, info_type, main_hwnd)
+
+
 def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:
     """Observe the main window ``main_hwnd`` for a key to its focused control.
 

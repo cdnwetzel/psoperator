@@ -119,7 +119,15 @@ These hold from the start, so they never have to be retrofitted:
   foreground window, the top-level window at the focused control, keyboard
   focus, menu and capture modes, dialogs, the window tree) before checking
   and again immediately before sending; any change, or a failed read,
-  refuses; the kill switch is checked again at the last moment. The audited
+  refuses; the kill switch is checked again at the last moment. As the last
+  step before the executor is called, a fast reading of who would receive the
+  key (foreground, focus, menu and capture modes, the window at the focused
+  control) must equal the approved observation, or the key is not sent; the
+  same reading right after the executor returns records any difference as an
+  incident. No sequence of readings can see a change made after the last one,
+  so a window remains between the final reading and the key reaching the
+  input queue; it is narrowed to the executor's own call and every change
+  detected after the send is recorded, never hidden. The audited
   identity is built from that observation. Refusals are audited with fixed
   codes; with `bound_input_only`, every kind of device input (clicks, typing,
   keys, scrolling, dragging) that bypasses the gate is refused, whatever the

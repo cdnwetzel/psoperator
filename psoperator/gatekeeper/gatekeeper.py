@@ -38,6 +38,7 @@ from psoperator.gatekeeper.bound_target import (
     audited_keys,
     bound_key_problem,
     normalized,
+    recipient_of,
     trusted_action,
     unchanged,
     unverified_record,
@@ -158,6 +159,7 @@ class Gatekeeper:
         bound_allow: AllowList | None = None,
         bound_app_image: str | None = None,
         bound_window: tuple[int, tuple[int, int]] | None = None,
+        bound_recipient: Callable[[int], tuple] | None = None,
         observation_max_age_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -174,6 +176,9 @@ class Gatekeeper:
         # The one main window (and its process instance: pid, start time) the
         # gate may send keys to, fixed for this gatekeeper's lifetime.
         self._window = bound_window
+        # A fast reader of who would receive a key (win32_state.recipient),
+        # read immediately before and after the executor is called.
+        self._recipient = bound_recipient
         self._max_age_s = observation_max_age_s
         self._clock = clock
         self._config = config
@@ -251,7 +256,7 @@ class Gatekeeper:
 
         if not readable:
             return refuse(Refusal(Code.INVALID))
-        if None in (self._observe, self._allow, self._app_image, self._window):
+        if None in (self._observe, self._allow, self._app_image, self._window, self._recipient):
             return refuse(Refusal(Code.NO_OBSERVER))
 
         main_hwnd, instance = self._window
@@ -289,7 +294,23 @@ class Gatekeeper:
                 return Code.CHANGED.value
             return None
 
-        return self._decide(action, frame, binding=binding, pre_execute=recheck)
+        approved = recipient_of(first)
+
+        def recipient_changed(code: Code) -> str | None:
+            try:
+                now = tuple(self._recipient(main_hwnd))
+            except Exception:
+                return code.value
+            return None if now == approved else code.value
+
+        return self._decide(
+            action,
+            frame,
+            binding=binding,
+            pre_execute=recheck,
+            pre_send=lambda: recipient_changed(Code.RECIPIENT_CHANGED),
+            post_send=lambda: recipient_changed(Code.SENT_THEN_CHANGED),
+        )
 
     def request_action(
         self,
@@ -356,6 +377,8 @@ class Gatekeeper:
         require_bound_input: bool = False,
         binding: dict | None = None,
         pre_execute: Callable[[], str | None] | None = None,
+        pre_send: Callable[[], str | None] | None = None,
+        post_send: Callable[[], str | None] | None = None,
     ) -> Decision:
         """The pipeline. Private: only request_action (which enforces
         bound_input_only) and request_bound_key (which binds and re-checks)
@@ -532,6 +555,22 @@ class Gatekeeper:
                 frame=frame,
             )
 
+        # 5d. a bound key: who would receive it is read once more, as the last
+        # step before the executor is called; any difference from the approved
+        # observation (or a failed reading) refuses.
+        if pre_send is not None:
+            changed = pre_send()
+            if changed is not None:
+                return record(
+                    DecisionKind.DENIED,
+                    action,
+                    risk,
+                    approver="gatekeeper",
+                    reason=changed,
+                    frame=frame,
+                    audit_reason=changed,
+                )
+
         # 6. execute; failures are decisions too and must enter the audit chain.
         try:
             outcome = self._executor.execute(action)
@@ -545,6 +584,21 @@ class Gatekeeper:
                 frame,
             )
         kind = DecisionKind.DRY_RUN if self._executor.name == "dry-run" else DecisionKind.EXECUTED
+        # 7. a bound key: read again right after the executor returns. The key
+        # has been sent; a difference is recorded as an incident, not hidden.
+        if post_send is not None:
+            incident = post_send()
+            if incident is not None:
+                return record(
+                    kind,
+                    action,
+                    risk,
+                    approver,
+                    incident,
+                    frame,
+                    outcome=outcome,
+                    audit_reason=incident,
+                )
         return record(kind, action, risk, approver, "ok", frame, outcome=outcome)
 
     # --------------------------------------------------------------- internals

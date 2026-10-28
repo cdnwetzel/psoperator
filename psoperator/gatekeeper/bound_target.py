@@ -97,6 +97,8 @@ class Code(str, Enum):
     GEOMETRY = "bad-geometry"
     CHANGED = "screen-changed"
     INVALID = "invalid-request"
+    RECIPIENT_CHANGED = "recipient-changed-before-send"
+    SENT_THEN_CHANGED = "recipient-changed-after-send"
 
 
 @dataclass(frozen=True)
@@ -490,6 +492,14 @@ def normalized(request: object) -> BoundKeyRequest:
     if type(path) is not str or not _is_int(step) or type(target) not in _TARGET_TYPES:
         raise ValueError("the path, step or target is malformed")
     return BoundKeyRequest(action=action, path=path, step=step, target=target)
+
+
+def recipient_of(obs: Observation) -> tuple:
+    """Who would receive a key, as the observation saw it: the foreground
+    window, the focused control, whether no menu/move-size/capture mode is
+    active, the focused control's centre and the top-level window there. The
+    same order as a live recipient reading."""
+    return (obs.foreground_hwnd, obs.focus_hwnd, obs.input_clear, obs.point, obs.topmost_hwnd)
 
 
 def _path_to(root: WindowNode, hwnd: int) -> list[WindowNode] | None:
