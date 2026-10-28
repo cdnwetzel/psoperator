@@ -209,6 +209,13 @@ not planned.
 - Validate OCR fallback and coordinate translation across scaling, multiple
   displays, and negative monitor origins where applicable.
 
+**Status (2026-10-28):** the Windows probe (`docs/windows-probe.md`) found
+UI Automation too slow on the pilot application. The pilot's provider is the
+Win32 window tree for identity plus OCR for values (charter, "Consequences of
+the probe verdict"). Coordinates agree at 96 DPI on one monitor; scaling and
+multiple displays are still to validate. `WinAutoA11y` is to be scoped to the
+target window in its own PR.
+
 #### R-304 — Reference workflow
 
 Platform decision and task specs: `docs/reference-workflow.md` (Linux/AT-SPI on
@@ -220,8 +227,8 @@ merged; the fixture's controls were probed live on the work node. Nothing runs
 the workflow yet. Stage 1 hardening (R-306 service contract and planner
 guards) is done. **Superseded as the pilot by `docs/pilot-charter.md`:** the
 GTK tasks stay as the Linux bench for the loop. The pilot's reference task is
-on the Windows application, after the read-only UI Automation probe
-(`docs/windows-handoff.md`).
+on the Windows application, after the probe (done 2026-10-28,
+`docs/windows-probe.md`) and D-01.
 
 - Select a narrow workflow with deterministic success criteria.
 - Provide a fixture or test application where practical.
@@ -444,7 +451,8 @@ the milestone that needs it arrives.
 
 **Promoted into the pilot (2026-10-27, `docs/pilot-charter.md`):** the pilot
 is now a Windows application, so this port is on the critical path, after the
-read-only UI Automation probe. The Windows test endpoint is the host the
+probe (done 2026-10-28, `docs/windows-probe.md`). The gatekeeper's new
+bound-target kind for Win32 fields and OCR boxes follows this port. The Windows test endpoint is the host the
 prerequisite below asked for. The capture path must re-prove the frame-hash
 contract *before* the reference task, not after:
 
@@ -455,7 +463,7 @@ contract *before* the reference task, not after:
 - Add the cross-repo frame-hash contract test (the dx.observer reader against
   the Windows writer) alongside the existing Linux/macOS one, so a change to the
   Windows capture pipeline fails in CI rather than at an operator's desk.
-- Only then build the UIA reference task.
+- Only then build the reference task (Win32 binding plus OCR reading).
 
 Rationale: a breadth demo whose observer is unwired would undercut the
 governance pitch at exactly the moment a skeptical audience hears it. Attestation
