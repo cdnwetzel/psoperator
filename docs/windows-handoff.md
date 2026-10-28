@@ -119,7 +119,7 @@ order, so do not mix it in.
    Each must be refused **by the privacy hook**: the output must name the
    rule, `private-lan-address` for the first, `denylist term` for the
    second, and `commit-identity` with `denylist term` for the third. A refusal without that line (for example, a missing Git identity)
-   proves nothing. If either commit succeeds or fails for another reason, stop;
+   proves nothing. If any commit succeeds or fails for another reason, stop;
    the privacy gate is not working on this machine.
 6. **Install:**
 
