@@ -44,6 +44,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 SYSTEM_SID = "S-1-5-18"
+_MAX_COMPONENT_UTF16 = 255
 
 _ACCESS_ALLOWED_ACE_TYPE = 0x0
 _ACCESS_DENIED_ACE_TYPE = 0x1
@@ -109,6 +110,10 @@ def component_problem(name: str) -> str | None:
     for bad in ("\\", "/", ":", "\x00"):
         if bad in name:
             return f"{name!r} contains {bad!r}"
+    # NTFS caps a component at 255 UTF-16 units; this also keeps the byte
+    # length inside the USHORT of the UNICODE_STRING passed to NtCreateFile.
+    if len(name.encode("utf-16-le")) > _MAX_COMPONENT_UTF16 * 2:
+        return f"a name of {len(name)} characters is longer than {_MAX_COMPONENT_UTF16} units"
     return None
 
 

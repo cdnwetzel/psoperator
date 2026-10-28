@@ -109,6 +109,15 @@ def test_a_name_that_is_not_one_plain_component_is_refused(name):
     assert component_problem(name) is not None
 
 
+def test_a_name_longer_than_ntfs_allows_is_refused():
+    # 255 UTF-16 units fit; a non-BMP character takes two units.
+    assert component_problem("a" * 255) is None
+    assert component_problem("a" * 256) is not None
+    assert component_problem("\U0001f600" * 128) is not None
+    # A USHORT wraps at 32768 characters; this must be refused, not truncated.
+    assert component_problem("a" * 32769) is not None
+
+
 @pytest.mark.parametrize("path", [r"C:\keys\observer.json", "keys/observer.json", r"\\host\s\k"])
 def test_a_plain_path_is_accepted(path):
     assert path_problem(Path(path)) is None
@@ -127,6 +136,20 @@ def test_by_handle_file_information_has_the_win32_layout():
     assert layout.ftCreationTime.offset == 4
     assert layout.dwVolumeSerialNumber.offset == 28
     assert layout.nFileIndexLow.offset == 48
+
+
+def test_the_nt_structures_have_the_native_layout():
+    pointer = ctypes.sizeof(ctypes.c_void_p)
+    assert pointer in (4, 8)
+    # UNICODE_STRING: two USHORTs, then a pointer aligned to pointer size.
+    assert ctypes.sizeof(winacl._UNICODE_STRING) == (16 if pointer == 8 else 8)
+    assert winacl._UNICODE_STRING.Buffer.offset == pointer
+    # OBJECT_ATTRIBUTES: ULONG Length, then five pointers and a ULONG.
+    assert ctypes.sizeof(winacl._OBJECT_ATTRIBUTES) == (48 if pointer == 8 else 24)
+    assert winacl._OBJECT_ATTRIBUTES.RootDirectory.offset == pointer
+    assert winacl._OBJECT_ATTRIBUTES.Attributes.offset == 3 * pointer
+    # IO_STATUS_BLOCK: a pointer-sized union and a ULONG_PTR.
+    assert ctypes.sizeof(winacl._IO_STATUS_BLOCK) == 2 * pointer
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the non-Windows refusal")
@@ -322,17 +345,63 @@ def test_real_descriptors_with_a_foreign_entry_are_refused(vault, extra, expecte
 
 
 @windows_only
-def test_an_alternate_data_stream_of_a_readable_file_is_refused(vault):
-    # The base file inherits the temp directory's entries. A stream on it
-    # would share that descriptor, whatever descriptor creation asked for.
-    base = vault.parent / "base"
-    base.write_bytes(b"x")
-    with pytest.raises(OwnerOnlyError, match="contains ':'"):
-        winacl.open_owner_only_for_read(Path(f"{base}:stream"))
-    with pytest.raises(OwnerOnlyError, match="contains ':'"):
-        winacl.create_owner_only_dir(Path(f"{base}:stream"))
+def test_a_stream_on_a_readable_file_is_never_created(vault):
+    # The exploit: a base file Everyone can read. A stream created on it
+    # shares that descriptor, whatever descriptor creation asked for.
+    _write(vault, "base", b"x")
+    _grant(vault / "base", EVERYONE)
     with OwnerOnlyDir(vault) as held, pytest.raises(OwnerOnlyError, match="contains ':'"):
-        held.create_file("secret:stream")
+        held.create_file("base:stream")
+    with pytest.raises(OwnerOnlyError, match="contains ':'"):
+        winacl.create_owner_only_dir(Path(f"{vault / 'base'}:stream"))
+    assert not os.path.exists(f"{vault / 'base'}:stream")
+
+
+@windows_only
+def test_an_existing_stream_on_a_readable_file_is_not_read(vault):
+    _write(vault, "base", b"x")
+    _grant(vault / "base", EVERYONE)
+    stream = f"{vault / 'base'}:stream"
+    with open(stream, "wb") as handle:  # a real stream, readable by Everyone
+        handle.write(b"planted")
+    assert os.path.exists(stream)
+    with pytest.raises(OwnerOnlyError, match="contains ':'"):
+        winacl.open_owner_only_for_read(Path(stream))
+
+
+@windows_only
+def test_anchored_creation_passes_the_held_handle_as_root(vault, monkeypatch):
+    # Deterministic: the filesystem test below cannot reach its swap branch
+    # on NTFS, so pin the native call itself. Removing the anchoring (no
+    # RootDirectory, a full path, or no OBJ_DONT_REPARSE) fails here.
+    calls = []
+    real_api = winacl._api
+
+    class _NtDll:
+        @staticmethod
+        def NtCreateFile(handle, access, attributes, io_status, *rest):
+            oa = attributes._obj
+            name = oa.ObjectName.contents
+            calls.append(
+                (
+                    oa.RootDirectory,
+                    oa.Attributes,
+                    ctypes.wstring_at(name.Buffer, name.Length // 2),
+                )
+            )
+            return ctypes.c_long(0xC0000022 - 2**32).value  # STATUS_ACCESS_DENIED
+
+        @staticmethod
+        def RtlNtStatusToDosError(status):
+            return 5
+
+    with OwnerOnlyDir(vault) as held:
+        advapi32, kernel32, _ = real_api()
+        monkeypatch.setattr(winacl, "_api", lambda: (advapi32, kernel32, _NtDll))
+        with pytest.raises(OwnerOnlyError, match="NtCreateFile"):
+            held.create_file("secret")
+        root = held._handle
+    assert calls == [(root, winacl._OBJ_CASE_INSENSITIVE | winacl._OBJ_DONT_REPARSE, "secret")]
 
 
 @windows_only
