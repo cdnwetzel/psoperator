@@ -40,6 +40,7 @@ from psoperator.gatekeeper.bound_target import (
     bound_key_problem,
     normalized,
     recipient_of,
+    recipient_problem,
     trusted_action,
     unchanged,
     unverified_record,
@@ -304,20 +305,23 @@ class Gatekeeper:
 
         approved = recipient_of(first)
 
-        def recipient_changed(code: Code) -> str | None:
+        def recipient_changed(code: Code, held: Code) -> str | None:
             try:
                 now = tuple(self._recipient(main_hwnd))
             except Exception:
                 return code.value
-            return None if now == approved else code.value
+            problem = recipient_problem(now, approved, code, held)
+            return None if problem is None else problem.value
 
         return self._decide(
             action,
             frame,
             binding=binding,
             pre_execute=recheck,
-            pre_send=lambda: recipient_changed(Code.RECIPIENT_CHANGED),
-            post_send=lambda: recipient_changed(Code.SENT_THEN_CHANGED),
+            # Before the send, a held modifier refuses with its own code; after
+            # it, any difference (a modifier included) is the incident code.
+            pre_send=lambda: recipient_changed(Code.RECIPIENT_CHANGED, Code.MODIFIER_HELD),
+            post_send=lambda: recipient_changed(Code.SENT_THEN_CHANGED, Code.SENT_THEN_CHANGED),
         )
 
     def request_action(

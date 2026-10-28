@@ -107,8 +107,8 @@ FIELD = Win32Field(
 def _obs(**change) -> Observation:
     values = dict(
         at=100.0, main_hwnd=MAIN, instance=APP, image="app.exe", foreground_hwnd=MAIN,
-        topmost_hwnd=MAIN, focus_hwnd=EDIT, input_clear=True, point=(240, 142),
-        signature=REPORT, tree=_tree(),
+        topmost_hwnd=MAIN, focus_hwnd=EDIT, input_clear=True, modifiers_clear=True,
+        point=(240, 142), signature=REPORT, tree=_tree(),
     )  # fmt: skip
     values.update(change)
     return Observation(**values)
@@ -664,10 +664,10 @@ def test_the_recipient_is_read_immediately_before_and_after_the_send(tmp_path):
 
 
 CHANGED_RECIPIENTS = {
-    "focus-moved": (MAIN, OTHER, True, (240, 142), MAIN),
-    "menu-opened": (MAIN, EDIT, False, (240, 142), MAIN),
-    "foreground-switched": (OTHER, EDIT, True, (240, 142), MAIN),
-    "covered": (MAIN, EDIT, True, (240, 142), OTHER),
+    "focus-moved": (MAIN, OTHER, True, (240, 142), MAIN, True),
+    "menu-opened": (MAIN, EDIT, False, (240, 142), MAIN, True),
+    "foreground-switched": (OTHER, EDIT, True, (240, 142), MAIN, True),
+    "covered": (MAIN, EDIT, True, (240, 142), OTHER, True),
 }
 
 
@@ -1481,7 +1481,7 @@ def _patched_observer(monkeypatch, recipients, owned=(0, 0), processes=None):
     return win32_state
 
 
-RECIPIENT = (MAIN, EDIT, True, (240, 142), MAIN)
+RECIPIENT = (MAIN, EDIT, True, (240, 142), MAIN, True)
 
 
 def test_a_consistent_live_observation_is_returned(monkeypatch):
@@ -1494,10 +1494,10 @@ def test_a_consistent_live_observation_is_returned(monkeypatch):
 @pytest.mark.parametrize(
     "recipients, owned, processes, match",
     [
-        ([RECIPIENT, (OTHER, EDIT, True, (240, 142), MAIN)], (0, 0), None, "recipient"),
-        ([RECIPIENT, (MAIN, EDIT, False, (240, 142), MAIN)], (0, 0), None, "recipient"),
-        ([RECIPIENT, (MAIN, OTHER, True, (240, 142), MAIN)], (0, 0), None, "recipient"),
-        ([RECIPIENT, (MAIN, EDIT, True, (240, 142), OTHER)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (OTHER, EDIT, True, (240, 142), MAIN, True)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, EDIT, False, (240, 142), MAIN, True)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, OTHER, True, (240, 142), MAIN, True)], (0, 0), None, "recipient"),
+        ([RECIPIENT, (MAIN, EDIT, True, (240, 142), OTHER, True)], (0, 0), None, "recipient"),
         ([RECIPIENT, RECIPIENT], (0, 1), None, "dialogs"),
         ([RECIPIENT, RECIPIENT], (0, 0), [(4242, 7, "app.exe"), (4242, 8, "app.exe")], "process"),
     ],
@@ -1524,7 +1524,7 @@ def test_the_recipient_is_read_last(monkeypatch):
 
     def owned_visible(u, hwnd):
         if owned_visible.calls == 1:
-            state["recipient"] = (OTHER, EDIT, True, (240, 142), MAIN)
+            state["recipient"] = (OTHER, EDIT, True, (240, 142), MAIN, True)
         owned_visible.calls += 1
         return 0
 
@@ -1538,6 +1538,9 @@ def test_the_recipient_is_read_last(monkeypatch):
 class _RecipientUser32:
     def __init__(self, foregrounds):
         self.foregrounds = list(foregrounds)
+
+    def GetAsyncKeyState(self, vk):
+        return 0
 
     def GetForegroundWindow(self):
         return self.foregrounds.pop(0) if len(self.foregrounds) > 1 else self.foregrounds[0]
@@ -1564,7 +1567,7 @@ def _patched_recipient(monkeypatch, threads, foregrounds, on_topmost=None):
 
 def test_a_consistent_recipient_is_read(monkeypatch):
     win32_state, user32 = _patched_recipient(monkeypatch, [(EDIT, True)], [MAIN])
-    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN)
+    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN, True)
 
 
 @pytest.mark.parametrize(
@@ -1632,12 +1635,13 @@ def test_a_failed_window_enumeration_is_not_zero_dialogs():
 
 def _interleaved(monkeypatch, change_on):
     """_recipient with live-looking state: the foreground and the thread state
-    are read from ``state``; ``change_on`` maps a (read name, call number) to a
-    change made to ``state`` during that read (after its value is taken)."""
+    and the modifier state are read from ``state``; ``change_on`` maps a (read
+    name, call number) to a change made to ``state`` during that read (after
+    its value is taken)."""
     from psoperator.perception import win32_state
 
-    state = {"foreground": MAIN, "thread": (EDIT, True)}
-    calls = {"foreground": 0, "thread": 0}
+    state = {"foreground": MAIN, "thread": (EDIT, True), "modifiers": True}
+    calls = {"foreground": 0, "thread": 0, "modifiers": 0}
 
     def read(name):
         calls[name] += 1
@@ -1651,6 +1655,7 @@ def _interleaved(monkeypatch, change_on):
             return read("foreground")
 
     monkeypatch.setattr(win32_state, "_thread_state", lambda u, i, hwnd: read("thread"))
+    monkeypatch.setattr(win32_state, "_modifiers_clear", lambda u: read("modifiers"))
     monkeypatch.setattr(win32_state, "_centre", lambda u, hwnd: (240, 142))
     monkeypatch.setattr(win32_state, "topmost_at", lambda point: MAIN)
     return win32_state, _User32()
@@ -1658,7 +1663,7 @@ def _interleaved(monkeypatch, change_on):
 
 def test_an_unchanged_recipient_reads_consistently(monkeypatch):
     win32_state, user32 = _interleaved(monkeypatch, {})
-    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN)
+    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN, True)
 
 
 @pytest.mark.parametrize(
@@ -1669,9 +1674,11 @@ def test_an_unchanged_recipient_reads_consistently(monkeypatch):
         {("foreground", 2): {"thread": (EDIT, False)}},
         # the foreground switches during the second thread-state read
         {("thread", 2): {"foreground": OTHER}},
+        # a modifier is pressed right after the first modifier read
+        {("modifiers", 1): {"modifiers": False}},
     ],
     ids=["focus-during-foreground-read", "menu-during-foreground-read",
-         "foreground-during-thread-read"],
+         "foreground-during-thread-read", "modifier-pressed-during-reading"],
 )  # fmt: skip
 def test_a_change_during_a_final_recipient_read_is_refused(monkeypatch, change_on):
     from psoperator.perception.win32_fields import Win32FieldError
@@ -1702,3 +1709,102 @@ def test_the_live_recipient_reader_reads_the_same_tuple_as_an_observation(monkey
     monkeypatch.setattr(win32_state, "_api", lambda: (_FakeUser32(), None))
     monkeypatch.setattr(win32_state, "_recipient", lambda u, i, hwnd: RECIPIENT)
     assert win32_state.recipient(MAIN) == RECIPIENT == recipient_of(_obs())
+
+
+# --- held modifier keys ------------------------------------------------------------------
+
+MODIFIER_VKS = {
+    "shift": 0x10, "ctrl": 0x11, "alt": 0x12, "left-shift": 0xA0, "right-shift": 0xA1,
+    "left-ctrl": 0xA2, "right-ctrl": 0xA3, "left-alt": 0xA4, "right-alt": 0xA5,
+    "left-win": 0x5B, "right-win": 0x5C,
+}  # fmt: skip
+HELD = (MAIN, EDIT, True, (240, 142), MAIN, False)
+
+
+class _Keyboard:
+    """GetAsyncKeyState for the given virtual keys held down."""
+
+    def __init__(self, *held, state=0x8000):
+        self.held, self.state = set(held), state
+
+    def GetAsyncKeyState(self, vk):
+        return self.state if vk in self.held else 0
+
+
+@pytest.mark.parametrize("vk", list(MODIFIER_VKS.values()), ids=list(MODIFIER_VKS))
+def test_each_held_modifier_is_seen(vk):
+    from psoperator.perception import win32_state
+
+    assert win32_state._modifiers_clear(_Keyboard(vk)) is False
+    # GetAsyncKeyState returns a signed SHORT: held is negative.
+    assert win32_state._modifiers_clear(_Keyboard(vk, state=-32768)) is False
+
+
+def test_no_held_modifier_is_clear():
+    from psoperator.perception import win32_state
+
+    assert win32_state._modifiers_clear(_Keyboard()) is True
+    # Only "pressed since the last call" (low bit), or an ordinary key held: clear.
+    assert win32_state._modifiers_clear(_Keyboard(*MODIFIER_VKS.values(), state=1)) is True
+    assert win32_state._modifiers_clear(_Keyboard(0x41, 0x0D)) is True
+
+
+def test_a_held_modifier_is_refused_by_the_check():
+    assert _code(_check(obs=_obs(modifiers_clear=False))[1]) is Code.MODIFIER_HELD
+    assert _code(_check(obs=_obs())[1]) is None  # the control: none held passes
+
+
+def test_a_held_modifier_refuses_at_the_gatekeeper(tmp_path):
+    gk, config, recorder = _gatekeeper(tmp_path, Observer(_obs(modifiers_clear=False)))
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.DENIED and decision.reason == Code.MODIFIER_HELD.value
+    assert recorder.calls == [] and _audit(config)[-1]["reason"] == Code.MODIFIER_HELD.value
+
+
+def test_a_modifier_pressed_between_the_observations_refuses(tmp_path):
+    gk, _, recorder = _gatekeeper(tmp_path, _then(modifiers_clear=False))
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.reason == Code.MODIFIER_HELD.value and recorder.calls == []
+
+
+def test_a_modifier_pressed_just_before_the_send_stops_the_key(tmp_path):
+    log = _Log(before=HELD)
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.DENIED and recorder.calls == []
+    assert decision.reason == Code.MODIFIER_HELD.value
+    assert log.events == ["observe", "observe", "recipient"]
+    assert _audit(config)[-1]["reason"] == Code.MODIFIER_HELD.value
+
+
+def test_a_modifier_pressed_during_the_send_is_recorded_as_an_incident(tmp_path):
+    log = _Log(after=HELD)
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.EXECUTED and len(recorder.calls) == 1
+    assert _audit(config)[-1]["reason"] == Code.SENT_THEN_CHANGED.value
+
+
+def test_the_live_observation_carries_the_modifier_state(monkeypatch):
+    win32_state = _patched_observer(monkeypatch, [HELD, HELD])
+    obs = win32_state.observe(MAIN)
+    assert obs.modifiers_clear is False and recipient_of(obs) == HELD
+    assert _code(_check(obs=obs, now=obs.at)[1]) is Code.MODIFIER_HELD
+
+
+def test_a_modifier_pressed_during_the_live_observation_returns_nothing(monkeypatch):
+    from psoperator.perception.win32_fields import Win32FieldError
+
+    win32_state = _patched_observer(monkeypatch, [RECIPIENT, HELD])
+    with pytest.raises(Win32FieldError, match="recipient"):
+        win32_state.observe(MAIN)
+
+
+@windows_only
+def test_the_real_modifier_reading_runs():
+    # Reads the real keyboard state (nothing is sent). The CI runner holds no
+    # key, so it is clear; the call itself must work with its declared types.
+    from psoperator.perception import win32_state
+
+    user32, _ = win32_state._api()
+    assert isinstance(win32_state._modifiers_clear(user32), bool)

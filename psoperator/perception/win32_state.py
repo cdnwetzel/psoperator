@@ -2,7 +2,8 @@
 
 :func:`observe` reports what the gate checks before a key: the foreground
 window, the control with keyboard focus and whether a menu, move/size or
-mouse-capture mode is active in the main window's thread, the top-level window
+mouse-capture mode is active in the main window's thread, whether a Shift,
+Ctrl, Alt or Windows key is held, the top-level window
 at the centre of the focused control, the visible windows owned by the main
 window (dialogs), and the main window's tree and screen signature. The window
 state is read before and after the (slower) tree walk; if it changed in
@@ -27,6 +28,10 @@ _GA_ROOT = 2
 _GW_OWNER = 4
 # GUITHREADINFO flags: move/size, menu, system-menu and popup-menu modes.
 _INTERCEPTING = 0x2 | 0x4 | 0x8 | 0x10
+# Shift, Ctrl, Alt (generic, left and right) and both Windows keys. SendInput
+# keeps the existing keyboard state, so a held one turns ENTER into a chord.
+_MODIFIER_VKS = (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
+_KEY_DOWN = 0x8000
 
 
 def _api():
@@ -58,6 +63,8 @@ def _api():
     user32.GetGUIThreadInfo.restype = wintypes.BOOL
     user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
     user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
     return user32, GUITHREADINFO
 
 
@@ -121,27 +128,36 @@ def _centre(user32, hwnd: int) -> tuple[int, int]:
     return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
 
+def _modifiers_clear(user32) -> bool:
+    """Whether no Shift, Ctrl, Alt or Windows key is down (physical state)."""
+    return not any(int(user32.GetAsyncKeyState(vk)) & _KEY_DOWN for vk in _MODIFIER_VKS)
+
+
 def _recipient(user32, info_type, main_hwnd: int) -> tuple:
-    """Who would receive a key now: the foreground window, the focused control,
-    whether no menu/move-size/capture mode is active, the focused control's
-    centre and the top-level window there."""
+    """Who would receive a key now, and as what: the foreground window, the
+    focused control, whether no menu/move-size/capture mode is active, the
+    focused control's centre, the top-level window there, and whether no
+    modifier key is held."""
     thread = _thread_state(user32, info_type, main_hwnd)
     foreground = int(user32.GetForegroundWindow() or 0)
+    modifiers = _modifiers_clear(user32)
     focus, clear = thread
     if not focus:
         raise Win32FieldError("the main window's thread has no keyboard focus")
     point = _centre(user32, focus)
     top = topmost_at(point)
-    # Focus, input modes and the foreground are sampled again after the other
-    # reads, the foreground on both sides of the thread state: a change in
-    # between, including during either final read, is an inconsistent recipient.
+    # Focus, input modes, modifiers and the foreground are sampled again after
+    # the other reads, the foreground on both sides of the thread state: a
+    # change in between, including during either final read, is an
+    # inconsistent recipient.
     if (
         int(user32.GetForegroundWindow() or 0) != foreground
+        or _modifiers_clear(user32) != modifiers
         or _thread_state(user32, info_type, main_hwnd) != thread
         or int(user32.GetForegroundWindow() or 0) != foreground
     ):
         raise Win32FieldError("the recipient changed while it was being read")
-    return (foreground, focus, clear, point, top)
+    return (foreground, focus, clear, point, top, modifiers)
 
 
 def recipient(main_hwnd: int) -> tuple:
@@ -169,7 +185,7 @@ def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:
     first = _recipient(user32, info_type, main_hwnd)
     owned = _owned_visible(user32, main_hwnd)
     tree = read_window_tree(main_hwnd, label_class=label_class)
-    foreground, focus, clear, point, top = first
+    foreground, focus, clear, point, top, modifiers = first
     signature = signature_of(
         tree, focus, owned, instance=(pid, started), image=image, label_class=label_class
     )
@@ -189,6 +205,7 @@ def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:
         topmost_hwnd=top,
         focus_hwnd=focus,
         input_clear=clear,
+        modifiers_clear=modifiers,
         point=point,
         signature=signature,
         tree=tree,

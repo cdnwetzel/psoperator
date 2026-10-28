@@ -117,12 +117,15 @@ These hold from the start, so they never have to be retrofitted:
   path and step within the allow-list, and the target; it is read once, and
   the values checked are the values executed. The gatekeeper observes (the
   foreground window, the top-level window at the focused control, keyboard
-  focus, menu and capture modes, dialogs, the window tree) before checking
-  and again immediately before sending; any change, or a failed read,
-  refuses; the kill switch is checked again at the last moment. As the last
+  focus, menu and capture modes, held Shift/Ctrl/Alt/Windows keys, dialogs,
+  the window tree) before checking and again immediately before sending; any
+  change, a held modifier (`modifier-held`: SendInput keeps the keyboard
+  state, so ENTER with Ctrl held would arrive as Ctrl+Enter), or a failed
+  read, refuses; the kill switch is checked again at the last moment. As the last
   step before the executor is called, a fast reading of who would receive the
   key (foreground, focus, menu and capture modes, the window at the focused
-  control) must equal the approved observation, or the key is not sent; the
+  control, held modifiers) must equal the approved observation, or the key is
+  not sent (a held modifier with its own code, `modifier-held`); the
   same reading right after the executor returns, or raises, records any
   difference as an incident. **Known limit:** these are samples, not a lock
   on the system's input state. A change can begin inside the last reading

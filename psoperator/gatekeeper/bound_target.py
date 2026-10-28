@@ -15,7 +15,9 @@ A key is admitted only when every one of these holds:
    window of the bound process instance (pid and start time; Windows reuses
    pids);
 3. no menu, move/size or mouse-capture mode is active in the main window's
-   thread (any of them can take the key instead of the focused control);
+   thread (any of them can take the key instead of the focused control), and
+   no Shift, Ctrl, Alt or Windows key is held (it would turn the key into a
+   chord);
 4. the main window is the foreground window and the top-level window at the
    target point (an owned dialog or popup of the same process fails this);
 5. the menu path is on the allow-list, the key is the one allowed at this
@@ -101,6 +103,7 @@ class Code(str, Enum):
     RECIPIENT_CHANGED = "recipient-changed-before-send"
     SENT_THEN_CHANGED = "recipient-changed-after-send"
     UNBOUND_INPUT = "input-not-bound"
+    MODIFIER_HELD = "modifier-held"
 
 
 @dataclass(frozen=True)
@@ -422,7 +425,9 @@ class Observation:
     focused control) and ``topmost_hwnd`` the top-level window there; an owned
     popup is its own top-level window, so it never equals the main window.
     ``input_clear`` is False while a menu, move/size or mouse-capture mode is
-    active in the main window's thread."""
+    active in the main window's thread; ``modifiers_clear`` is False while a
+    Shift, Ctrl, Alt or Windows key is held (SendInput keeps the keyboard
+    state, so ENTER would arrive as a chord)."""
 
     at: float
     main_hwnd: int
@@ -432,6 +437,7 @@ class Observation:
     topmost_hwnd: int
     focus_hwnd: int
     input_clear: bool
+    modifiers_clear: bool
     point: tuple[int, int]
     signature: ScreenSignature
     tree: WindowNode
@@ -540,11 +546,31 @@ def normalized(request: object) -> BoundKeyRequest:
 
 
 def recipient_of(obs: Observation) -> tuple:
-    """Who would receive a key, as the observation saw it: the foreground
-    window, the focused control, whether no menu/move-size/capture mode is
-    active, the focused control's centre and the top-level window there. The
-    same order as a live recipient reading."""
-    return (obs.foreground_hwnd, obs.focus_hwnd, obs.input_clear, obs.point, obs.topmost_hwnd)
+    """Who would receive a key, and as what, as the observation saw it: the
+    foreground window, the focused control, whether no menu/move-size/capture
+    mode is active, the focused control's centre, the top-level window there,
+    and whether no modifier key is held (last). The same order as a live
+    recipient reading."""
+    return (
+        obs.foreground_hwnd,
+        obs.focus_hwnd,
+        obs.input_clear,
+        obs.point,
+        obs.topmost_hwnd,
+        obs.modifiers_clear,
+    )
+
+
+def recipient_problem(reading: object, approved: tuple, changed: Code, held: Code) -> Code | None:
+    """Why a live recipient reading may not stand for ``approved`` (the
+    approved observation's :func:`recipient_of`): ``held`` if a modifier key
+    is down, ``changed`` if anything else differs or the reading is malformed,
+    or None."""
+    if type(reading) is not tuple or len(reading) != len(approved):
+        return changed
+    if reading[-1] is not True:
+        return held
+    return None if reading == approved else changed
 
 
 def _path_to(root: WindowNode, hwnd: int) -> list[WindowNode] | None:
@@ -671,6 +697,8 @@ def bound_key_problem(
         return None, Refusal(Code.WRONG_APP)
     if obs.input_clear is not True:
         return None, Refusal(Code.INPUT_MODE)
+    if obs.modifiers_clear is not True:
+        return None, Refusal(Code.MODIFIER_HELD)
     if obs.topmost_hwnd != obs.main_hwnd:
         return None, Refusal(Code.COVERED)
     if obs.foreground_hwnd != obs.main_hwnd:
@@ -692,6 +720,7 @@ def unchanged(first: Observation, second: Observation) -> bool:
         "topmost_hwnd",
         "focus_hwnd",
         "input_clear",
+        "modifiers_clear",
         "point",
         "signature",
     )
