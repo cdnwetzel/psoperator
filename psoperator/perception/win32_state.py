@@ -1,9 +1,12 @@
 """Live, read-only observations for the bound-target gate.
 
 :func:`observe` reports what the gate checks before a key: the foreground
-window, the top-level window at the target point, the control with keyboard
-focus, the visible windows owned by the main window (dialogs), and the main
-window's tree and screen signature. Every call reads state the window manager
+window, the control with keyboard focus and whether a menu, move/size or
+mouse-capture mode is active in the main window's thread, the top-level window
+at the centre of the focused control, the visible windows owned by the main
+window (dialogs), and the main window's tree and screen signature. The window
+state is read before and after the (slower) tree walk; if it changed in
+between, no observation is returned. Every call reads state the window manager
 already holds; none sends a window a message or changes focus.
 """
 
@@ -22,6 +25,8 @@ from psoperator.perception.win32_fields import (
 
 _GA_ROOT = 2
 _GW_OWNER = 4
+# GUITHREADINFO flags: move/size, menu, system-menu and popup-menu modes.
+_INTERCEPTING = 0x2 | 0x4 | 0x8 | 0x10
 
 
 def _api():
@@ -68,14 +73,22 @@ def topmost_at(point: tuple[int, int]) -> int:
     return int(top)
 
 
-def _focus_of(user32, info_type, hwnd: int) -> int:
+def _thread_state(user32, info_type, hwnd: int) -> tuple[int, bool]:
+    """The focused control of ``hwnd``'s thread, and whether no menu,
+    move/size or capture mode is active there."""
     import ctypes
 
     info = info_type(cbSize=ctypes.sizeof(info_type))
     thread = user32.GetWindowThreadProcessId(hwnd, None)
     if not thread or not user32.GetGUIThreadInfo(thread, ctypes.byref(info)):
-        raise Win32FieldError("cannot read the main window's keyboard focus")
-    return int(info.hwndFocus or 0)
+        raise Win32FieldError("cannot read the main window's thread state")
+    clear = (
+        not info.flags & _INTERCEPTING
+        and not info.hwndCapture
+        and not info.hwndMenuOwner
+        and not info.hwndMoveSize
+    )
+    return int(info.hwndFocus or 0), clear
 
 
 def _owned_visible(user32, hwnd: int) -> int:
@@ -94,36 +107,58 @@ def _owned_visible(user32, hwnd: int) -> int:
     return len(found)
 
 
-def observe(
-    main_hwnd: int, point: tuple[int, int], *, label_class: str = LABEL_CLASS
-) -> Observation:
-    """Observe the main window ``main_hwnd`` for a key aimed at ``point``."""
+def _centre(user32, hwnd: int) -> tuple[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        raise Win32FieldError("cannot read the focused control's rectangle")
+    return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+
+
+def _window_state(user32, info_type, main_hwnd: int) -> tuple:
+    focus, clear = _thread_state(user32, info_type, main_hwnd)
+    if not focus:
+        raise Win32FieldError("the main window's thread has no keyboard focus")
+    point = _centre(user32, focus)
+    return (
+        int(user32.GetForegroundWindow() or 0),
+        focus,
+        clear,
+        point,
+        topmost_at(point),
+        _owned_visible(user32, main_hwnd),
+    )
+
+
+def observe(main_hwnd: int, *, label_class: str = LABEL_CLASS) -> Observation:
+    """Observe the main window ``main_hwnd`` for a key to its focused control.
+    Raises if the window is gone or its state changes during observation."""
     user32, info_type = _api()
     if not user32.IsWindow(main_hwnd):
         raise Win32FieldError("the main window no longer exists")
     at = time.monotonic()
     pid, started, image = process_of(main_hwnd)
-    foreground = int(user32.GetForegroundWindow() or 0)
-    top = topmost_at(point)
-    focus = _focus_of(user32, info_type, main_hwnd)
-    owned = _owned_visible(user32, main_hwnd)
+    before = _window_state(user32, info_type, main_hwnd)
     tree = read_window_tree(main_hwnd, label_class=label_class)
+    foreground, focus, clear, point, top, owned = before
     signature = signature_of(
-        tree,
-        focus,
-        owned,
-        pid=pid,
-        process_started=started,
-        process_image=image,
-        label_class=label_class,
+        tree, focus, owned, instance=(pid, started), image=image, label_class=label_class
     )
+    if _window_state(user32, info_type, main_hwnd) != before:
+        raise Win32FieldError("the window state changed during observation")
+    if process_of(main_hwnd)[:2] != (pid, started):
+        raise Win32FieldError("the main window's process changed during observation")
     return Observation(
         at=at,
         main_hwnd=int(main_hwnd),
         instance=(pid, started),
+        image=image,
         foreground_hwnd=foreground,
         topmost_hwnd=top,
         focus_hwnd=focus,
+        input_clear=clear,
         point=point,
         signature=signature,
         tree=tree,

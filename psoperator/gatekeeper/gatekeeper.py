@@ -35,10 +35,10 @@ from psoperator.gatekeeper.bound_target import (
     Code,
     Observation,
     Refusal,
-    audit_record,
     audited_keys,
     bound_key_problem,
     unchanged,
+    unverified_record,
 )
 from psoperator.gatekeeper.executor import DryRunExecutor, Executor
 from psoperator.gatekeeper.risk import (
@@ -76,6 +76,7 @@ _INPUT_KINDS = frozenset(
     }
 )
 _KEYBOARD_KINDS = frozenset({ActionKind.TYPE, ActionKind.KEY})
+_ACTION_KIND_VALUES = frozenset(kind.value for kind in ActionKind)
 
 
 def _service_contract_refusal(
@@ -141,10 +142,18 @@ class Gatekeeper:
         executor: Executor | None = None,
         *,
         bound_input_only: bool = False,
+        bound_observer: Callable[[int], Observation] | None = None,
+        observation_max_age_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # With bound_input_only, input reaches the device only through
         # request_bound_key: request_action refuses every unbound input.
         self._bound_input_only = bound_input_only
+        # The observer and the clock are trusted configuration fixed here; a
+        # request can neither supply nor replace them.
+        self._observe = bound_observer
+        self._max_age_s = observation_max_age_s
+        self._clock = clock
         self._config = config
         self._freshness = freshness
         self._approval = approval_backend or CLIApproval()
@@ -176,77 +185,81 @@ class Gatekeeper:
 
     # ------------------------------------------------------------------ API
     def request_bound_key(
-        self,
-        request: BoundKeyRequest,
-        frame: Frame,
-        allow: AllowList,
-        observe: Callable[[], Observation],
-        *,
-        max_age_s: float = 1.0,
-        clock: Callable[[], float] = time.monotonic,
+        self, request: BoundKeyRequest, frame: Frame, allow: AllowList
     ) -> Decision:
         """One key for the pilot application, admitted only through the
-        bound-target gate (``bound_target``). The screen is not taken from the
-        caller: ``observe`` is the gatekeeper's own observer, called now and
-        again immediately before the key is sent (after any approval), and any
-        change refuses. Every decision is audited with a fixed reason code,
-        validated identity and recognised key names; never text."""
+        bound-target gate (``bound_target``). The screen is observed by the
+        gatekeeper's own observer (fixed at construction): now, and again
+        immediately before the key is sent (after any approval); any change
+        refuses. Every decision is audited with a fixed reason code, recognised
+        key names and identity built from the observation; never text."""
+        # The kill switch is checked before anything about the request is read.
+        if killswitch.is_engaged(self._config.kill_switch_path):
+            return self._record(
+                DecisionKind.KILL_SWITCHED,
+                None,
+                None,
+                approver="gatekeeper",
+                reason="kill switch engaged",
+                frame=frame,
+                binding={"kind": "unread", "verified": False},
+            )
+        # Reading the request is itself guarded: a malformed or hostile request
+        # becomes an audited refusal, never an exception.
         try:
-            binding = audit_record(request.target, frame.sha256)
-        except Exception:  # a malformed target is refused below, never fatal
-            binding = {"kind": "invalid"}
+            action, main_hwnd = request.action, request.main_hwnd
+            unverified = unverified_record(request.target, frame.sha256)
+            readable = True
+        except Exception:
+            action, main_hwnd = None, None
+            unverified = {"kind": "invalid", "verified": False}
+            readable = False
 
         def refuse(refusal: Refusal) -> Decision:
             reason = refusal.code.value + (f": {refusal.detail}" if refusal.detail else "")
             return self._record(
                 DecisionKind.DENIED,
-                request.action,
+                action,
                 None,
                 approver="gatekeeper",
                 reason=reason,
                 frame=frame,
-                binding=binding,
+                binding=unverified,
                 audit_reason=refusal.code.value,
             )
 
-        if killswitch.is_engaged(self._config.kill_switch_path):
-            return self._record(
-                DecisionKind.KILL_SWITCHED,
-                request.action,
-                None,
-                approver="gatekeeper",
-                reason="kill switch engaged",
-                frame=frame,
-                binding=binding,
-            )
+        if not readable:
+            return refuse(Refusal(Code.INVALID))
+        if self._observe is None:
+            return refuse(Refusal(Code.NO_OBSERVER))
 
-        def check() -> tuple[Observation | None, Refusal | None]:
+        def check() -> tuple[Observation | None, dict | None, Refusal | None]:
             try:
-                observed = observe()
+                observed = self._observe(main_hwnd)
             except Exception:
-                return None, Refusal(Code.OBSERVE_FAILED)
+                return None, None, Refusal(Code.OBSERVE_FAILED)
             try:
-                return observed, bound_key_problem(
-                    request, allow, observed, now=clock(), max_age_s=max_age_s
+                identity, refusal = bound_key_problem(
+                    request, allow, observed, now=self._clock(), max_age_s=self._max_age_s
                 )
             except Exception:
-                return observed, Refusal(Code.INVALID)
+                return observed, None, Refusal(Code.INVALID)
+            return observed, identity, refusal
 
-        first, refusal = check()
+        first, identity, refusal = check()
         if refusal is not None:
             return refuse(refusal)
+        binding = {**identity, "verified": True, "frame_hash": unverified["frame_hash"]}
 
         def recheck() -> str | None:
-            second, again = check()
+            second, _, again = check()
             if again is not None:
                 return again.code.value
             if not unchanged(first, second):
                 return Code.CHANGED.value
             return None
 
-        return self.request_action(
-            request.action, frame, binding=binding, pre_execute=recheck, _bound=True
-        )
+        return self._decide(action, frame, binding=binding, pre_execute=recheck)
 
     def request_action(
         self,
@@ -256,10 +269,40 @@ class Gatekeeper:
         snapshot: PerceptionSnapshot | None = None,
         *,
         require_bound_input: bool = False,
+    ) -> Decision:
+        # With bound_input_only, unbound input never reaches the device. The
+        # kill switch still wins, so it is recorded as such.
+        if (
+            self._bound_input_only
+            and action.kind in _INPUT_KINDS
+            and not killswitch.is_engaged(self._config.kill_switch_path)
+        ):
+            return self._record(
+                DecisionKind.DENIED,
+                action,
+                None,
+                approver="gatekeeper",
+                reason="input must go through the bound-target gate",
+                frame=frame,
+            )
+        return self._decide(
+            action, frame, context, snapshot, require_bound_input=require_bound_input
+        )
+
+    def _decide(
+        self,
+        action: Action,
+        frame: Frame,
+        context: ActionContext | None = None,
+        snapshot: PerceptionSnapshot | None = None,
+        *,
+        require_bound_input: bool = False,
         binding: dict | None = None,
         pre_execute: Callable[[], str | None] | None = None,
-        _bound: bool = False,
     ) -> Decision:
+        """The pipeline. Private: only request_action (which enforces
+        bound_input_only) and request_bound_key (which binds and re-checks)
+        call it."""
         record = partial(self._record, binding=binding)
         # 1. global stop — fail closed, including terminal/no-op actions
         if killswitch.is_engaged(self._config.kill_switch_path):
@@ -269,17 +312,6 @@ class Gatekeeper:
                 None,
                 approver="gatekeeper",
                 reason="kill switch engaged",
-                frame=frame,
-            )
-
-        # 1b. with bound_input_only, unbound input never reaches the device
-        if self._bound_input_only and not _bound and action.kind in _INPUT_KINDS:
-            return record(
-                DecisionKind.DENIED,
-                action,
-                None,
-                approver="gatekeeper",
-                reason="input must go through the bound-target gate",
                 frame=frame,
             )
 
@@ -465,19 +497,24 @@ class Gatekeeper:
         if binding is None:
             entry = action.to_dict()
             audited = reason
+            frame_id = action.frame_id
         else:
             # A bound action is recorded by kind, recognised key names and the
-            # validated binding only, with a fixed reason code: never typed
-            # text, never a caller-supplied string, never an executor message.
+            # binding only, with a fixed reason code: never typed text, never a
+            # caller-supplied string, never an executor message. Safe for a
+            # malformed action.
+            kind_value = getattr(getattr(action, "kind", None), "value", None)
+            frame_id = getattr(action, "frame_id", None)
+            frame_id = frame_id if type(frame_id) is int else -1
             entry = {
-                "action": action.kind.value,
-                "frame_id": action.frame_id,
+                "action": kind_value if kind_value in _ACTION_KIND_VALUES else "<invalid>",
+                "frame_id": frame_id,
                 "keys": audited_keys(action),
                 "binding": binding,
             }
             audited = audit_reason or kind.value
         self._audit.append(
-            frame_id=action.frame_id,
+            frame_id=frame_id,
             frame_hash=frame.sha256,
             action=entry,
             tier=int(risk.tier) if risk else -1,
