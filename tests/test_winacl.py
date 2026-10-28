@@ -934,6 +934,24 @@ def test_unlink_removes_a_symlink_not_its_target(vault):
     assert sorted(p.name for p in vault.iterdir()) == ["secret"]
 
 
+@windows_only
+def test_a_verified_read_cannot_be_deleted_or_renamed_underneath(tmp_path, vault):
+    # Delete sharing on its own: while the read is held, the file can be
+    # neither removed nor renamed away, and once it is closed both work.
+    _write(vault, "secret", b"x")
+    fd = winacl.open_owner_only_for_read(vault / "secret")
+    try:
+        with pytest.raises(PermissionError):
+            os.remove(vault / "secret")
+        with pytest.raises(PermissionError):
+            os.rename(vault / "secret", vault / "moved")
+        assert os.read(fd, 10) == b"x"
+    finally:
+        os.close(fd)
+    os.rename(vault / "secret", vault / "moved")  # the control
+    os.remove(vault / "moved")
+
+
 class _Kernel32:
     """The real kernel32, with FlushFileBuffers and CloseHandle recorded."""
 
