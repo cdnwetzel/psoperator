@@ -177,8 +177,9 @@ def test_one_failed_release_does_not_skip_the_others():
     keyboard = _GoesDownThenRaises(bad={"s"})
     executor = PynputExecutor(keyboard=keyboard, mouse=object())
     # The press error is the one raised; every release is still attempted.
-    with pytest.raises(RuntimeError, match="press failed"):
+    with pytest.raises(Exception) as raised:
         executor.execute(Action(ActionKind.KEY, 1, keys=("ctrl", "s")))
+    assert type(raised.value) is RuntimeError and "press failed" in str(raised.value)
     assert keyboard.released == ["s", Key.ctrl]
 
 
