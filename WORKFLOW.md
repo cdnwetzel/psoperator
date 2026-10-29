@@ -57,6 +57,7 @@ paths = [
     "psoperator/gatekeeper/",
     "psoperator/perception/snapshot.py",
     "psoperator/perception/win32_fields.py",
+    "psoperator/perception/win32_state.py",
     "psoperator/services/",
     "tests/test_gatekeeper.py",
     "tests/conftest.py",
@@ -65,6 +66,7 @@ paths = [
     "tests/test_isolation.py",
     "tests/test_integration.py",
     "tests/test_observer.py",
+    "tests/test_bound_target.py",
     "tests/test_win32_fields.py",
     "tests/test_winacl.py",
 ]

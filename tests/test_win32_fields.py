@@ -279,7 +279,9 @@ def test_a_field_carries_no_text():
         "label_hash", "rect", "label_rect", "screen_rect", "hwnd",
     }  # fmt: skip
     names = {f.name for f in dataclasses.fields(WindowNode)}
-    assert names == {"class_name", "rect", "visible", "name_hash", "hwnd", "children"}
+    assert names == {
+        "class_name", "rect", "visible", "name_hash", "hwnd", "children", "client_rect",
+    }  # fmt: skip
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the non-Windows refusal")
@@ -406,7 +408,7 @@ def test_reading_sends_no_message_and_reads_only_label_captions(monkeypatch):
     used = {name for name, _ in calls}
     assert used <= {
         "IsWindow", "GetWindow", "GetClassNameW", "GetWindowRect",
-        "IsWindowVisible", "InternalGetWindowText",
+        "IsWindowVisible", "InternalGetWindowText", "GetClientRect", "ClientToScreen",
     }, used  # fmt: skip
     classes = {node.hwnd: node.class_name for node in _walk(tree)}
     captions = [hwnd for name, hwnd in calls if name == "InternalGetWindowText"]

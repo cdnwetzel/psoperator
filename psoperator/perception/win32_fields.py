@@ -77,7 +77,8 @@ def name_hash(text: str) -> str:
 class WindowNode:
     """One window in a recorded tree. ``name_hash`` is set only for
     label-class windows below the root with a non-empty caption; no text is
-    stored."""
+    stored. ``client_rect`` is the client area in screen pixels (None when not
+    recorded): a child shown outside it is scrolled out or clipped."""
 
     class_name: str
     rect: Rect
@@ -85,6 +86,7 @@ class WindowNode:
     name_hash: str | None = None
     hwnd: int = 0
     children: tuple["WindowNode", ...] = ()
+    client_rect: Rect | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +247,10 @@ def _user32():
     user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetClientRect.restype = wintypes.BOOL
+    user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+    user32.ClientToScreen.restype = wintypes.BOOL
     user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.IsWindowVisible.restype = wintypes.BOOL
     user32.IsWindow.argtypes = [wintypes.HWND]
@@ -256,6 +262,12 @@ def _user32():
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     return user32
+
+
+def user32_api():
+    """The ``user32`` binding with the message-free calls this module uses
+    declared. Raises :class:`Win32FieldError` off Windows."""
+    return _user32()
 
 
 def _class_name(user32, hwnd: int) -> str:
@@ -275,6 +287,19 @@ def _rect(user32, hwnd: int) -> Rect:
     if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
         raise Win32FieldError("GetWindowRect failed")
     return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+
+
+def _client_rect(user32, hwnd: int) -> Rect:
+    import ctypes
+    from ctypes import wintypes
+
+    r = wintypes.RECT()
+    origin = wintypes.POINT(0, 0)
+    if not user32.GetClientRect(hwnd, ctypes.byref(r)) or not user32.ClientToScreen(
+        hwnd, ctypes.byref(origin)
+    ):
+        raise Win32FieldError("GetClientRect failed")
+    return (origin.x, origin.y, r.right - r.left, r.bottom - r.top)
 
 
 def _label_name_hash(user32, hwnd: int) -> str | None:
@@ -316,6 +341,7 @@ def read_window_tree(
             name_hash=_label_name_hash(user32, handle) if named else None,
             hwnd=int(handle),
             children=children,
+            client_rect=_client_rect(user32, handle),
         )
 
     # Post-order, iteratively: a node is built once all its children are.

@@ -100,9 +100,93 @@ These hold from the start, so they never have to be retrofitted:
      image name and pid, since Windows reuses pids. (Done in the provider.)
   5. **The audit records identity, the frame hash and the rectangles**,
      never text.
+
+  The gate (`psoperator/gatekeeper/bound_target.py`, entry point
+  `Gatekeeper.request_bound_key`) meets all five and adds an **allow-list**:
+  a key is admitted only on a menu path explicitly listed as read-only, only
+  the key listed for that step, and only when the screen's complete
+  signature matches the step's expected one and none of its recorded
+  neighbouring screens (every step must record at least one, such as the
+  screen one wrong digit away). The signature is structure, never text:
+  every visible Edit's position, every label-class caption on screen as a
+  hash and position (so menus without fields are told apart), every
+  labelled field's hash and position, dialogs and focus. The gatekeeper does
+  not take the screen from the caller: its observer, clock, allow-list, the
+  application it applies to and the one main window and process instance it
+  may send to are fixed at construction. A request carries only the key, a
+  path and step within the allow-list, and the target; it is read once, and
+  the values checked are the values executed. The gatekeeper observes (the
+  foreground window, the top-level window at the focused control, keyboard
+  focus, menu and capture modes, held Shift/Ctrl/Alt/Windows keys, dialogs,
+  the window tree) before checking and again immediately before sending; any
+  change, a held modifier (`modifier-held`: SendInput keeps the keyboard
+  state, so ENTER with Ctrl held would arrive as Ctrl+Enter), a keyboard
+  whose state cannot be read (`keyboard-unreadable`, below), or a failed
+  read, refuses; the kill switch is checked again at the last moment. As the last
+  step before the executor is called, a fast reading of who would receive the
+  key (foreground, focus, menu and capture modes, the window at the focused
+  control, held modifiers) must equal the approved observation, or the key is
+  not sent (a held modifier or an unreadable keyboard with its own code); the
+  same reading right after the executor returns, or raises, records any
+  difference as an incident. **Known limit:** these are samples, not a lock
+  on the system's input state. A change can begin inside the last reading
+  (focus or a menu can change while its final foreground read runs), so the
+  unobserved window starts inside the reader, before the executor is called,
+  and runs until the key is consumed. A change that happens and reverts
+  between two samples is not seen. A key accepted into the input queue is not
+  proof of where it was delivered. Sampling therefore cannot guarantee the
+  actual recipient or detect every intervening change; it refuses what it
+  sees before the send and records what it sees after. The operator has
+  accepted this residual race for the pilot.
+  **Modifier check, what it covers:** Shift, Ctrl, Alt (AltGr reads as
+  Ctrl+Alt) and both Windows keys, held on any keyboard or by any program:
+  the asynchronous key state includes keys injected by other software (a
+  script's `hotkey('ctrl', 's')` still in progress, or one that crashed with
+  Ctrl down), not only physical keys. The modifiers are sampled first and
+  last in every reading, so a press at either end refuses as
+  `modifier-held`; one pressed after the last sample is not seen (the same
+  sampling limit). `GetAsyncKeyState` returns 0 ("not held") when it cannot
+  read the keyboard: when this process's desktop is not the active desktop
+  (a locked workstation, the secure desktop of a UAC or Ctrl+Alt+Del
+  prompt, a disconnected remote session), when the input desktop denies it
+  the hook and journal-record rights, and when UIPI keeps it from a
+  foreground process of higher integrity (an application run as
+  administrator). Each sample is therefore bracketed by three checks: the
+  session is connected and unlocked (`WTSQuerySessionInformation`; in a
+  disconnected session the input desktop still opens, as the desktop that
+  becomes active on reconnection, so the desktop alone proves nothing
+  there); this process is in the visible interactive window station and the
+  input desktop opens with those rights and is this thread's desktop
+  (otherwise `keyboard-unreadable`); and the foreground process's integrity
+  level is known and not above this process's (otherwise
+  `privilege-not-verified`). In those states SendInput would not reach the
+  application either (UIPI drops injected input to a higher-integrity
+  window without an error), so unattended input needs a connected, unlocked
+  session and an application that does not run elevated above the gate.
+  **What it does not
+  cover:** CapsLock, NumLock, the keyboard layout, IME state and a pending
+  dead key can change the character a letter or digit produces; the check
+  does not read them. The asynchronous state is the system's, not the target
+  thread's own view (which an application can maintain or alter, and which
+  no outside reader can attest). The audit therefore records the key that
+  was injected, not the character the application received. The audited
+  identity is built from that observation. Refusals are audited with fixed
+  codes; with `bound_input_only`, every kind of device input (clicks, typing,
+  keys, scrolling, dragging) that bypasses the gate is refused, whatever the
+  kill switch reads after its first check. An empty allow-list refuses
+  everything. The real allow-list, the application map and its dangerous
+  paths are private configuration, never in this repository; the repository
+  holds only the mechanism, tested with made-up paths.
 - **The audit logs identity, never text:** the field's identity and
   rectangle, the OCR box and the frame hash. It never logs OCR text, field
-  values or window text.
+  values or window text. With `bound_input_only`, every decision (refusals,
+  kill switch, done, fail, wait, executor failures) is recorded by action
+  kind, recognised key names, binding and a fixed reason code, never typed
+  text, a caller's reason or an executor message; a rejected request is
+  recorded as a fixed placeholder and not read again. An envelope receipt is
+  reduced to fixed values too: its outcome and reason from fixed sets, the
+  frame id and hash, the epoch and nonce as 64-hex, the key id only as its
+  SHA-256; its detail is dropped.
 - **`WinAutoA11y` must be scoped to the target window.** It walks the whole
   desktop today; one snapshot took 124 s. That fix is its own test-first PR.
 - **Every key is preceded by two checks:** the application is the foreground
