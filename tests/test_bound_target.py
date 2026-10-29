@@ -22,6 +22,7 @@ from psoperator.config import load_config
 from psoperator.gatekeeper import gatekeeper as gatekeeper_module
 from psoperator.gatekeeper.audit import verify
 from psoperator.gatekeeper.bound_target import (
+    KEY_STATE_CODES,
     AllowedPath,
     AllowedStep,
     AllowList,
@@ -1755,12 +1756,20 @@ def test_zeros_from_an_unreadable_keyboard_are_not_clear(monkeypatch, change_on)
 
 
 class _Desktops:
-    """OpenInputDesktop and friends: the input desktop (or None if it cannot
-    be opened) and this thread's desktop, by name."""
+    """OpenInputDesktop and friends: this process's window station (by name,
+    and whether it is visible), the input desktop (or None if it cannot be
+    opened) and this thread's desktop, by name."""
 
-    def __init__(self, input_name="Default", thread_name="Default", name_fails=False):
+    def __init__(
+        self, input_name="Default", thread_name="Default", name_fails=False,
+        station="WinSta0", visible=True,
+    ):  # fmt: skip
         self.input_name, self.thread_name, self.name_fails = input_name, thread_name, name_fails
+        self.station, self.visible = station, visible
         self.opened, self.closed = [], []
+
+    def GetProcessWindowStation(self):
+        return 0x33 if self.station is not None else 0
 
     def OpenInputDesktop(self, flags, inherit, access):
         self.opened.append(access)
@@ -1770,9 +1779,13 @@ class _Desktops:
         return 0x22
 
     def GetUserObjectInformationW(self, handle, index, buffer, size, needed):
+        if handle == 0x33 and index == 1:  # the station's USEROBJECTFLAGS
+            buffer._obj.dwFlags = 0x0001 if self.visible else 0
+            return 1
         if self.name_fails or index != 2:
             return 0
-        buffer.value = self.input_name if handle == 0x11 else self.thread_name
+        names = {0x11: self.input_name, 0x22: self.thread_name, 0x33: self.station}
+        buffer.value = names[handle]
         return 1
 
     def CloseDesktop(self, handle):
@@ -1785,7 +1798,7 @@ def test_the_keyboard_is_readable_on_this_threads_input_desktop():
     from psoperator.perception import win32_state
 
     desktops = _Desktops()
-    assert win32_state._keyboard_readable(desktops) is None
+    assert win32_state._input_desktop_ours(desktops) is None
     # Opened with read-objects, hook-control and journal-record, and closed.
     assert desktops.opened == [0x0001 | 0x0008 | 0x0010] and desktops.closed == [0x11]
 
@@ -1798,16 +1811,177 @@ def test_the_keyboard_is_readable_on_this_threads_input_desktop():
         _Desktops(input_name="Winlogon"),  # the input desktop is another desktop
         _Desktops(name_fails=True),  # its name cannot be read
         _Desktops(input_name="", thread_name=""),  # no name: nothing proven
+        _Desktops(station="Service-0x0-3e7$"),  # a non-interactive window station
+        _Desktops(visible=False),  # the interactive station, but not visible
+        _Desktops(station=None),  # no window station
     ],
-    ids=["cannot-open", "another-desktop", "name-unreadable", "empty-names"],
-)
+    ids=["cannot-open", "another-desktop", "name-unreadable", "empty-names",
+         "other-station", "invisible-station", "no-station"],
+)  # fmt: skip
 def test_the_keyboard_is_unreadable_off_the_input_desktop(desktops):
     from psoperator.perception import win32_state
 
-    code = _key_state(lambda: win32_state._keyboard_readable(desktops))
+    code = _key_state(lambda: win32_state._input_desktop_ours(desktops))
     assert code is Code.KEYBOARD_UNREADABLE
-    # Whatever was opened is closed.
-    assert desktops.closed == ([] if desktops.input_name is None else [0x11])
+    # Whatever was opened is closed; off the interactive station, nothing is opened.
+    assert desktops.closed == ([] if desktops.input_name is None else [0x11] * len(desktops.opened))
+    if desktops.station != "WinSta0" or not desktops.visible:
+        assert desktops.opened == []
+
+
+@pytest.mark.parametrize(
+    "level, state, flags, ok",
+    [
+        (1, 0, 1, True),  # WTSActive, WTS_SESSIONSTATE_UNLOCK
+        (1, 4, 1, False),  # WTSDisconnected: OpenInputDesktop would still succeed
+        (1, 1, 1, False),  # WTSConnected (not yet logged on)
+        (1, 0, 0, False),  # WTS_SESSIONSTATE_LOCK
+        (1, 0, -1, False),  # WTS_SESSIONSTATE_UNKNOWN
+        (2, 0, 1, False),  # not the level-1 reply
+        (True, 0, 1, False),  # not exact ints
+        (1, False, 1, False),
+        (1, 0, True, False),
+        ("1", 0, 1, False),
+    ],
+    ids=["active-unlocked", "disconnected", "connected", "locked", "unknown", "level",
+         "bool-level", "bool-state", "bool-flags", "str-level"],
+)  # fmt: skip
+def test_only_a_connected_unlocked_session_is_ok(level, state, flags, ok):
+    from psoperator.perception import win32_state
+
+    assert win32_state.session_ok(level, state, flags) is ok
+
+
+def _readable_parts(monkeypatch, session=True, desktop=None, privilege=None):
+    """_keyboard_readable with its three checks replaced; ``desktop`` and
+    ``privilege`` are codes those checks raise (None: they pass)."""
+    from psoperator.perception import win32_state
+
+    calls = []
+
+    def part(name, code):
+        def check(u):
+            calls.append(name)
+            if code is not None:
+                raise KeyStateRefusal(code)
+
+        return check
+
+    def session_unlocked():
+        calls.append("session")
+        return session
+
+    monkeypatch.setattr(win32_state, "_session_unlocked", session_unlocked)
+    monkeypatch.setattr(win32_state, "_input_desktop_ours", part("desktop", desktop))
+    monkeypatch.setattr(win32_state, "_privilege_verified", part("privilege", privilege))
+    return win32_state, calls
+
+
+def test_a_readable_keyboard_passes_all_three_checks(monkeypatch):
+    win32_state, calls = _readable_parts(monkeypatch)
+    assert win32_state._keyboard_readable(None) is None
+    assert calls == ["session", "desktop", "privilege"]
+
+
+def test_a_disconnected_or_locked_session_is_unreadable_though_the_desktop_opens(monkeypatch):
+    # The desktop and privilege checks would pass: the session check alone refuses.
+    win32_state, calls = _readable_parts(monkeypatch, session=False)
+    assert _key_state(lambda: win32_state._keyboard_readable(None)) is Code.KEYBOARD_UNREADABLE
+    assert calls == ["session"]
+
+
+@pytest.mark.parametrize(
+    "desktop, privilege, expected",
+    [
+        (Code.KEYBOARD_UNREADABLE, None, Code.KEYBOARD_UNREADABLE),
+        (None, Code.PRIVILEGE_UNVERIFIED, Code.PRIVILEGE_UNVERIFIED),
+    ],
+    ids=["desktop", "privilege"],
+)
+def test_each_readability_check_refuses_on_its_own(monkeypatch, desktop, privilege, expected):
+    win32_state, _ = _readable_parts(monkeypatch, desktop=desktop, privilege=privilege)
+    assert _key_state(lambda: win32_state._keyboard_readable(None)) is expected
+
+
+MEDIUM, HIGH, LOW, SYSTEM = 0x2000, 0x3000, 0x1000, 0x4000
+
+
+def _privilege(monkeypatch, pid, levels):
+    """_privilege_verified with the foreground pid and the integrity levels
+    (by pid, None for this process) given; a level that is an exception is
+    raised when read."""
+    from psoperator.perception import win32_state
+
+    def foreground_pid(u):
+        if isinstance(pid, Exception):
+            raise pid
+        return pid
+
+    def integrity(of):
+        level = levels[of]
+        if isinstance(level, Exception):
+            raise level
+        return level
+
+    monkeypatch.setattr(win32_state, "_foreground_pid", foreground_pid)
+    monkeypatch.setattr(win32_state, "_integrity", integrity)
+    return lambda: _key_state(lambda: win32_state._privilege_verified(None))
+
+
+@pytest.mark.parametrize(
+    "pid, levels, expected",
+    [
+        (42, {42: MEDIUM, None: MEDIUM}, None),  # the same level
+        (42, {42: LOW, None: MEDIUM}, None),  # a lower foreground
+        (42, {42: HIGH, None: MEDIUM}, Code.PRIVILEGE_UNVERIFIED),  # elevated: UIPI
+        (42, {42: SYSTEM, None: HIGH}, Code.PRIVILEGE_UNVERIFIED),
+        (42, {42: OSError("denied"), None: MEDIUM}, Code.PRIVILEGE_UNVERIFIED),
+        (42, {42: MEDIUM, None: OSError("denied")}, Code.PRIVILEGE_UNVERIFIED),
+        # no foreground process (were pid 0 read, its level would pass)
+        (0, {0: MEDIUM, None: MEDIUM}, Code.PRIVILEGE_UNVERIFIED),
+        (OSError("no window"), {None: MEDIUM}, Code.PRIVILEGE_UNVERIFIED),
+    ],
+    ids=["same", "lower", "elevated", "system", "target-unreadable", "own-unreadable",
+         "no-foreground", "foreground-unreadable"],
+)  # fmt: skip
+def test_the_foreground_must_not_be_more_privileged(monkeypatch, pid, levels, expected):
+    assert _privilege(monkeypatch, pid, levels)() is expected
+
+
+class _FailingSessionQuery:
+    def WTSQuerySessionInformationW(self, server, session, kind, buffer, size):
+        return 0
+
+    def WTSFreeMemory(self, buffer):
+        raise AssertionError("nothing was allocated")
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "api",
+    [
+        lambda: (_ for _ in ()).throw(OSError("wtsapi32 missing")),
+        lambda: (_FailingSessionQuery(), None, None, None),
+    ],
+    ids=["api-unavailable", "query-fails"],
+)
+def test_a_session_that_cannot_be_read_is_not_unlocked(monkeypatch, api):
+    from psoperator.perception import win32_state
+
+    monkeypatch.setattr(win32_state, "_security_api", api)
+    assert win32_state._session_unlocked() is False
+
+
+@windows_only
+def test_the_real_session_and_privilege_readings_run():
+    # Smoke tests of the declared types (nothing is sent): an interactive,
+    # unlocked session reads as such; a runner's service session may not.
+    from psoperator.perception import win32_state
+
+    assert win32_state._session_unlocked() in (True, False)
+    own = win32_state._integrity(None)
+    assert type(own) is int and 0 <= own <= 0x7000
+    assert win32_state._integrity(os.getpid()) == own
 
 
 @windows_only
@@ -1983,13 +2157,15 @@ class _HostileRefusal(KeyStateRefusal):
     [
         (KeyStateRefusal(Code.MODIFIER_HELD), Code.MODIFIER_HELD),
         (KeyStateRefusal(Code.KEYBOARD_UNREADABLE), Code.KEYBOARD_UNREADABLE),
-        # controls: only the two key-state codes are carried through
+        (KeyStateRefusal(Code.PRIVILEGE_UNVERIFIED), Code.PRIVILEGE_UNVERIFIED),
+        # controls: only the key-state codes are carried through
         (KeyStateRefusal(Code.CHANGED), Code.OBSERVE_FAILED),
         (_HostileRefusal(Code.MODIFIER_HELD), Code.OBSERVE_FAILED),
         (RuntimeError("secret observer text"), Code.OBSERVE_FAILED),
     ],
-    ids=["modifier-held", "keyboard-unreadable", "other-code", "hostile-code", "plain-error"],
-)
+    ids=["modifier-held", "keyboard-unreadable", "privilege", "other-code", "hostile-code",
+         "plain-error"],
+)  # fmt: skip
 def test_an_observer_key_state_refusal_keeps_its_code(tmp_path, call, error, expected):
     gk, config, recorder = _gatekeeper(tmp_path, _RaisingObserver({call: error}))
     decision = gk.request_bound_key(_req(), _frame())
@@ -2018,12 +2194,14 @@ class _RaisingLog(_Log):
     [
         (KeyStateRefusal(Code.MODIFIER_HELD), Code.MODIFIER_HELD),
         (KeyStateRefusal(Code.KEYBOARD_UNREADABLE), Code.KEYBOARD_UNREADABLE),
+        (KeyStateRefusal(Code.PRIVILEGE_UNVERIFIED), Code.PRIVILEGE_UNVERIFIED),
         (KeyStateRefusal(Code.CHANGED), Code.RECIPIENT_CHANGED),
         (_HostileRefusal(Code.MODIFIER_HELD), Code.RECIPIENT_CHANGED),
         (RuntimeError("secret recipient text"), Code.RECIPIENT_CHANGED),
     ],
-    ids=["modifier-held", "keyboard-unreadable", "other-code", "hostile-code", "plain-error"],
-)
+    ids=["modifier-held", "keyboard-unreadable", "privilege", "other-code", "hostile-code",
+         "plain-error"],
+)  # fmt: skip
 def test_a_key_state_refusal_just_before_the_send_keeps_its_code(tmp_path, error, expected):
     log = _RaisingLog({1: error})
     gk, config, recorder = _bracketed(tmp_path, log)
@@ -2033,7 +2211,7 @@ def test_a_key_state_refusal_just_before_the_send_keeps_its_code(tmp_path, error
     assert log.events == ["observe", "observe", "recipient"]
 
 
-@pytest.mark.parametrize("code", [Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE])
+@pytest.mark.parametrize("code", sorted(KEY_STATE_CODES))
 def test_a_key_state_refusal_after_the_send_is_the_incident_code(tmp_path, code):
     log = _RaisingLog({2: KeyStateRefusal(code)})
     gk, config, recorder = _bracketed(tmp_path, log)
@@ -2045,6 +2223,7 @@ def test_a_key_state_refusal_after_the_send_is_the_incident_code(tmp_path, code)
 def test_key_state_code_is_safe_for_any_exception():
     assert key_state_code(KeyStateRefusal(Code.MODIFIER_HELD)) is Code.MODIFIER_HELD
     assert key_state_code(KeyStateRefusal(Code.KEYBOARD_UNREADABLE)) is Code.KEYBOARD_UNREADABLE
+    assert key_state_code(KeyStateRefusal(Code.PRIVILEGE_UNVERIFIED)) is Code.PRIVILEGE_UNVERIFIED
     assert key_state_code(KeyStateRefusal(Code.INVALID)) is None
     assert key_state_code(_HostileRefusal(Code.MODIFIER_HELD)) is None
     assert key_state_code(RuntimeError("modifier-held")) is None

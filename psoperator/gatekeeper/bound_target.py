@@ -105,6 +105,7 @@ class Code(str, Enum):
     UNBOUND_INPUT = "input-not-bound"
     MODIFIER_HELD = "modifier-held"
     KEYBOARD_UNREADABLE = "keyboard-unreadable"
+    PRIVILEGE_UNVERIFIED = "privilege-not-verified"
 
 
 @dataclass(frozen=True)
@@ -114,12 +115,15 @@ class Refusal:
 
 
 # The codes a live reading may raise as a KeyStateRefusal.
-KEY_STATE_CODES = frozenset({Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE})
+KEY_STATE_CODES = frozenset(
+    {Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE, Code.PRIVILEGE_UNVERIFIED}
+)
 
 
 class KeyStateRefusal(Exception):
     """A live reading found a modifier key held, or could not establish that
-    the keyboard state is readable: raised with its fixed code so that the
+    the keyboard state is readable (the session, the desktop, or the
+    foreground's privilege): raised with its fixed code so that the
     refusal keeps that code instead of becoming a generic failed reading."""
 
     def __init__(self, code: Code) -> None:

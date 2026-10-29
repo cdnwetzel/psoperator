@@ -14,6 +14,7 @@ already holds; none sends a window a message or changes focus.
 
 from __future__ import annotations
 
+import functools
 import threading
 import time
 
@@ -40,13 +41,26 @@ _INTERCEPTING = 0x2 | 0x4 | 0x8 | 0x10
 _MODIFIER_VKS = (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
 _KEY_DOWN = 0x8000
 # GetAsyncKeyState returns 0 ("not down") when it cannot read the keyboard:
-# when this thread's desktop is not the input desktop (a locked workstation,
-# the secure desktop, a disconnected remote session), or when the input
-# desktop does not allow this process the hook or journal-record right.
-# Opening the input desktop with those rights and finding it is this thread's
-# desktop rules both out, so the zeros may be read as "not held".
+# when this thread's desktop is not the active desktop, when the input
+# desktop does not allow this process the hook or journal-record right, and
+# when UIPI keeps this process from the foreground thread (a foreground
+# process of higher integrity). Before the zeros may be read as "not held",
+# each check (_keyboard_readable) establishes: the session is connected and
+# unlocked (in a disconnected session OpenInputDesktop still succeeds, with
+# the desktop that becomes active on reconnection); this process is in the
+# interactive window station, where the input desktop opens with those
+# rights and is this thread's desktop; and the foreground process's
+# integrity level is known and not above this process's.
 _DESKTOP_READ = 0x0001 | 0x0008 | 0x0010  # read objects, hook control, journal record
-_UOI_NAME = 2
+_UOI_FLAGS, _UOI_NAME = 1, 2
+_WSF_VISIBLE = 0x0001
+_INTERACTIVE_STATION = "WinSta0"
+_WTS_CURRENT_SESSION = 0xFFFFFFFF
+_WTS_SESSION_INFO_EX = 25
+_WTS_ACTIVE, _WTS_SESSIONSTATE_UNLOCK = 0, 1
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TOKEN_INTEGRITY_LEVEL = 25
 
 
 def _api():
@@ -94,6 +108,8 @@ def _api():
     user32.GetUserObjectInformationW.restype = wintypes.BOOL
     user32.CloseDesktop.argtypes = [wintypes.HANDLE]
     user32.CloseDesktop.restype = wintypes.BOOL
+    user32.GetProcessWindowStation.argtypes = []
+    user32.GetProcessWindowStation.restype = wintypes.HANDLE
     return user32, GUITHREADINFO
 
 
@@ -157,32 +173,251 @@ def _centre(user32, hwnd: int) -> tuple[int, int]:
     return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
 
-def _desktop_name(user32, desktop) -> str:
+@functools.cache
+def _security_api():
+    import ctypes
+    from ctypes import wintypes
+
+    wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    wtsapi32.WTSQuerySessionInformationW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    wtsapi32.WTSQuerySessionInformationW.restype = wintypes.BOOL
+    wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+    wtsapi32.WTSFreeMemory.restype = None
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.IsValidSid.argtypes = [ctypes.c_void_p]
+    advapi32.IsValidSid.restype = wintypes.BOOL
+    advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    class Level1(ctypes.Structure):  # WTSINFOEX_LEVEL1_W
+        _fields_ = [
+            ("SessionId", wintypes.ULONG),
+            ("SessionState", ctypes.c_int),
+            ("SessionFlags", wintypes.LONG),
+            ("WinStationName", wintypes.WCHAR * 33),
+            ("UserName", wintypes.WCHAR * 21),
+            ("DomainName", wintypes.WCHAR * 18),
+            ("LogonTime", ctypes.c_longlong),
+            ("ConnectTime", ctypes.c_longlong),
+            ("DisconnectTime", ctypes.c_longlong),
+            ("LastInputTime", ctypes.c_longlong),
+            ("CurrentTime", ctypes.c_longlong),
+            ("Counters", wintypes.DWORD * 6),
+        ]
+
+    class Data(ctypes.Union):
+        _fields_ = [("WTSInfoExLevel1", Level1)]
+
+    class InfoEx(ctypes.Structure):  # WTSINFOEXW
+        _fields_ = [("Level", wintypes.DWORD), ("Data", Data)]
+
+    return wtsapi32, advapi32, kernel32, InfoEx
+
+
+def session_ok(level: object, state: object, flags: object) -> bool:
+    """Whether a WTSINFOEX reading shows a connected (active), unlocked
+    session: level 1, state WTSActive, flags WTS_SESSIONSTATE_UNLOCK."""
+    return (
+        type(level) is int
+        and level == 1
+        and type(state) is int
+        and state == _WTS_ACTIVE
+        and type(flags) is int
+        and flags == _WTS_SESSIONSTATE_UNLOCK
+    )
+
+
+def _session_unlocked() -> bool:
+    """Whether this process's session is connected and unlocked; False if
+    it cannot be read. Only the state and flags are read from the reply."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        wtsapi32, _, _, info_type = _security_api()
+        buffer, size = ctypes.c_void_p(), wintypes.DWORD()
+        if not wtsapi32.WTSQuerySessionInformationW(
+            None,
+            _WTS_CURRENT_SESSION,
+            _WTS_SESSION_INFO_EX,
+            ctypes.byref(buffer),
+            ctypes.byref(size),
+        ):
+            return False
+        try:
+            if not buffer.value or size.value < ctypes.sizeof(info_type):
+                return False
+            info = ctypes.cast(buffer, ctypes.POINTER(info_type)).contents
+            level1 = info.Data.WTSInfoExLevel1
+            return session_ok(int(info.Level), int(level1.SessionState), int(level1.SessionFlags))
+        finally:
+            wtsapi32.WTSFreeMemory(buffer)
+    except Exception:
+        return False
+
+
+def _integrity(pid: int | None) -> int:
+    """The mandatory integrity level (the RID, e.g. 0x2000 medium, 0x3000
+    high) of process ``pid``, or of this process for None. Raises if it
+    cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    _, advapi32, kernel32, _ = _security_api()
+    if pid is None:
+        process, opened = kernel32.GetCurrentProcess(), False
+    else:
+        process = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            raise OSError("cannot open the process")
+        opened = True
+    try:
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(process, _TOKEN_QUERY, ctypes.byref(token)):
+            raise OSError("cannot open the process token")
+        try:
+            needed = wintypes.DWORD()
+            advapi32.GetTokenInformation(
+                token, _TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(needed)
+            )
+            if not needed.value:
+                raise OSError("cannot size the integrity level")
+            label = ctypes.create_string_buffer(needed.value)
+            if not advapi32.GetTokenInformation(
+                token, _TOKEN_INTEGRITY_LEVEL, label, needed, ctypes.byref(needed)
+            ):
+                raise OSError("cannot read the integrity level")
+            sid = ctypes.cast(label, ctypes.POINTER(ctypes.c_void_p))[0]
+            if not sid or not advapi32.IsValidSid(sid):
+                raise OSError("the integrity label has no valid SID")
+            count = advapi32.GetSidSubAuthorityCount(sid)[0]
+            if count < 1:
+                raise OSError("the integrity SID has no sub-authority")
+            return int(advapi32.GetSidSubAuthority(sid, count - 1)[0])
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        if opened:
+            kernel32.CloseHandle(process)
+
+
+def _foreground_pid(user32) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    foreground = user32.GetForegroundWindow()
+    pid = wintypes.DWORD()
+    if foreground:
+        user32.GetWindowThreadProcessId(foreground, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _privilege_verified(user32) -> None:
+    """Raise ``privilege-not-verified`` unless the foreground process's
+    integrity level is known and not above this process's (UIPI)."""
+    try:
+        pid = _foreground_pid(user32)
+        verified = bool(pid) and _integrity(pid) <= _integrity(None)
+    except Exception:
+        verified = False
+    if not verified:
+        raise KeyStateRefusal(Code.PRIVILEGE_UNVERIFIED)
+
+
+def _object_name(user32, handle) -> str:
     import ctypes
     from ctypes import wintypes
 
     buffer = ctypes.create_unicode_buffer(256)
     needed = wintypes.DWORD()
     if not user32.GetUserObjectInformationW(
-        desktop, _UOI_NAME, buffer, ctypes.sizeof(buffer), ctypes.byref(needed)
+        handle, _UOI_NAME, buffer, ctypes.sizeof(buffer), ctypes.byref(needed)
     ):
         raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
     return buffer.value
 
 
-def _keyboard_readable(user32) -> None:
-    """Raise ``keyboard-unreadable`` unless the input desktop opens with the
-    rights GetAsyncKeyState needs and is this thread's desktop."""
+def _interactive_station(user32) -> bool:
+    """Whether this process's window station is the visible interactive one
+    (WinSta0), the station the input desktop belongs to: a thread's desktop
+    belongs to its process's station, so equal names name one desktop."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Flags(ctypes.Structure):  # USEROBJECTFLAGS
+        _fields_ = [
+            ("fInherit", wintypes.BOOL),
+            ("fReserved", wintypes.BOOL),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    station = user32.GetProcessWindowStation()
+    if not station or _object_name(user32, station) != _INTERACTIVE_STATION:
+        return False
+    flags, needed = Flags(), wintypes.DWORD()
+    if not user32.GetUserObjectInformationW(
+        station, _UOI_FLAGS, ctypes.byref(flags), ctypes.sizeof(flags), ctypes.byref(needed)
+    ):
+        return False
+    return bool(flags.dwFlags & _WSF_VISIBLE)
+
+
+def _input_desktop_ours(user32) -> None:
+    """Raise ``keyboard-unreadable`` unless this process is in the
+    interactive window station and the input desktop opens with the rights
+    GetAsyncKeyState needs and is this thread's desktop."""
+    if not _interactive_station(user32):
+        raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
     desktop = user32.OpenInputDesktop(0, False, _DESKTOP_READ)
     if not desktop:
         raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
     try:
         ours = user32.GetThreadDesktop(threading.get_native_id())
-        name = _desktop_name(user32, desktop)
-        if not ours or not name or _desktop_name(user32, ours) != name:
+        name = _object_name(user32, desktop)
+        if not ours or not name or _object_name(user32, ours) != name:
             raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
     finally:
         user32.CloseDesktop(desktop)
+
+
+def _keyboard_readable(user32) -> None:
+    """Raise :class:`KeyStateRefusal` unless GetAsyncKeyState can read the
+    keyboard now: ``keyboard-unreadable`` for a disconnected or locked
+    session or another desktop, ``privilege-not-verified`` for a foreground
+    process of higher or unknown integrity."""
+    if not _session_unlocked():
+        raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
+    _input_desktop_ours(user32)
+    _privilege_verified(user32)
 
 
 def _modifiers_clear(user32) -> bool:

@@ -146,14 +146,24 @@ These hold from the start, so they never have to be retrofitted:
   last in every reading, so a press at either end refuses as
   `modifier-held`; one pressed after the last sample is not seen (the same
   sampling limit). `GetAsyncKeyState` returns 0 ("not held") when it cannot
-  read the keyboard: when this process's desktop is not the input desktop (a
-  locked workstation, the secure desktop of a UAC or Ctrl+Alt+Del prompt, a
-  disconnected remote session) or the input desktop denies it
-  the hook and journal-record rights. Each sample is therefore bracketed by
-  opening the input desktop with those rights and checking it is this
-  thread's desktop; otherwise the key is refused as `keyboard-unreadable`.
-  In those states SendInput would not reach the application either, so
-  unattended input needs an unlocked, connected session. **What it does not
+  read the keyboard: when this process's desktop is not the active desktop
+  (a locked workstation, the secure desktop of a UAC or Ctrl+Alt+Del
+  prompt, a disconnected remote session), when the input desktop denies it
+  the hook and journal-record rights, and when UIPI keeps it from a
+  foreground process of higher integrity (an application run as
+  administrator). Each sample is therefore bracketed by three checks: the
+  session is connected and unlocked (`WTSQuerySessionInformation`; in a
+  disconnected session the input desktop still opens, as the desktop that
+  becomes active on reconnection, so the desktop alone proves nothing
+  there); this process is in the visible interactive window station and the
+  input desktop opens with those rights and is this thread's desktop
+  (otherwise `keyboard-unreadable`); and the foreground process's integrity
+  level is known and not above this process's (otherwise
+  `privilege-not-verified`). In those states SendInput would not reach the
+  application either (UIPI drops injected input to a higher-integrity
+  window without an error), so unattended input needs a connected, unlocked
+  session and an application that does not run elevated above the gate.
+  **What it does not
   cover:** CapsLock, NumLock, the keyboard layout, IME state and a pending
   dead key can change the character a letter or digit produces; the check
   does not read them. The asynchronous state is the system's, not the target
