@@ -91,17 +91,27 @@ class PynputExecutor:
             self._kb.type(action.text or "")
             return f"typed {len(action.text or '')} chars"
         if k is ActionKind.KEY:
-            # Every name is resolved before anything is pressed; whatever was
-            # pressed is released even if a later press fails.
+            # Every name is resolved before anything is pressed. A key counts
+            # as pressed once its press is attempted (a press that raises may
+            # still have gone down), and every one is released, each attempt on
+            # its own: one failed release does not skip the others. The first
+            # error (a press's before any release's) is raised after all
+            # releases have been attempted.
             keys = [self._key(n) for n in action.keys]
-            pressed = []
+            attempted, failed = [], None
             try:
                 for key in keys:
+                    attempted.append(key)
                     self._kb.press(key)
-                    pressed.append(key)
-            finally:
-                for key in reversed(pressed):
+            except BaseException as error:
+                failed = error
+            for key in reversed(attempted):
+                try:
                     self._kb.release(key)
+                except BaseException as error:
+                    failed = failed or error
+            if failed is not None:
+                raise failed
             return f"pressed {'+'.join(action.keys)}"
         if k is ActionKind.SCROLL:
             if action.x is not None:

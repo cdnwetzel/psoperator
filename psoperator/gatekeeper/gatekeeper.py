@@ -18,6 +18,8 @@ Pipeline, all deterministic, all audited:
 
 from __future__ import annotations
 
+import hashlib
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -38,6 +40,7 @@ from psoperator.gatekeeper.bound_target import (
     audited_hash,
     audited_keys,
     bound_key_problem,
+    key_state_code,
     normalized,
     recipient_of,
     recipient_problem,
@@ -97,6 +100,59 @@ def _guarded(read):
         return read()
     except Exception:
         return None
+
+
+# The outcomes and rejection reasons the attestation gate records; anything
+# else in a receipt is recorded as "invalid".
+_ENVELOPE_OUTCOMES = frozenset({"admitted", "rejected", "nonce-evicted-unexpired"})
+_ENVELOPE_REASONS = frozenset(
+    {
+        "unknown-key",
+        "bad-signature",
+        "stale-epoch",
+        "not-yet-valid",
+        "expired",
+        "replayed-nonce",
+        "stale-frame",
+        "max-nonces",
+    }
+)
+
+
+def _text_free_envelope(receipt: object) -> tuple[int, str, dict, str, str]:
+    """An envelope receipt reduced to fixed values, safe for any input: the
+    frame id (an exact int, else 0), the frame hash, the envelope identity
+    (epoch and nonce as 64-hex, the key id only as its SHA-256, the time only
+    as a finite float), the outcome and the reason from fixed sets. The
+    detail and anything else in the receipt are dropped."""
+
+    def get(key: str) -> object:
+        return _guarded(lambda: receipt.get(key)) if type(receipt) is dict else None
+
+    outcome = get("outcome")
+    outcome = outcome if type(outcome) is str and outcome in _ENVELOPE_OUTCOMES else "invalid"
+    reason = get("reason")
+    reason = reason if type(reason) is str and reason in _ENVELOPE_REASONS else outcome
+    frame_id = get("frame_id")
+    key_id = get("key_id")
+    at = get("at")
+    envelope = {
+        "key_id_sha256": (
+            hashlib.sha256(key_id.encode("utf-8", "replace")).hexdigest()
+            if type(key_id) is str
+            else "<invalid>"
+        ),
+        "observer_epoch": audited_hash(get("observer_epoch")),
+        "nonce": audited_hash(get("nonce")),
+        "at": at if type(at) is float and math.isfinite(at) else None,
+    }
+    return (
+        frame_id if type(frame_id) is int else 0,
+        audited_hash(get("frame_hash")),
+        envelope,
+        outcome,
+        reason,
+    )
 
 
 def _service_contract_refusal(
@@ -200,7 +256,20 @@ class Gatekeeper:
         rejection) to the same hash-chained audit the decisions use, so a refused
         forgery leaves a durable, tamper-evident receipt — not just a response.
         The envelope's identity (key, epoch, nonce) is kept, so a receipt can say
-        which key or nonce a rejection was about."""
+        which key or nonce a rejection was about. With bound_input_only the
+        receipt is reduced to fixed values first (:func:`_text_free_envelope`)."""
+        if self._bound_input_only:
+            frame_id, frame_hash, envelope, outcome, reason = _text_free_envelope(receipt)
+            self._audit.append(
+                frame_id=frame_id,
+                frame_hash=frame_hash,
+                action={"envelope": envelope},
+                tier=-1,
+                decision=f"ENVELOPE_{outcome.upper()}",
+                approver="gatekeeper",
+                reason=reason,
+            )
+            return
         self._audit.append(
             frame_id=int(receipt.get("frame_id", 0)),
             frame_hash=str(receipt.get("frame_hash", "-")),
@@ -273,8 +342,9 @@ class Gatekeeper:
         def check() -> tuple[Observation | None, dict | None, Refusal | None]:
             try:
                 observed = self._observe(main_hwnd)
-            except Exception:
-                return None, None, Refusal(Code.OBSERVE_FAILED)
+            except Exception as error:
+                # A held modifier or unreadable keyboard keeps its own code.
+                return None, None, Refusal(key_state_code(error) or Code.OBSERVE_FAILED)
             try:
                 identity, refusal = bound_key_problem(
                     request,
@@ -305,11 +375,12 @@ class Gatekeeper:
 
         approved = recipient_of(first)
 
-        def recipient_changed(code: Code, held: Code) -> str | None:
+        def recipient_changed(code: Code, held: Code, typed: bool) -> str | None:
             try:
                 now = tuple(self._recipient(main_hwnd))
-            except Exception:
-                return code.value
+            except Exception as error:
+                state = key_state_code(error) if typed else None
+                return (state or code).value
             problem = recipient_problem(now, approved, code, held)
             return None if problem is None else problem.value
 
@@ -318,10 +389,13 @@ class Gatekeeper:
             frame,
             binding=binding,
             pre_execute=recheck,
-            # Before the send, a held modifier refuses with its own code; after
-            # it, any difference (a modifier included) is the incident code.
-            pre_send=lambda: recipient_changed(Code.RECIPIENT_CHANGED, Code.MODIFIER_HELD),
-            post_send=lambda: recipient_changed(Code.SENT_THEN_CHANGED, Code.SENT_THEN_CHANGED),
+            # Before the send, a held modifier or an unreadable keyboard refuses
+            # with its own code; after it, any difference (those included) is
+            # the incident code.
+            pre_send=lambda: recipient_changed(Code.RECIPIENT_CHANGED, Code.MODIFIER_HELD, True),
+            post_send=lambda: recipient_changed(
+                Code.SENT_THEN_CHANGED, Code.SENT_THEN_CHANGED, False
+            ),
         )
 
     def request_action(

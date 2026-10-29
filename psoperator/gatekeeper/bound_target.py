@@ -104,12 +104,39 @@ class Code(str, Enum):
     SENT_THEN_CHANGED = "recipient-changed-after-send"
     UNBOUND_INPUT = "input-not-bound"
     MODIFIER_HELD = "modifier-held"
+    KEYBOARD_UNREADABLE = "keyboard-unreadable"
 
 
 @dataclass(frozen=True)
 class Refusal:
     code: Code
     detail: str = ""  # for the caller; never audited
+
+
+# The codes a live reading may raise as a KeyStateRefusal.
+KEY_STATE_CODES = frozenset({Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE})
+
+
+class KeyStateRefusal(Exception):
+    """A live reading found a modifier key held, or could not establish that
+    the keyboard state is readable: raised with its fixed code so that the
+    refusal keeps that code instead of becoming a generic failed reading."""
+
+    def __init__(self, code: Code) -> None:
+        super().__init__(code.value)
+        self.code = code
+
+
+def key_state_code(error: BaseException) -> Code | None:
+    """The fixed code carried by ``error`` if it is a KeyStateRefusal with one
+    of :data:`KEY_STATE_CODES`, else None. Safe for any exception."""
+    if not isinstance(error, KeyStateRefusal):
+        return None
+    try:
+        code = error.code
+    except Exception:
+        return None
+    return code if type(code) is Code and code in KEY_STATE_CODES else None
 
 
 class AllowListError(Exception):

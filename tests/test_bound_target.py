@@ -10,6 +10,7 @@ private configuration and never enters the repository.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 from types import SimpleNamespace
@@ -28,11 +29,13 @@ from psoperator.gatekeeper.bound_target import (
     BoundKeyRequest,
     Code,
     FocusedEdit,
+    KeyStateRefusal,
     Observation,
     OcrBox,
     ScreenSignature,
     audited_keys,
     bound_key_problem,
+    key_state_code,
     observed_fields,
     recipient_of,
     signature_of,
@@ -1562,6 +1565,7 @@ def _patched_recipient(monkeypatch, threads, foregrounds, on_topmost=None):
     monkeypatch.setattr(win32_state, "_thread_state", thread_state)
     monkeypatch.setattr(win32_state, "_centre", lambda u, hwnd: (240, 142))
     monkeypatch.setattr(win32_state, "topmost_at", topmost)
+    monkeypatch.setattr(win32_state, "_keyboard_readable", lambda u: None)
     return win32_state, _RecipientUser32(foregrounds)
 
 
@@ -1633,15 +1637,22 @@ def test_a_failed_window_enumeration_is_not_zero_dialogs():
         win32_state._owned_visible(failing, MAIN)
 
 
-def _interleaved(monkeypatch, change_on):
-    """_recipient with live-looking state: the foreground and the thread state
-    and the modifier state are read from ``state``; ``change_on`` maps a (read
-    name, call number) to a change made to ``state`` during that read (after
-    its value is taken)."""
+def _interleaved(monkeypatch, change_on, modifiers=True, readable=True):
+    """_recipient with live-looking state: the foreground, the thread state,
+    the modifier state and whether the keyboard is readable are read from
+    ``state``; ``change_on`` maps a (read name, call number) to a change made
+    to ``state`` during that read (after its value is taken)."""
     from psoperator.perception import win32_state
 
-    state = {"foreground": MAIN, "thread": (EDIT, True), "modifiers": True}
-    calls = {"foreground": 0, "thread": 0, "modifiers": 0}
+    state = {
+        "foreground": MAIN, "thread": (EDIT, True), "modifiers": modifiers,
+        "readable": readable,
+    }  # fmt: skip
+    calls = {"foreground": 0, "thread": 0, "modifiers": 0, "readable": 0}
+
+    def keyboard_readable(u):
+        if not read("readable"):
+            raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
 
     def read(name):
         calls[name] += 1
@@ -1656,6 +1667,7 @@ def _interleaved(monkeypatch, change_on):
 
     monkeypatch.setattr(win32_state, "_thread_state", lambda u, i, hwnd: read("thread"))
     monkeypatch.setattr(win32_state, "_modifiers_clear", lambda u: read("modifiers"))
+    monkeypatch.setattr(win32_state, "_keyboard_readable", keyboard_readable)
     monkeypatch.setattr(win32_state, "_centre", lambda u, hwnd: (240, 142))
     monkeypatch.setattr(win32_state, "topmost_at", lambda point: MAIN)
     return win32_state, _User32()
@@ -1674,11 +1686,9 @@ def test_an_unchanged_recipient_reads_consistently(monkeypatch):
         {("foreground", 2): {"thread": (EDIT, False)}},
         # the foreground switches during the second thread-state read
         {("thread", 2): {"foreground": OTHER}},
-        # a modifier is pressed right after the first modifier read
-        {("modifiers", 1): {"modifiers": False}},
     ],
     ids=["focus-during-foreground-read", "menu-during-foreground-read",
-         "foreground-during-thread-read", "modifier-pressed-during-reading"],
+         "foreground-during-thread-read"],
 )  # fmt: skip
 def test_a_change_during_a_final_recipient_read_is_refused(monkeypatch, change_on):
     from psoperator.perception.win32_fields import Win32FieldError
@@ -1686,6 +1696,131 @@ def test_a_change_during_a_final_recipient_read_is_refused(monkeypatch, change_o
     win32_state, user32 = _interleaved(monkeypatch, change_on)
     with pytest.raises(Win32FieldError, match="while it was being read"):
         win32_state._recipient(user32, None, MAIN)
+
+
+def _key_state(call) -> Code | None:
+    try:
+        call()
+    except KeyStateRefusal as refusal:
+        return refusal.code
+    return None
+
+
+@pytest.mark.parametrize(
+    "change_on",
+    [
+        # pressed right after the first modifier sample
+        {("modifiers", 1): {"modifiers": False}},
+        # pressed during the second thread-state read or the last foreground
+        # read: the last modifier sample comes after both
+        {("thread", 2): {"modifiers": False}},
+        {("foreground", 3): {"modifiers": False}},
+    ],
+    ids=["after-first-sample", "during-final-thread-read", "during-final-foreground-read"],
+)
+def test_a_modifier_pressed_during_a_reading_refuses_with_its_code(monkeypatch, change_on):
+    win32_state, user32 = _interleaved(monkeypatch, change_on)
+    assert _key_state(lambda: win32_state._recipient(user32, None, MAIN)) is Code.MODIFIER_HELD
+
+
+def test_a_modifier_held_when_a_reading_starts_refuses_with_its_code(monkeypatch):
+    win32_state, user32 = _interleaved(monkeypatch, {}, modifiers=False)
+    assert _key_state(lambda: win32_state._recipient(user32, None, MAIN)) is Code.MODIFIER_HELD
+
+
+def test_a_modifier_pressed_after_the_last_sample_is_not_seen(monkeypatch):
+    # The documented limit: the reading samples, it does not lock. A press
+    # after the last poll of the modifiers is not part of this reading (the
+    # gatekeeper reads again immediately after the send).
+    win32_state, user32 = _interleaved(monkeypatch, {("modifiers", 2): {"modifiers": False}})
+    assert win32_state._recipient(user32, None, MAIN) == (MAIN, EDIT, True, (240, 142), MAIN, True)
+
+
+@pytest.mark.parametrize(
+    "change_on",
+    [
+        {},  # unreadable from the start
+        {("readable", 1): {"readable": False}},  # unreadable around the first sample
+        {("readable", 3): {"readable": False}},  # unreadable around the last sample
+    ],
+    ids=["from-the-start", "at-the-first-sample", "at-the-last-sample"],
+)
+def test_zeros_from_an_unreadable_keyboard_are_not_clear(monkeypatch, change_on):
+    # GetAsyncKeyState returns 0 when it cannot read the keyboard: those
+    # zeros must not pass for "no modifier held".
+    readable = bool(change_on)
+    win32_state, user32 = _interleaved(monkeypatch, change_on, readable=readable)
+    code = _key_state(lambda: win32_state._recipient(user32, None, MAIN))
+    assert code is Code.KEYBOARD_UNREADABLE
+
+
+class _Desktops:
+    """OpenInputDesktop and friends: the input desktop (or None if it cannot
+    be opened) and this thread's desktop, by name."""
+
+    def __init__(self, input_name="Default", thread_name="Default", name_fails=False):
+        self.input_name, self.thread_name, self.name_fails = input_name, thread_name, name_fails
+        self.opened, self.closed = [], []
+
+    def OpenInputDesktop(self, flags, inherit, access):
+        self.opened.append(access)
+        return 0x11 if self.input_name is not None else 0
+
+    def GetThreadDesktop(self, thread):
+        return 0x22
+
+    def GetUserObjectInformationW(self, handle, index, buffer, size, needed):
+        if self.name_fails or index != 2:
+            return 0
+        buffer.value = self.input_name if handle == 0x11 else self.thread_name
+        return 1
+
+    def CloseDesktop(self, handle):
+        self.closed.append(handle)
+        return 1
+
+
+@windows_only
+def test_the_keyboard_is_readable_on_this_threads_input_desktop():
+    from psoperator.perception import win32_state
+
+    desktops = _Desktops()
+    assert win32_state._keyboard_readable(desktops) is None
+    # Opened with read-objects, hook-control and journal-record, and closed.
+    assert desktops.opened == [0x0001 | 0x0008 | 0x0010] and desktops.closed == [0x11]
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "desktops",
+    [
+        _Desktops(input_name=None),  # locked, secure desktop, disconnected session
+        _Desktops(input_name="Winlogon"),  # the input desktop is another desktop
+        _Desktops(name_fails=True),  # its name cannot be read
+        _Desktops(input_name="", thread_name=""),  # no name: nothing proven
+    ],
+    ids=["cannot-open", "another-desktop", "name-unreadable", "empty-names"],
+)
+def test_the_keyboard_is_unreadable_off_the_input_desktop(desktops):
+    from psoperator.perception import win32_state
+
+    code = _key_state(lambda: win32_state._keyboard_readable(desktops))
+    assert code is Code.KEYBOARD_UNREADABLE
+    # Whatever was opened is closed.
+    assert desktops.closed == ([] if desktops.input_name is None else [0x11])
+
+
+@windows_only
+def test_the_real_keyboard_readability_check_runs():
+    # A smoke test of the declared types (nothing is sent): on an interactive
+    # desktop this passes; on a runner without one it refuses with its code.
+    from psoperator.perception import win32_state
+
+    user32, _ = win32_state._api()
+    assert _key_state(lambda: win32_state._keyboard_readable(user32)) in (
+        None,
+        Code.KEYBOARD_UNREADABLE,
+    )
 
 
 def test_the_live_recipient_reader_refuses_a_window_that_is_gone(monkeypatch):
@@ -1798,6 +1933,204 @@ def test_a_modifier_pressed_during_the_live_observation_returns_nothing(monkeypa
     win32_state = _patched_observer(monkeypatch, [RECIPIENT, HELD])
     with pytest.raises(Win32FieldError, match="recipient"):
         win32_state.observe(MAIN)
+
+
+@pytest.mark.parametrize("code", [Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE])
+def test_a_key_state_refusal_in_the_last_observation_reading_keeps_its_code(monkeypatch, code):
+    from psoperator.perception import win32_state
+
+    readings = [RECIPIENT, KeyStateRefusal(code)]
+    _patched_observer(monkeypatch, [])
+
+    def recipient(u, i, hwnd):
+        reading = readings.pop(0)
+        if isinstance(reading, Exception):
+            raise reading
+        return reading
+
+    monkeypatch.setattr(win32_state, "_recipient", recipient)
+    assert _key_state(lambda: win32_state.observe(MAIN)) is code
+
+
+class _RaisingObserver(Observer):
+    """Observes normally, except that the calls numbered in ``raises`` raise
+    the given exception."""
+
+    def __init__(self, raises):
+        super().__init__()
+        self.raises = raises
+
+    def __call__(self, main_hwnd):
+        observed = super().__call__(main_hwnd)
+        if len(self.calls) in self.raises:
+            raise self.raises[len(self.calls)]
+        return observed
+
+
+class _HostileRefusal(KeyStateRefusal):
+    @property
+    def code(self):
+        raise RuntimeError("secret code text")
+
+    @code.setter
+    def code(self, value):
+        pass
+
+
+@pytest.mark.parametrize("call", [1, 2], ids=["first-observation", "second-observation"])
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (KeyStateRefusal(Code.MODIFIER_HELD), Code.MODIFIER_HELD),
+        (KeyStateRefusal(Code.KEYBOARD_UNREADABLE), Code.KEYBOARD_UNREADABLE),
+        # controls: only the two key-state codes are carried through
+        (KeyStateRefusal(Code.CHANGED), Code.OBSERVE_FAILED),
+        (_HostileRefusal(Code.MODIFIER_HELD), Code.OBSERVE_FAILED),
+        (RuntimeError("secret observer text"), Code.OBSERVE_FAILED),
+    ],
+    ids=["modifier-held", "keyboard-unreadable", "other-code", "hostile-code", "plain-error"],
+)
+def test_an_observer_key_state_refusal_keeps_its_code(tmp_path, call, error, expected):
+    gk, config, recorder = _gatekeeper(tmp_path, _RaisingObserver({call: error}))
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.DENIED and recorder.calls == []
+    assert decision.reason == _audit(config)[-1]["reason"] == expected.value
+    assert "secret" not in config.audit_log_path.read_text(encoding="utf-8")
+
+
+class _RaisingLog(_Log):
+    """A _Log whose recipient readings numbered in ``raises`` raise."""
+
+    def __init__(self, raises):
+        super().__init__()
+        self.raises = raises
+
+    def recipient(self, main_hwnd):
+        reading = super().recipient(main_hwnd)
+        n = self.events.count("recipient")
+        if n in self.raises:
+            raise self.raises[n]
+        return reading
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (KeyStateRefusal(Code.MODIFIER_HELD), Code.MODIFIER_HELD),
+        (KeyStateRefusal(Code.KEYBOARD_UNREADABLE), Code.KEYBOARD_UNREADABLE),
+        (KeyStateRefusal(Code.CHANGED), Code.RECIPIENT_CHANGED),
+        (_HostileRefusal(Code.MODIFIER_HELD), Code.RECIPIENT_CHANGED),
+        (RuntimeError("secret recipient text"), Code.RECIPIENT_CHANGED),
+    ],
+    ids=["modifier-held", "keyboard-unreadable", "other-code", "hostile-code", "plain-error"],
+)
+def test_a_key_state_refusal_just_before_the_send_keeps_its_code(tmp_path, error, expected):
+    log = _RaisingLog({1: error})
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.DENIED and recorder.calls == []
+    assert decision.reason == _audit(config)[-1]["reason"] == expected.value
+    assert log.events == ["observe", "observe", "recipient"]
+
+
+@pytest.mark.parametrize("code", [Code.MODIFIER_HELD, Code.KEYBOARD_UNREADABLE])
+def test_a_key_state_refusal_after_the_send_is_the_incident_code(tmp_path, code):
+    log = _RaisingLog({2: KeyStateRefusal(code)})
+    gk, config, recorder = _bracketed(tmp_path, log)
+    decision = gk.request_bound_key(_req(), _frame())
+    assert decision.kind is DecisionKind.EXECUTED and len(recorder.calls) == 1
+    assert _audit(config)[-1]["reason"] == Code.SENT_THEN_CHANGED.value
+
+
+def test_key_state_code_is_safe_for_any_exception():
+    assert key_state_code(KeyStateRefusal(Code.MODIFIER_HELD)) is Code.MODIFIER_HELD
+    assert key_state_code(KeyStateRefusal(Code.KEYBOARD_UNREADABLE)) is Code.KEYBOARD_UNREADABLE
+    assert key_state_code(KeyStateRefusal(Code.INVALID)) is None
+    assert key_state_code(_HostileRefusal(Code.MODIFIER_HELD)) is None
+    assert key_state_code(RuntimeError("modifier-held")) is None
+    refusal = KeyStateRefusal(Code.MODIFIER_HELD)
+    refusal.code = "modifier-held"  # a plain string is not the code
+    assert key_state_code(refusal) is None
+
+
+# --- envelope receipts under bound_input_only ---------------------------------------------
+
+SECRET_RECEIPT = {
+    "outcome": "rejected",
+    "reason": "replayed-nonce",
+    "detail": "secret detail text",
+    "key_id": "secret key text",
+    "observer_epoch": "a" * 64,
+    "nonce": "b" * 64,
+    "frame_id": 7,
+    "frame_hash": "f" * 64,
+    "at": 101.0,
+    "extra": "secret extra text",
+}
+
+
+def _envelope_row(tmp_path, receipt, bound=True):
+    gk, config, _ = _gatekeeper(tmp_path, bound_input_only=bound)
+    gk.record_envelope_event(receipt)
+    assert verify(config.audit_log_path).ok
+    return _audit(config)[-1], config.audit_log_path.read_text(encoding="utf-8")
+
+
+def test_an_envelope_receipt_is_text_free_under_bound_input_only(tmp_path):
+    row, text = _envelope_row(tmp_path, SECRET_RECEIPT)
+    assert "secret" not in text
+    assert row["decision"] == "ENVELOPE_REJECTED" and row["reason"] == "replayed-nonce"
+    assert row["frame_id"] == 7 and row["frame_hash"] == "f" * 64 and row["tier"] == -1
+    assert row["action"]["envelope"] == {
+        "key_id_sha256": hashlib.sha256(b"secret key text").hexdigest(),
+        "observer_epoch": "a" * 64,
+        "nonce": "b" * 64,
+        "at": 101.0,
+    }
+
+
+def test_without_bound_input_only_the_envelope_receipt_is_kept(tmp_path):
+    # The control: the same receipt is recorded as given (the existing contract).
+    row, text = _envelope_row(tmp_path, SECRET_RECEIPT, bound=False)
+    assert "secret detail text" in text and row["action"]["envelope"]["key_id"] == "secret key text"
+
+
+class _HostileKey(str):
+    def __hash__(self):
+        return hash("outcome")
+
+    def __eq__(self, other):
+        raise RuntimeError("secret comparison text")
+
+
+class _HostileDict(dict):
+    def get(self, key, default=None):
+        return "secret dict text"
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {**SECRET_RECEIPT, "outcome": "secret outcome text", "reason": "secret reason text"},
+        {**SECRET_RECEIPT, "frame_id": True, "frame_hash": "secret hash text", "at": float("nan")},
+        {**SECRET_RECEIPT, "observer_epoch": "secret epoch", "nonce": "A" * 64, "key_id": 7},
+        {_HostileKey("x"): "secret value text"},
+        _HostileDict(SECRET_RECEIPT),
+        ["secret list text"],
+        None,
+    ],
+    ids=["outcome-and-reason", "frame-and-time", "identity", "hostile-key", "dict-subclass",
+         "not-a-dict", "none"],
+)  # fmt: skip
+def test_a_malformed_envelope_receipt_is_recorded_as_fixed_values(tmp_path, receipt):
+    row, text = _envelope_row(tmp_path, receipt)
+    assert "secret" not in text
+    assert row["decision"] in ("ENVELOPE_REJECTED", "ENVELOPE_INVALID")
+    assert row["reason"] in ("replayed-nonce", "rejected", "invalid")
+    assert type(row["frame_id"]) is int
+    envelope = row["action"]["envelope"]
+    assert set(envelope) == {"key_id_sha256", "observer_epoch", "nonce", "at"}
+    assert envelope["at"] is None or envelope["at"] == 101.0
 
 
 @windows_only

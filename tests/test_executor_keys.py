@@ -129,11 +129,78 @@ class _FailsOnSecondPress:
 
 
 @windows_only
-def test_a_failed_press_releases_what_was_pressed():
+def test_a_failed_press_releases_every_key_whose_press_was_attempted():
+    # The press that raised may still have gone down, so it is released too.
     from pynput.keyboard import Key
 
     keyboard = _FailsOnSecondPress()
     executor = PynputExecutor(keyboard=keyboard, mouse=object())
+    with pytest.raises(RuntimeError, match="press failed"):
+        executor.execute(Action(ActionKind.KEY, 1, keys=("ctrl", "s")))
+    assert keyboard.pressed == [Key.ctrl] and keyboard.released == ["s", Key.ctrl]
+
+
+class _GoesDownThenRaises:
+    """A press that reaches the OS and then raises; releases are recorded,
+    and the releases named in ``bad`` raise."""
+
+    def __init__(self, bad=()):
+        self.down, self.released, self.bad = [], [], set(bad)
+
+    def press(self, key):
+        self.down.append(key)
+        if len(self.down) == 2:
+            raise RuntimeError("press failed after the key went down")
+
+    def release(self, key):
+        self.released.append(key)
+        if key in self.bad:
+            raise OSError(f"release of {key} failed")
+
+
+@windows_only
+def test_a_key_that_went_down_before_its_press_raised_is_released():
+    from pynput.keyboard import Key
+
+    keyboard = _GoesDownThenRaises()
+    executor = PynputExecutor(keyboard=keyboard, mouse=object())
     with pytest.raises(RuntimeError):
         executor.execute(Action(ActionKind.KEY, 1, keys=("ctrl", "s")))
-    assert keyboard.pressed == [Key.ctrl] and keyboard.released == [Key.ctrl]
+    assert keyboard.down == [Key.ctrl, "s"]
+    assert sorted(map(str, keyboard.released)) == sorted(map(str, keyboard.down))
+
+
+@windows_only
+def test_one_failed_release_does_not_skip_the_others():
+    from pynput.keyboard import Key
+
+    keyboard = _GoesDownThenRaises(bad={"s"})
+    executor = PynputExecutor(keyboard=keyboard, mouse=object())
+    # The press error is the one raised; every release is still attempted.
+    with pytest.raises(RuntimeError, match="press failed"):
+        executor.execute(Action(ActionKind.KEY, 1, keys=("ctrl", "s")))
+    assert keyboard.released == ["s", Key.ctrl]
+
+
+class _ReleaseFails:
+    def __init__(self, bad):
+        self.released, self.bad = [], bad
+
+    def press(self, key):
+        pass
+
+    def release(self, key):
+        self.released.append(key)
+        if key == self.bad:
+            raise OSError("release failed")
+
+
+@windows_only
+def test_a_failed_release_is_raised_after_every_release_is_attempted():
+    from pynput.keyboard import Key
+
+    keyboard = _ReleaseFails(bad="s")
+    executor = PynputExecutor(keyboard=keyboard, mouse=object())
+    with pytest.raises(OSError, match="release failed"):
+        executor.execute(Action(ActionKind.KEY, 1, keys=("ctrl", "s")))
+    assert keyboard.released == ["s", Key.ctrl]

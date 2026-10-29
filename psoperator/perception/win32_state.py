@@ -3,7 +3,8 @@
 :func:`observe` reports what the gate checks before a key: the foreground
 window, the control with keyboard focus and whether a menu, move/size or
 mouse-capture mode is active in the main window's thread, whether a Shift,
-Ctrl, Alt or Windows key is held, the top-level window
+Ctrl, Alt or Windows key is held (refused with its own code, as is a keyboard
+whose state this desktop cannot read), the top-level window
 at the centre of the focused control, the visible windows owned by the main
 window (dialogs), and the main window's tree and screen signature. The window
 state is read before and after the (slower) tree walk; if it changed in
@@ -13,9 +14,15 @@ already holds; none sends a window a message or changes focus.
 
 from __future__ import annotations
 
+import threading
 import time
 
-from psoperator.gatekeeper.bound_target import Observation, signature_of
+from psoperator.gatekeeper.bound_target import (
+    Code,
+    KeyStateRefusal,
+    Observation,
+    signature_of,
+)
 from psoperator.perception.win32_fields import (
     LABEL_CLASS,
     Win32FieldError,
@@ -32,6 +39,14 @@ _INTERCEPTING = 0x2 | 0x4 | 0x8 | 0x10
 # keeps the existing keyboard state, so a held one turns ENTER into a chord.
 _MODIFIER_VKS = (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
 _KEY_DOWN = 0x8000
+# GetAsyncKeyState returns 0 ("not down") when it cannot read the keyboard:
+# when this thread's desktop is not the input desktop (a locked workstation,
+# the secure desktop, a disconnected remote session), or when the input
+# desktop does not allow this process the hook or journal-record right.
+# Opening the input desktop with those rights and finding it is this thread's
+# desktop rules both out, so the zeros may be read as "not held".
+_DESKTOP_READ = 0x0001 | 0x0008 | 0x0010  # read objects, hook control, journal record
+_UOI_NAME = 2
 
 
 def _api():
@@ -65,6 +80,20 @@ def _api():
     user32.EnumWindows.restype = wintypes.BOOL
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+    user32.GetThreadDesktop.restype = wintypes.HANDLE
+    user32.GetUserObjectInformationW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetUserObjectInformationW.restype = wintypes.BOOL
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
     return user32, GUITHREADINFO
 
 
@@ -128,36 +157,77 @@ def _centre(user32, hwnd: int) -> tuple[int, int]:
     return ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
 
+def _desktop_name(user32, desktop) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    buffer = ctypes.create_unicode_buffer(256)
+    needed = wintypes.DWORD()
+    if not user32.GetUserObjectInformationW(
+        desktop, _UOI_NAME, buffer, ctypes.sizeof(buffer), ctypes.byref(needed)
+    ):
+        raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
+    return buffer.value
+
+
+def _keyboard_readable(user32) -> None:
+    """Raise ``keyboard-unreadable`` unless the input desktop opens with the
+    rights GetAsyncKeyState needs and is this thread's desktop."""
+    desktop = user32.OpenInputDesktop(0, False, _DESKTOP_READ)
+    if not desktop:
+        raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
+    try:
+        ours = user32.GetThreadDesktop(threading.get_native_id())
+        name = _desktop_name(user32, desktop)
+        if not ours or not name or _desktop_name(user32, ours) != name:
+            raise KeyStateRefusal(Code.KEYBOARD_UNREADABLE)
+    finally:
+        user32.CloseDesktop(desktop)
+
+
 def _modifiers_clear(user32) -> bool:
     """Whether no Shift, Ctrl, Alt or Windows key is down (physical state)."""
     return not any(int(user32.GetAsyncKeyState(vk)) & _KEY_DOWN for vk in _MODIFIER_VKS)
+
+
+def _modifiers_sampled(user32) -> None:
+    """Sample the modifiers, between two checks that the keyboard is
+    readable: ``keyboard-unreadable`` or ``modifier-held`` if not clear."""
+    _keyboard_readable(user32)
+    if not _modifiers_clear(user32):
+        raise KeyStateRefusal(Code.MODIFIER_HELD)
+    _keyboard_readable(user32)
 
 
 def _recipient(user32, info_type, main_hwnd: int) -> tuple:
     """Who would receive a key now, and as what: the foreground window, the
     focused control, whether no menu/move-size/capture mode is active, the
     focused control's centre, the top-level window there, and whether no
-    modifier key is held."""
+    modifier key is held (always True: a held modifier, or a keyboard whose
+    state cannot be read, raises :class:`KeyStateRefusal` with its code)."""
+    # The modifiers are sampled first and last, so a modifier down at the
+    # start or the end of the reading refuses with its own code.
+    _modifiers_sampled(user32)
     thread = _thread_state(user32, info_type, main_hwnd)
     foreground = int(user32.GetForegroundWindow() or 0)
-    modifiers = _modifiers_clear(user32)
     focus, clear = thread
     if not focus:
         raise Win32FieldError("the main window's thread has no keyboard focus")
     point = _centre(user32, focus)
     top = topmost_at(point)
-    # Focus, input modes, modifiers and the foreground are sampled again after
-    # the other reads, the foreground on both sides of the thread state: a
-    # change in between, including during either final read, is an
-    # inconsistent recipient.
+    # Focus, input modes and the foreground are sampled again after the other
+    # reads, the foreground on both sides of the thread state: a change in
+    # between is an inconsistent recipient.
     if (
         int(user32.GetForegroundWindow() or 0) != foreground
-        or _modifiers_clear(user32) != modifiers
         or _thread_state(user32, info_type, main_hwnd) != thread
         or int(user32.GetForegroundWindow() or 0) != foreground
     ):
         raise Win32FieldError("the recipient changed while it was being read")
-    return (foreground, focus, clear, point, top, modifiers)
+    # Samples, not a lock: a modifier pressed and released between the two
+    # samples, or pressed after the last poll of its key, is not seen.
+    _modifiers_sampled(user32)
+    return (foreground, focus, clear, point, top, True)
 
 
 def recipient(main_hwnd: int) -> tuple:
